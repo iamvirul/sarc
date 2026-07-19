@@ -40,6 +40,19 @@ sarc list --password "StrongPass123" --archive backup.sarc
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |
 | Container integrity | HMAC-SHA256 over entire archive body, verified by `sarc verify` without decryption |
 
+## Benchmark
+
+![Benchmark results](https://raw.githubusercontent.com/iamvirul/sarc/master/benchmarks/benchmark_results.png)
+
+Benchmarks run automatically on every PR and compare sarc archive/extract throughput against zip on a random-data file. Results are committed to `benchmarks/benchmark_results.png` and posted as a PR comment.
+
+| Runner | Max safe file size | Disk available |
+|---|---|---|
+| `ubuntu-latest` (free) | 5 GB | 14 GB |
+| `ubuntu-latest-16-core` (Team/Enterprise) | 10 GB+ | 32 GB |
+
+To increase the file size, set `TEST_FILE_GB` in `.github/workflows/benchmark.yml` and switch the runner accordingly.
+
 ## Performance targets
 
 | Operation | Target |
