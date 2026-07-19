@@ -36,6 +36,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	}
 	defer f.Close()
 
+	// Progress tracker handles per-file error printing via FileError.
 	progress := sarcio.NewConsoleProgressBar(os.Stdout)
 	ex := sarcio.NewSafeExtractor(f, flagPassword, progress)
 
@@ -51,9 +52,12 @@ func runExtract(cmd *cobra.Command, args []string) error {
 			log.Debug("extracted", "file", r.Filename, "size", r.Size)
 		} else {
 			failed++
-			fmt.Fprintf(os.Stderr, "error: %v\n", r.Err)
 		}
 	}
 	fmt.Printf("extracted %d file(s), %d error(s)\n", ok, failed)
+
+	if failed > 0 {
+		return fmt.Errorf("%d file(s) failed to extract", failed)
+	}
 	return nil
 }
