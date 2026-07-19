@@ -1,0 +1,179 @@
+name: Benchmark vs zip
+
+# Runs on every PR to master.
+# For a 10 GB file, switch to a larger runner:
+#   runs-on: ubuntu-latest-16-core   (requires GitHub Team/Enterprise, has 32 GB disk)
+# The default runner (ubuntu-latest, 14 GB disk) supports TEST_FILE_GB up to 2.
+# Each phase deletes large files immediately after use to minimise peak disk usage.
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write       # commit chart back to PR branch
+  pull-requests: write  # post results as PR comment
+
+env:
+  # 5 GB is the maximum safe size on ubuntu-latest (14 GB disk, peak usage ~10 GB).
+  # For 10 GB, switch to ubuntu-latest-16-core (32 GB disk, requires GitHub Team/Enterprise)
+  # and set TEST_FILE_GB: 10.
+  TEST_FILE_GB: 5
+
+jobs:
+  benchmark:
+    name: "sarc vs zip — ${{ env.TEST_FILE_GB }} GB"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Python deps
+        run: pip install matplotlib numpy --quiet
+
+      - name: Build sarc
+        run: go build -o ./sarc-bin ./cmd/sarc
+
+      # ----------------------------------------------------------------
+      # Generate test file once and compute reference checksum.
+      # ----------------------------------------------------------------
+      - name: Generate test file (${{ env.TEST_FILE_GB }} GB random data)
+        run: |
+          dd if=/dev/urandom of=testfile.bin \
+            bs=1M count=$(( TEST_FILE_GB * 1024 )) \
+            status=progress 2>&1
+          sha256sum testfile.bin | awk '{print $1}' > original.sha256
+          echo "Original sha256: $(cat original.sha256)"
+
+      # ----------------------------------------------------------------
+      # sarc: archive -> extract -> verify -> delete
+      # ----------------------------------------------------------------
+      - name: sarc archive
+        run: |
+          START_NS=$(date +%s%N)
+          ./sarc-bin archive \
+            --password "benchmark-password-1" \
+            --output testfile.sarc \
+            testfile.bin
+          END_NS=$(date +%s%N)
+          echo "SARC_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+
+      - name: sarc extract
+        run: |
+          START_NS=$(date +%s%N)
+          ./sarc-bin extract \
+            --password "benchmark-password-1" \
+            --archive testfile.sarc \
+            --output ./sarc-out
+          END_NS=$(date +%s%N)
+          echo "SARC_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+
+      - name: Verify sarc integrity
+        run: |
+          EXTRACTED_SHA=$(sha256sum sarc-out/testfile.bin | awk '{print $1}')
+          ORIGINAL_SHA=$(cat original.sha256)
+          echo "Original : $ORIGINAL_SHA"
+          echo "Extracted: $EXTRACTED_SHA"
+          if [ "$EXTRACTED_SHA" = "$ORIGINAL_SHA" ]; then
+            echo "SARC_INTEGRITY=PASS" >> "$GITHUB_ENV"
+          else
+            echo "SARC_INTEGRITY=FAIL" >> "$GITHUB_ENV"
+            echo "DATA CORRUPTION DETECTED" >&2
+            exit 1
+          fi
+
+      - name: Delete sarc files
+        run: rm -f testfile.sarc sarc-out/testfile.bin && rmdir sarc-out 2>/dev/null || true
+
+      # ----------------------------------------------------------------
+      # zip: archive -> extract -> delete
+      # zip will try to compress random data, so times are comparable.
+      # ----------------------------------------------------------------
+      - name: zip archive
+        run: |
+          START_NS=$(date +%s%N)
+          zip -0 testfile.zip testfile.bin
+          END_NS=$(date +%s%N)
+          echo "ZIP_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+
+      - name: zip extract
+        run: |
+          START_NS=$(date +%s%N)
+          unzip -q testfile.zip -d zip-out
+          END_NS=$(date +%s%N)
+          echo "ZIP_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+
+      - name: Delete zip files and test file
+        run: rm -f testfile.bin testfile.zip zip-out/testfile.bin && rmdir zip-out 2>/dev/null || true
+
+      # ----------------------------------------------------------------
+      # Generate chart and commit to branch.
+      # ----------------------------------------------------------------
+      - name: Generate benchmark chart
+        env:
+          SARC_ARCHIVE_MS: ${{ env.SARC_ARCHIVE_MS }}
+          ZIP_ARCHIVE_MS:  ${{ env.ZIP_ARCHIVE_MS }}
+          SARC_EXTRACT_MS: ${{ env.SARC_EXTRACT_MS }}
+          ZIP_EXTRACT_MS:  ${{ env.ZIP_EXTRACT_MS }}
+          FILE_SIZE_GB:    ${{ env.TEST_FILE_GB }}
+        run: python3 scripts/gen-benchmark-chart.py
+
+      - name: Commit chart to PR branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/benchmark_results.png
+          git diff --cached --quiet || git commit -m "Update benchmark results chart [skip ci]"
+          git push
+
+      # ----------------------------------------------------------------
+      # Post summary as PR comment.
+      # ----------------------------------------------------------------
+      - name: Post benchmark results as PR comment
+        uses: actions/github-script@v7
+        env:
+          SARC_ARCHIVE_MS: ${{ env.SARC_ARCHIVE_MS }}
+          ZIP_ARCHIVE_MS:  ${{ env.ZIP_ARCHIVE_MS }}
+          SARC_EXTRACT_MS: ${{ env.SARC_EXTRACT_MS }}
+          ZIP_EXTRACT_MS:  ${{ env.ZIP_EXTRACT_MS }}
+          SARC_INTEGRITY:  ${{ env.SARC_INTEGRITY }}
+          FILE_SIZE_GB:    ${{ env.TEST_FILE_GB }}
+        with:
+          script: |
+            const gb       = parseFloat(process.env.FILE_SIZE_GB);
+            const mbTotal  = gb * 1024;
+            const toMBs    = ms => ms > 0 ? (mbTotal / (ms / 1000)).toFixed(0) : "n/a";
+            const toSec    = ms => (ms / 1000).toFixed(2);
+
+            const sa_ms = parseInt(process.env.SARC_ARCHIVE_MS);
+            const za_ms = parseInt(process.env.ZIP_ARCHIVE_MS);
+            const se_ms = parseInt(process.env.SARC_EXTRACT_MS);
+            const ze_ms = parseInt(process.env.ZIP_EXTRACT_MS);
+
+            const body = [
+              `## Benchmark results — ${gb} GB random data`,
+              ``,
+              `| Operation | sarc | zip | winner |`,
+              `|---|---|---|---|`,
+              `| Archive time | ${toSec(sa_ms)} s (${toMBs(sa_ms)} MB/s) | ${toSec(za_ms)} s (${toMBs(za_ms)} MB/s) | ${sa_ms <= za_ms ? "**sarc**" : "zip"} |`,
+              `| Extract time | ${toSec(se_ms)} s (${toMBs(se_ms)} MB/s) | ${toSec(ze_ms)} s (${toMBs(ze_ms)} MB/s) | ${se_ms <= ze_ms ? "**sarc**" : "zip"} |`,
+              `| Data integrity | ${process.env.SARC_INTEGRITY} | n/a | — |`,
+              ``,
+              `Chart committed to \`benchmarks/benchmark_results.png\`.`,
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner:    context.repo.owner,
+              repo:     context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
