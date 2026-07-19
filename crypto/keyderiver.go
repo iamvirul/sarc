@@ -1,3 +1,6 @@
+// Copyright (c) 2026 iamvirul. All rights reserved.
+// Use of this source code is governed by the MIT license.
+
 package crypto
 
 import (
@@ -9,22 +12,22 @@ import (
 )
 
 const (
-	SaltSize       = 32
-	KeySize        = 32
-	PBKDF2Iter     = 100_000
+	SaltSize   = 32
+	KeySize    = 32
+	PBKDF2Iter = 100_000
 )
 
-// KeyDeriver derives per-file AES-256 keys from a master password using PBKDF2-SHA256.
+// KeyDeriver derives per-file AES-256 keys from a master password via PBKDF2-SHA256.
 type KeyDeriver struct {
 	password []byte
 }
 
-// NewKeyDeriver creates a KeyDeriver from the given master password.
+// NewKeyDeriver returns a KeyDeriver for the given master password.
 func NewKeyDeriver(password string) *KeyDeriver {
 	return &KeyDeriver{password: []byte(password)}
 }
 
-// GenerateSalt returns a cryptographically secure random 32-byte salt.
+// GenerateSalt returns a cryptographically random 32-byte salt.
 func GenerateSalt() ([SaltSize]byte, error) {
 	var salt [SaltSize]byte
 	if _, err := rand.Read(salt[:]); err != nil {
@@ -33,8 +36,7 @@ func GenerateSalt() ([SaltSize]byte, error) {
 	return salt, nil
 }
 
-// DeriveKey produces a 32-byte AES-256 key from the master password and the provided salt.
-// Each unique salt yields an independent key, ensuring no cross-file key correlation.
+// DeriveKey returns a 32-byte AES-256 key from the master password and salt.
 func (kd *KeyDeriver) DeriveKey(salt [SaltSize]byte) [KeySize]byte {
 	raw := pbkdf2.Key(kd.password, salt[:], PBKDF2Iter, KeySize, sha256.New)
 	var key [KeySize]byte
