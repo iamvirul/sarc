@@ -80,6 +80,12 @@ jobs:
           NOTES=$(gh release view "$TAG" --json body -q .body)
           BRANCH="chore/changelog-${TAG}"
 
+          # Skip if CHANGELOG already has an entry for this tag.
+          if [ -f CHANGELOG.md ] && grep -q "^## ${TAG}" CHANGELOG.md; then
+            echo "CHANGELOG already contains ${TAG}, skipping PR."
+            exit 0
+          fi
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
@@ -95,7 +101,6 @@ jobs:
           fi
 
           git add CHANGELOG.md
-          git diff --cached --quiet && exit 0
           git commit -m "Update CHANGELOG for ${TAG} [skip ci]"
           git push origin "$BRANCH"
 
