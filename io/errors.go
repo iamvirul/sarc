@@ -45,12 +45,12 @@ func recoverable(code, message string, cause error) *ArchiveError {
 
 // Sentinel error codes.
 const (
-	ErrCodeBadMagic       = "BAD_MAGIC"
-	ErrCodeBadVersion     = "BAD_VERSION"
-	ErrCodeAuthFailed     = "AUTH_FAILED"
-	ErrCodeTruncated      = "TRUNCATED"
-	ErrCodeIntegrityFail  = "INTEGRITY_FAIL"
-	ErrCodeWriteFailed    = "WRITE_FAILED"
-	ErrCodeReadFailed     = "READ_FAILED"
-	ErrCodeWorkerPanic    = "WORKER_PANIC"
+	ErrCodeBadMagic      = "BAD_MAGIC"
+	ErrCodeBadVersion    = "BAD_VERSION"
+	ErrCodeAuthFailed    = "AUTH_FAILED"
+	ErrCodeTruncated     = "TRUNCATED"
+	ErrCodeIntegrityFail = "INTEGRITY_FAIL"
+	ErrCodeWriteFailed   = "WRITE_FAILED"
+	ErrCodeReadFailed    = "READ_FAILED"
+	ErrCodeWorkerPanic   = "WORKER_PANIC"
 )
