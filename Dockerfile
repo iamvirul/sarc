@@ -1,6 +1,10 @@
 # Build stage
 FROM golang:1.25-alpine AS builder
 
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILT_BY=docker
+
 WORKDIR /build
 
 # Cache module downloads before copying source.
@@ -11,7 +15,10 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
-    -ldflags="-s -w -X main.version=docker -X main.builtBy=docker" \
+    -ldflags="-s -w \
+      -X main.version=${VERSION} \
+      -X main.commit=${COMMIT} \
+      -X main.builtBy=${BUILT_BY}" \
     -o /sarc \
     ./cmd/sarc
 
