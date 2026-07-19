@@ -17,7 +17,6 @@ plan.md
 
 # Go module cache and build cache
 /vendor/
-go.sum
 
 # OS
 .DS_Store
