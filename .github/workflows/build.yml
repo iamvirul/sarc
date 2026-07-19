@@ -21,13 +21,10 @@ permissions:
 jobs:
   quality:
     name: Quality gate
-    # For workflow_run: only proceed if the Release workflow succeeded.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-go@v5
         with:
@@ -60,10 +57,11 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
+      # Always checkout the default branch — source code is the same.
+      # GoReleaser uses GORELEASER_CURRENT_TAG to find the right release.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-go@v5
         with:
@@ -76,7 +74,6 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
-            # Read the tag from the release that triggered the Release workflow.
             TAG=$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName -q '.[0].tagName')
             echo "value=$TAG" >> "$GITHUB_OUTPUT"
           fi
