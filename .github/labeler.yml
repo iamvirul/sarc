@@ -1,0 +1,32 @@
+feature:
+  - head-branch: ['^feat/', '^feature/']
+
+bug:
+  - head-branch: ['^fix/', '^bugfix/', '^hotfix/']
+
+documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'examples/**'
+      - '.github/release.yml'
+
+enhancement:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'cmd/**'
+      - 'io/**'
+
+security:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'crypto/**'
+      - 'archive/**'
+
+ci:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '.github/workflows/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - '.slsa-goreleaser.yml'
