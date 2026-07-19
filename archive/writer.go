@@ -79,6 +79,10 @@ func (aw *ArchiveWriter) WriteFileEntry(entry FileEntry) error {
 			return fmt.Errorf("archive/writer: data block %d: %w", i, err)
 		}
 	}
+	// Sentinel: 12-byte zero nonce + 4-byte zero size signals end of data blocks to extractor.
+	if _, err := aw.tee.Write(make([]byte, crypto.NonceSize+4)); err != nil {
+		return fmt.Errorf("archive/writer: data block sentinel: %w", err)
+	}
 	return aw.writeTrailer(entry.Trailer)
 }
 
