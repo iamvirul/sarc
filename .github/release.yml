@@ -12,10 +12,16 @@ changelog:
         - bug
         - fix
         - bugfix
+    - title: Security
+      labels:
+        - security
     - title: Documentation
       labels:
         - documentation
         - docs
+    - title: CI / Build
+      labels:
+        - ci
     - title: Other Changes
       labels:
         - "*"
