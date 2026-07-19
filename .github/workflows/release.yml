@@ -71,8 +71,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Prepend the same release notes to CHANGELOG.md.
-      # Opens a PR instead of pushing directly to master (branch protection).
-      # Auto-merge is enabled so it merges once CI passes.
+      # Opens a PR and requests review from the repo owner.
+      # Merge it manually after reviewing.
       - name: Update CHANGELOG.md via PR
         run: |
           TAG="${{ steps.tag.outputs.value }}"
@@ -104,14 +104,13 @@ jobs:
           git commit -m "Update CHANGELOG for ${TAG} [skip ci]"
           git push origin "$BRANCH"
 
-          PR=$(gh pr create \
+          gh pr create \
             --title "Update CHANGELOG for ${TAG}" \
-            --body "Automated CHANGELOG update for release ${TAG}." \
+            --body "Automated CHANGELOG update for release ${TAG}. Review and merge to complete the release." \
             --base master \
             --head "$BRANCH" \
-            --label "skip-changelog")
-
-          gh pr merge "$PR" --squash --auto --delete-branch
+            --label "skip-changelog" \
+            --reviewer iamvirul
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
