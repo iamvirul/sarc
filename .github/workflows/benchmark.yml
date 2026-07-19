@@ -22,7 +22,7 @@ env:
 
 jobs:
   benchmark:
-    name: "sarc vs zip — ${{ env.TEST_FILE_GB }} GB"
+    name: "sarc vs zip - ${{ env.TEST_FILE_GB }} GB"
     runs-on: ubuntu-latest
 
     steps:
@@ -160,13 +160,13 @@ jobs:
             const ze_ms = parseInt(process.env.ZIP_EXTRACT_MS);
 
             const body = [
-              `## Benchmark results — ${gb} GB random data`,
+              `## Benchmark results - ${gb} GB random data`,
               ``,
               `| Operation | sarc | zip | winner |`,
               `|---|---|---|---|`,
               `| Archive time | ${toSec(sa_ms)} s (${toMBs(sa_ms)} MB/s) | ${toSec(za_ms)} s (${toMBs(za_ms)} MB/s) | ${sa_ms <= za_ms ? "**sarc**" : "zip"} |`,
               `| Extract time | ${toSec(se_ms)} s (${toMBs(se_ms)} MB/s) | ${toSec(ze_ms)} s (${toMBs(ze_ms)} MB/s) | ${se_ms <= ze_ms ? "**sarc**" : "zip"} |`,
-              `| Data integrity | ${process.env.SARC_INTEGRITY} | n/a | — |`,
+              `| Data integrity | ${process.env.SARC_INTEGRITY} | n/a | - |`,
               ``,
               `Chart committed to \`benchmarks/benchmark_results.png\`.`,
             ].join("\n");
