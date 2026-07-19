@@ -1,12 +1,19 @@
 name: Build Release Binaries
 
-# Fires when release.yml creates the GitHub release.
-# Builds multi-platform binaries with GoReleaser and uploads them
-# to the existing release as downloadable assets.
+# Automatic: fires after the Release workflow completes successfully.
+# Manual:    Actions -> "Build Release Binaries" -> enter tag to upload binaries
+#            to an existing release (e.g. backfill v1.0.0).
 
 on:
-  release:
-    types: [created]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to upload binaries to (e.g. v1.0.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,9 +21,13 @@ permissions:
 jobs:
   quality:
     name: Quality gate
+    # For workflow_run: only proceed if the Release workflow succeeded.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-go@v5
         with:
@@ -52,11 +63,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event.workflow_run.head_sha }}
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            # Read the tag from the release that triggered the Release workflow.
+            TAG=$(gh release list --repo ${{ github.repository }} --limit 1 --json tagName -q '.[0].tagName')
+            echo "value=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
@@ -66,3 +91,4 @@ jobs:
           args: release --clean --skip=validate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.value }}
