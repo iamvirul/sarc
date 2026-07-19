@@ -1,0 +1,96 @@
+name: Release
+
+# Trigger: push a version tag (v1.2.3) OR run manually from the Actions tab.
+#
+# Flow:
+#   1. This job creates the GitHub release with auto-generated notes.
+#   2. The SLSA workflow fires on the release-created event, builds
+#      signed binaries, and uploads them to the same release.
+#
+# To release from the command line:
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# To release from the UI:
+#   Actions -> Release -> Run workflow -> enter version
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Manual trigger: create and push the tag first.
+      - name: Create and push tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ github.event.inputs.version }}" \
+            -m "Release ${{ github.event.inputs.version }}"
+          git push origin "${{ github.event.inputs.version }}"
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Create the GitHub release. --generate-notes pulls from merged PR
+      # titles and descriptions since the previous tag, grouped by the
+      # categories defined in .github/release.yml.
+      - name: Create GitHub release
+        run: |
+          gh release create "${{ steps.tag.outputs.value }}" \
+            --title "${{ steps.tag.outputs.value }}" \
+            --generate-notes \
+            --verify-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Prepend the same release notes to CHANGELOG.md and commit to master.
+      - name: Update CHANGELOG.md
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          DATE=$(date +%Y-%m-%d)
+          NOTES=$(gh release view "$TAG" --json body -q .body)
+
+          if [ -f CHANGELOG.md ]; then
+            TMP=$(mktemp)
+            # Keep the first line (title), insert new entry after it.
+            head -1 CHANGELOG.md > "$TMP"
+            printf "\n## %s - %s\n\n%s\n\n---\n" "$TAG" "$DATE" "$NOTES" >> "$TMP"
+            tail -n +2 CHANGELOG.md >> "$TMP"
+            mv "$TMP" CHANGELOG.md
+          else
+            printf "# Changelog\n\n## %s - %s\n\n%s\n" "$TAG" "$DATE" "$NOTES" > CHANGELOG.md
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet || \
+            git commit -m "Update CHANGELOG for ${TAG} [skip ci]"
+          git push origin HEAD:master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
