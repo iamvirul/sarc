@@ -1,0 +1,47 @@
+# Design docs / local-only notes
+plan.md
+
+# Binaries
+/sarc
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test outputs
+*.test
+*.out
+/testdata/tmp/
+
+# Go module cache and build cache
+/vendor/
+go.sum
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Archive test outputs (never commit encrypted archives)
+*.sarc
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Profiling
+*.prof
+*.pprof
+cpu.out
+mem.out
+
+# Benchmark outputs
+/benchmarks/results/
