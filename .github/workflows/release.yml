@@ -27,6 +27,7 @@ on:
 permissions:
   contents: write
   packages: write
+  pull-requests: write
 
 jobs:
   release:
@@ -69,16 +70,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Prepend the same release notes to CHANGELOG.md and commit to master.
-      - name: Update CHANGELOG.md
+      # Prepend the same release notes to CHANGELOG.md.
+      # Opens a PR instead of pushing directly to master (branch protection).
+      # Auto-merge is enabled so it merges once CI passes.
+      - name: Update CHANGELOG.md via PR
         run: |
           TAG="${{ steps.tag.outputs.value }}"
           DATE=$(date +%Y-%m-%d)
           NOTES=$(gh release view "$TAG" --json body -q .body)
+          BRANCH="chore/changelog-${TAG}"
+
+          # Skip if CHANGELOG already has an entry for this tag.
+          if [ -f CHANGELOG.md ] && grep -q "^## ${TAG}" CHANGELOG.md; then
+            echo "CHANGELOG already contains ${TAG}, skipping PR."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
 
           if [ -f CHANGELOG.md ]; then
             TMP=$(mktemp)
-            # Keep the first line (title), insert new entry after it.
             head -1 CHANGELOG.md > "$TMP"
             printf "\n## %s - %s\n\n%s\n\n---\n" "$TAG" "$DATE" "$NOTES" >> "$TMP"
             tail -n +2 CHANGELOG.md >> "$TMP"
@@ -87,12 +100,18 @@ jobs:
             printf "# Changelog\n\n## %s - %s\n\n%s\n" "$TAG" "$DATE" "$NOTES" > CHANGELOG.md
           fi
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add CHANGELOG.md
-          git diff --cached --quiet || \
-            git commit -m "Update CHANGELOG for ${TAG} [skip ci]"
-          git push origin HEAD:master
+          git commit -m "Update CHANGELOG for ${TAG} [skip ci]"
+          git push origin "$BRANCH"
+
+          PR=$(gh pr create \
+            --title "Update CHANGELOG for ${TAG}" \
+            --body "Automated CHANGELOG update for release ${TAG}." \
+            --base master \
+            --head "$BRANCH" \
+            --label "skip-changelog")
+
+          gh pr merge "$PR" --squash --auto --delete-branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
