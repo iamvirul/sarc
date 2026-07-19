@@ -1,10 +1,10 @@
 name: Benchmark vs zip
 
 # Runs on every PR to master.
-# For a 10 GB file, switch to a larger runner:
-#   runs-on: ubuntu-latest-16-core   (requires GitHub Team/Enterprise, has 32 GB disk)
-# The default runner (ubuntu-latest, 14 GB disk) supports TEST_FILE_GB up to 2.
-# Each phase deletes large files immediately after use to minimise peak disk usage.
+# Peak disk usage: input (1 GB) + one archive (1 GB) = ~2 GB at any point.
+# To use a larger file, set TEST_FILE_GB and switch to a runner with enough disk:
+#   ubuntu-latest          14 GB disk  -> safe up to TEST_FILE_GB: 5
+#   ubuntu-latest-16-core  32 GB disk  -> safe up to TEST_FILE_GB: 10 (Team/Enterprise)
 
 on:
   pull_request:
@@ -15,14 +15,11 @@ permissions:
   pull-requests: write  # post results as PR comment
 
 env:
-  # 5 GB is the maximum safe size on ubuntu-latest (14 GB disk, peak usage ~10 GB).
-  # For 10 GB, switch to ubuntu-latest-16-core (32 GB disk, requires GitHub Team/Enterprise)
-  # and set TEST_FILE_GB: 10.
-  TEST_FILE_GB: 5
+  TEST_FILE_GB: 1
 
 jobs:
   benchmark:
-    name: "sarc vs zip - ${{ env.TEST_FILE_GB }} GB"
+    name: "sarc vs zip benchmark"
     runs-on: ubuntu-latest
 
     steps:
@@ -43,8 +40,11 @@ jobs:
       - name: Build sarc
         run: go build -o ./sarc-bin ./cmd/sarc
 
+      - name: Show available disk
+        run: df -h .
+
       # ----------------------------------------------------------------
-      # Generate test file once and compute reference checksum.
+      # Generate test file and compute reference checksum.
       # ----------------------------------------------------------------
       - name: Generate test file (${{ env.TEST_FILE_GB }} GB random data)
         run: |
@@ -52,10 +52,11 @@ jobs:
             bs=1M count=$(( TEST_FILE_GB * 1024 )) \
             status=progress 2>&1
           sha256sum testfile.bin | awk '{print $1}' > original.sha256
-          echo "Original sha256: $(cat original.sha256)"
+          echo "sha256: $(cat original.sha256)"
 
       # ----------------------------------------------------------------
-      # sarc: archive -> extract -> verify -> delete
+      # sarc: archive -> delete original -> extract -> verify -> delete all
+      # Deleting the original before extraction keeps peak usage at 2x file size.
       # ----------------------------------------------------------------
       - name: sarc archive
         run: |
@@ -66,6 +67,7 @@ jobs:
             testfile.bin
           END_NS=$(date +%s%N)
           echo "SARC_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f testfile.bin
 
       - name: sarc extract
         run: |
@@ -76,6 +78,7 @@ jobs:
             --output ./sarc-out
           END_NS=$(date +%s%N)
           echo "SARC_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f testfile.sarc
 
       - name: Verify sarc integrity
         run: |
@@ -90,13 +93,19 @@ jobs:
             echo "DATA CORRUPTION DETECTED" >&2
             exit 1
           fi
-
-      - name: Delete sarc files
-        run: rm -f testfile.sarc sarc-out/testfile.bin && rmdir sarc-out 2>/dev/null || true
+          rm -rf sarc-out
 
       # ----------------------------------------------------------------
-      # zip: archive -> extract -> delete
-      # zip will try to compress random data, so times are comparable.
+      # Regenerate test file for zip (original was deleted after sarc archive).
+      # ----------------------------------------------------------------
+      - name: Regenerate test file for zip
+        run: |
+          dd if=/dev/urandom of=testfile.bin \
+            bs=1M count=$(( TEST_FILE_GB * 1024 )) \
+            status=progress 2>&1
+
+      # ----------------------------------------------------------------
+      # zip: archive -> delete original -> extract -> delete all
       # ----------------------------------------------------------------
       - name: zip archive
         run: |
@@ -104,6 +113,7 @@ jobs:
           zip -0 testfile.zip testfile.bin
           END_NS=$(date +%s%N)
           echo "ZIP_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f testfile.bin
 
       - name: zip extract
         run: |
@@ -111,9 +121,8 @@ jobs:
           unzip -q testfile.zip -d zip-out
           END_NS=$(date +%s%N)
           echo "ZIP_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
-
-      - name: Delete zip files and test file
-        run: rm -f testfile.bin testfile.zip zip-out/testfile.bin && rmdir zip-out 2>/dev/null || true
+          rm -f testfile.zip zip-out/testfile.bin
+          rmdir zip-out 2>/dev/null || true
 
       # ----------------------------------------------------------------
       # Generate chart and commit to branch.
