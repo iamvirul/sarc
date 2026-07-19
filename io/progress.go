@@ -72,10 +72,10 @@ func (pb *ConsoleProgressBar) Done(totalFiles int, totalBytes int64, elapsed tim
 // NopProgressTracker discards all progress events.
 type NopProgressTracker struct{}
 
-func (NopProgressTracker) FileStarted(_ string, _ int64)      {}
-func (NopProgressTracker) BytesProcessed(_ int64)              {}
-func (NopProgressTracker) FileFinished(_ string)               {}
-func (NopProgressTracker) FileError(_ string, _ error)         {}
+func (NopProgressTracker) FileStarted(_ string, _ int64)        {}
+func (NopProgressTracker) BytesProcessed(_ int64)               {}
+func (NopProgressTracker) FileFinished(_ string)                {}
+func (NopProgressTracker) FileError(_ string, _ error)          {}
 func (NopProgressTracker) Done(_ int, _ int64, _ time.Duration) {}
 
 func formatBytes(b int64) string {

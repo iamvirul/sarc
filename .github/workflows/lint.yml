@@ -1,0 +1,56 @@
+name: Lint
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check go vet
+        run: go vet ./...
+
+  license:
+    name: License Header Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check copyright headers
+        run: |
+          missing=""
+          while IFS= read -r f; do
+            if ! head -1 "$f" | grep -q "^// Copyright"; then
+              missing="$missing\n  $f"
+            fi
+          done < <(git ls-files '*.go')
+
+          if [ -n "$missing" ]; then
+            echo "The following Go files are missing a copyright header:"
+            printf "$missing\n"
+            echo ""
+            echo "Run scripts/add-copyright.sh to fix."
+            exit 1
+          fi
+          echo "All Go files have copyright headers."

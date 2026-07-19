@@ -23,6 +23,12 @@ type ExtractionResult struct {
 	Err      error
 }
 
+// ListResult holds decrypted metadata for one archive entry, used by the list command.
+type ListResult struct {
+	Filename   string
+	SizeBucket string
+}
+
 // SafeExtractor decrypts and verifies files from a SARC archive.
 type SafeExtractor struct {
 	r        io.Reader
@@ -286,6 +292,103 @@ func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plai
 	}
 
 	return expected, nil
+}
+
+// List decrypts metadata for every entry and returns a ListResult per file.
+// No file content is decrypted or written to disk.
+func (se *SafeExtractor) List() ([]ListResult, error) {
+	hdr, kd, err := se.readHeader()
+	if err != nil {
+		return nil, err
+	}
+	_ = hdr
+
+	var results []ListResult
+	for {
+		result, done, err := se.listNext(kd)
+		if done {
+			break
+		}
+		if err != nil {
+			results = append(results, ListResult{Filename: "<decrypt error>", SizeBucket: "?"})
+			continue
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+func (se *SafeExtractor) listNext(kd *crypto.KeyDeriver) (ListResult, bool, error) {
+	entryTypeBuf := make([]byte, 1)
+	_, err := io.ReadFull(se.r, entryTypeBuf)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return ListResult{}, true, nil
+	}
+	if err != nil {
+		return ListResult{}, true, fatal(ErrCodeTruncated, "read entry type", err)
+	}
+	if entryTypeBuf[0] != archive.EntryTypeFile {
+		return ListResult{}, true, nil
+	}
+
+	var salt [crypto.SaltSize]byte
+	if _, err := io.ReadFull(se.r, salt[:]); err != nil {
+		return ListResult{}, false, recoverable(ErrCodeTruncated, "read entry salt", err)
+	}
+	fileKey := kd.DeriveKey(salt)
+
+	if _, err := io.ReadFull(se.r, make([]byte, 32)); err != nil {
+		return ListResult{}, false, recoverable(ErrCodeTruncated, "read frame header", err)
+	}
+
+	metaBlock, err := se.readMetadataBlock()
+	if err != nil {
+		return ListResult{}, false, err
+	}
+	mm, err := archive.NewMetadataManager(fileKey)
+	if err != nil {
+		return ListResult{}, false, fatal(ErrCodeAuthFailed, "init metadata manager", err)
+	}
+	pm, err := mm.Open(metaBlock)
+	if err != nil {
+		return ListResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt metadata", err)
+	}
+	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
+	if err != nil {
+		return ListResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt filename", err)
+	}
+
+	// Skip remaining entry bytes (inter-block pad, data blocks, trailer) by re-using Extract path.
+	if err := se.skipPadding(); err != nil {
+		return ListResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
+	}
+	if _, err := se.decryptDataBlocks(fileKey); err != nil {
+		return ListResult{}, false, err
+	}
+	if _, err := se.readAndVerifyTrailer(fileKey, nil); err != nil {
+		// Ignore HMAC mismatch on list; we only need metadata.
+		_ = err
+	}
+
+	return ListResult{
+		Filename:   filename,
+		SizeBucket: bucketName(pm.SizeBucket),
+	}, false, nil
+}
+
+func bucketName(b archive.SizeBucket) string {
+	switch b {
+	case archive.BucketTiny:
+		return "0-1 KB"
+	case archive.BucketSmall:
+		return "1-10 KB"
+	case archive.BucketMedium:
+		return "10-100 KB"
+	case archive.BucketLarge:
+		return "100 KB-1 MB"
+	default:
+		return ">1 MB"
+	}
 }
 
 // decryptFilename reverses encryptFilename: nonce(12) | ciphertext.

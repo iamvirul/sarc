@@ -11,6 +11,7 @@ const (
 	Version       uint16 = 1
 	EntryTypeFile byte   = 0x01
 	ReservedSize         = 32
+	HMACSize             = crypto.HMACSize
 )
 
 // SizeBucket is a coarse file-size class stored in metadata instead of the exact byte count.
