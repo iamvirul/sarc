@@ -1,3 +1,6 @@
+// Copyright (c) 2026 iamvirul. All rights reserved.
+// Use of this source code is governed by the MIT license.
+
 package crypto
 
 import (
@@ -11,22 +14,22 @@ import (
 const (
 	NonceSize     = 12
 	GCMTagSize    = 16
-	BaseBlockSize = 64 * 1024 // 64 KB
+	BaseBlockSize = 64 * 1024
 )
 
-// EncryptedBlock holds a single encrypted chunk along with its nonce.
-// Nonce is stored plaintext (safe with GCM) so the receiver can decrypt without extra state.
+// EncryptedBlock holds one AES-256-GCM encrypted chunk with its nonce.
+// Nonce is stored plaintext; Ciphertext includes the 16-byte GCM auth tag.
 type EncryptedBlock struct {
 	Nonce      [NonceSize]byte
-	Ciphertext []byte // includes 16-byte GCM auth tag at the end
+	Ciphertext []byte
 }
 
-// EncryptionManager performs AES-256-GCM block encryption using a derived key.
+// EncryptionManager performs AES-256-GCM block encryption with a derived key.
 type EncryptionManager struct {
 	gcm cipher.AEAD
 }
 
-// NewEncryptionManager constructs an EncryptionManager from a 32-byte AES-256 key.
+// NewEncryptionManager returns an EncryptionManager keyed by a 32-byte AES-256 key.
 func NewEncryptionManager(key [KeySize]byte) (*EncryptionManager, error) {
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
@@ -39,29 +42,29 @@ func NewEncryptionManager(key [KeySize]byte) (*EncryptionManager, error) {
 	return &EncryptionManager{gcm: gcm}, nil
 }
 
-// EncryptBlock encrypts plaintext with a freshly generated random nonce.
-// Each call produces an independent ciphertext even for identical plaintext.
+// EncryptBlock encrypts plaintext with a fresh random nonce.
 func (em *EncryptionManager) EncryptBlock(plaintext []byte) (EncryptedBlock, error) {
 	var nonce [NonceSize]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return EncryptedBlock{}, fmt.Errorf("crypto/encryption: generate nonce: %w", err)
 	}
-	ciphertext := em.gcm.Seal(nil, nonce[:], plaintext, nil)
-	return EncryptedBlock{Nonce: nonce, Ciphertext: ciphertext}, nil
+	return EncryptedBlock{
+		Nonce:      nonce,
+		Ciphertext: em.gcm.Seal(nil, nonce[:], plaintext, nil),
+	}, nil
 }
 
-// DecryptBlock authenticates and decrypts a block produced by EncryptBlock.
-// Returns an error if the GCM auth tag does not verify (tampered or wrong key).
+// DecryptBlock authenticates and decrypts a block. Returns an error if the GCM tag fails.
 func (em *EncryptionManager) DecryptBlock(block EncryptedBlock) ([]byte, error) {
-	plaintext, err := em.gcm.Open(nil, block.Nonce[:], block.Ciphertext, nil)
+	pt, err := em.gcm.Open(nil, block.Nonce[:], block.Ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("crypto/encryption: decrypt block: authentication failed: %w", err)
+		return nil, fmt.Errorf("crypto/encryption: decrypt: authentication failed: %w", err)
 	}
-	return plaintext, nil
+	return pt, nil
 }
 
-// EncryptStream reads from r in variable-size chunks and returns encrypted blocks.
-// Chunk sizes vary around BaseBlockSize to prevent size-pattern analysis.
+// EncryptStream reads r in variable-size chunks and returns the encrypted blocks.
+// Chunk sizes vary around BaseBlockSize using varGen to prevent size-pattern analysis.
 func (em *EncryptionManager) EncryptStream(r io.Reader, varGen VarianceGenerator) ([]EncryptedBlock, error) {
 	var blocks []EncryptedBlock
 	for {
@@ -88,17 +91,17 @@ func (em *EncryptionManager) EncryptStream(r io.Reader, varGen VarianceGenerator
 	return blocks, nil
 }
 
-// VarianceGenerator provides a block-size delta (can be negative) for each chunk.
+// VarianceGenerator provides a per-chunk size delta (may be negative).
 type VarianceGenerator interface {
 	Next() int
 }
 
-// RandomVarianceGenerator returns a variance in [-maxDelta, +maxDelta].
+// RandomVarianceGenerator returns a random delta in [-maxDelta, +maxDelta] per call.
 type RandomVarianceGenerator struct {
 	maxDelta int
 }
 
-// NewRandomVarianceGenerator creates a generator with variance up to maxDelta bytes.
+// NewRandomVarianceGenerator returns a generator with variance up to maxDelta bytes.
 func NewRandomVarianceGenerator(maxDelta int) *RandomVarianceGenerator {
 	return &RandomVarianceGenerator{maxDelta: maxDelta}
 }
@@ -112,7 +115,6 @@ func (g *RandomVarianceGenerator) Next() int {
 	if _, err := rand.Read(b); err != nil {
 		return 0
 	}
-	raw := int(b[0])<<8 | int(b[1])
 	span := 2*g.maxDelta + 1
-	return (raw % span) - g.maxDelta
+	return (int(b[0])<<8|int(b[1]))%span - g.maxDelta
 }

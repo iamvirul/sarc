@@ -1,3 +1,6 @@
+// Copyright (c) 2026 iamvirul. All rights reserved.
+// Use of this source code is governed by the MIT license.
+
 package crypto
 
 import (
@@ -9,8 +12,8 @@ import (
 
 const HMACSize = 32
 
-// ComputeHMAC returns HMAC-SHA256(data) keyed with key.
-// Call this on plaintext BEFORE encryption so the stored digest covers original content.
+// ComputeHMAC returns HMAC-SHA256(key, data).
+// Must be called on plaintext before encryption.
 func ComputeHMAC(key [KeySize]byte, data []byte) [HMACSize]byte {
 	mac := hmac.New(sha256.New, key[:])
 	mac.Write(data)
@@ -19,12 +22,11 @@ func ComputeHMAC(key [KeySize]byte, data []byte) [HMACSize]byte {
 	return out
 }
 
-// VerifyHMAC checks that expected == HMAC-SHA256(key, data) using a constant-time comparison.
-// Returns an error if the tag does not match, preventing timing side-channel attacks.
+// VerifyHMAC checks expected == HMAC-SHA256(key, data) in constant time.
 func VerifyHMAC(key [KeySize]byte, data []byte, expected [HMACSize]byte) error {
 	got := ComputeHMAC(key, data)
 	if subtle.ConstantTimeCompare(got[:], expected[:]) != 1 {
-		return fmt.Errorf("crypto/hmac: integrity check failed: tag mismatch")
+		return fmt.Errorf("crypto/hmac: tag mismatch")
 	}
 	return nil
 }
