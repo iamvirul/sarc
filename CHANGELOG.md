@@ -22,27 +22,7 @@
 ## New Contributors
 * @iamvirul made their first contribution in https://github.com/iamvirul/sarc/pull/1
 
-**Full Changelog**: https://github.com/iamvirul/sarc/commits/1.0.0
-
----
-
-## v1.0.0 (2026-07-19)
-
-Initial release.
-
-### Features
-
-- AES-256-GCM encryption with per-block random nonces
-- PBKDF2-SHA256 key derivation, 100k iterations, unique 32-byte salt per file
-- Anti-deduplication: random padding, variable chunk sizes, per-file key isolation
-- Metadata protection: encrypted filenames, size buckets, hashed timestamps
-- Container-level HMAC-SHA256 for tamper detection without decryption
-- Streaming archiver with < 200 MB memory footprint
-- Concurrent archiver with configurable worker count (default: NumCPU)
-- CLI commands: archive, extract, verify, list
-- SLSA level-3 signed release binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64
-
-### Security audit
+## Security audit
 
 - [x] All nonces generated with crypto/rand
 - [x] All file salts unique, 32 bytes from crypto/rand
@@ -53,3 +33,7 @@ Initial release.
 - [x] Random padding always included, never skipped
 - [x] Variable chunk sizes prevent pattern analysis
 - [x] Archive HMAC prevents container-level tampering
+
+**Full Changelog**: https://github.com/iamvirul/sarc/commits/1.0.0
+
+---
