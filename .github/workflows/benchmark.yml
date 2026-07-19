@@ -22,7 +22,7 @@ env:
 
 jobs:
   benchmark:
-    name: "sarc vs zip - ${{ env.TEST_FILE_GB }} GB"
+    name: "sarc vs zip benchmark"
     runs-on: ubuntu-latest
 
     steps:
