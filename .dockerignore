@@ -1,0 +1,8 @@
+.git
+.github
+memory/
+*.sarc
+*.md
+examples/
+benchmarks/
+testdata/

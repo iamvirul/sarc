@@ -1,0 +1,9 @@
+services:
+  sarc:
+    build: .
+    volumes:
+      - ./data:/data
+    # Override ENTRYPOINT args at runtime:
+    #   docker compose run sarc archive --password "pass" --output /data/out.sarc /data/file.txt
+    #   docker compose run sarc extract --password "pass" --archive /data/out.sarc --output /data/restored/
+    #   docker compose run sarc verify --archive /data/out.sarc
