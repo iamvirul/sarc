@@ -1,0 +1,47 @@
+version: 2
+
+project_name: sarc
+
+builds:
+  - main: ./cmd/sarc
+    binary: sarc
+    env:
+      - CGO_ENABLED=0
+      - GO111MODULE=on
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.builtBy=goreleaser
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+
+# Upload to the GitHub release that already exists (created by release.yml).
+release:
+  mode: append
+  skip_upload: false
+
+changelog:
+  disable: true

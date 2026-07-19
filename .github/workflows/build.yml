@@ -1,0 +1,68 @@
+name: Build Release Binaries
+
+# Fires when release.yml creates the GitHub release.
+# Builds multi-platform binaries with GoReleaser and uploads them
+# to the existing release as downloadable assets.
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (with race detector)
+        run: go test -race -count=1 ./...
+
+      - name: Format check
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: License header check
+        run: |
+          missing=""
+          while IFS= read -r f; do
+            if ! head -1 "$f" | grep -q "^// Copyright"; then
+              missing="$missing $f"
+            fi
+          done < <(git ls-files '*.go')
+          if [ -n "$missing" ]; then echo "Missing headers:$missing"; exit 1; fi
+
+  goreleaser:
+    name: Build and upload binaries
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
