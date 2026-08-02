@@ -30,8 +30,8 @@ type macResult struct {
 
 // encryptAndStream runs a 2-stage pipeline for a single file:
 //
-//   Stage 1 (goroutine): read plaintext -> update HMAC -> encrypt -> send DataBlock
-//   Stage 2 (caller):    receive DataBlock -> write via send()
+//	Stage 1 (goroutine): read plaintext -> update HMAC -> encrypt -> send DataBlock
+//	Stage 2 (caller):    receive DataBlock -> write via send()
 //
 // While the caller writes block N, the goroutine reads and encrypts block N+1.
 // Plaintext buffers are recycled from a sync.Pool; peak in-flight memory is
