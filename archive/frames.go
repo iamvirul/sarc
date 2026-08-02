@@ -70,6 +70,18 @@ func (fb *FrameBuilder) EncryptChunk(plaintext []byte) (DataBlock, error) {
 	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}, nil
 }
 
+// EncryptChunkInto encrypts plaintext into dst without allocating.
+// dst must have cap >= len(plaintext)+crypto.GCMTagSize. DataBlock.Ciphertext
+// is a sub-slice of dst; callers must not return dst to a pool until after
+// the DataBlock has been written to the archive.
+func (fb *FrameBuilder) EncryptChunkInto(plaintext, dst []byte) (DataBlock, error) {
+	b, err := fb.em.EncryptBlockInto(plaintext, dst)
+	if err != nil {
+		return DataBlock{}, fmt.Errorf("archive/frames: encrypt chunk: %w", err)
+	}
+	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}, nil
+}
+
 // FrameHeader returns a 32-byte random opaque header drawn from the per-file CSPRNG.
 func (fb *FrameBuilder) FrameHeader() (FrameHeader, error) {
 	var fh FrameHeader

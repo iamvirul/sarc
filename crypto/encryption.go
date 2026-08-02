@@ -62,6 +62,20 @@ func (em *EncryptionManager) EncryptBlock(plaintext []byte) (EncryptedBlock, err
 	}, nil
 }
 
+// EncryptBlockInto encrypts plaintext into dst without allocating.
+// dst must have cap >= len(plaintext)+GCMTagSize; the returned Ciphertext is a
+// sub-slice of dst. Callers that pool dst can drive per-block allocation to zero.
+func (em *EncryptionManager) EncryptBlockInto(plaintext, dst []byte) (EncryptedBlock, error) {
+	var nonce [NonceSize]byte
+	if _, err := io.ReadFull(em.rand, nonce[:]); err != nil {
+		return EncryptedBlock{}, fmt.Errorf("crypto/encryption: generate nonce: %w", err)
+	}
+	return EncryptedBlock{
+		Nonce:      nonce,
+		Ciphertext: em.gcm.Seal(dst[:0], nonce[:], plaintext, nil),
+	}, nil
+}
+
 // DecryptBlock authenticates and decrypts a block. Returns an error if the GCM tag fails.
 func (em *EncryptionManager) DecryptBlock(block EncryptedBlock) ([]byte, error) {
 	pt, err := em.gcm.Open(nil, block.Nonce[:], block.Ciphertext, nil)
