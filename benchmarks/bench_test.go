@@ -5,6 +5,7 @@ package benchmarks_test
 
 import (
 	"bytes"
+	"os"
 	"testing"
 
 	"github.com/iamvirul/sarc/crypto"
@@ -47,23 +48,30 @@ func BenchmarkDecryptBlock256KB(b *testing.B) {
 func BenchmarkStreamingArchive1MB(b *testing.B) {
 	content := bytes.Repeat([]byte("benchmark"), 1024*1024/9)
 
+	tmp, err := os.CreateTemp("", "sarc-bench-*.bin")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(content); err != nil {
+		b.Fatal(err)
+	}
+	tmp.Close()
+
 	b.SetBytes(int64(len(content)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r := bytes.NewReader(content)
 		var out bytes.Buffer
 		sa, err := sarcio.NewStreamingArchiver(&out, benchPassword, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
-		salt, _ := crypto.GenerateSalt()
-		key := crypto.NewKeyDeriver(benchPassword).DeriveKey(salt)
-		em, _ := crypto.NewEncryptionManager(key)
-		vg := crypto.NewRandomVarianceGenerator(32 * 1024)
-		if _, err := em.EncryptStream(r, vg); err != nil {
+		if err := sa.AddFile(tmp.Name()); err != nil {
 			b.Fatal(err)
 		}
-		_ = sa
+		if err := sa.Finalize(1, int64(len(content))); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -78,7 +86,26 @@ func BenchmarkKeyDerivation(b *testing.B) {
 }
 
 func BenchmarkConcurrentArchive4Workers(b *testing.B) {
-	content := bytes.Repeat([]byte("concurrent benchmark data"), 4*1024)
+	content := bytes.Repeat([]byte("concurrent benchmark data"), 256*1024)
+
+	var files [4]*os.File
+	for i := range files {
+		tmp, err := os.CreateTemp("", "sarc-bench-concurrent-*.bin")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := tmp.Write(content); err != nil {
+			b.Fatal(err)
+		}
+		tmp.Close()
+		files[i] = tmp
+		b.Cleanup(func() { os.Remove(tmp.Name()) })
+	}
+
+	paths := make([]string, 4)
+	for i, f := range files {
+		paths[i] = f.Name()
+	}
 
 	b.SetBytes(int64(len(content)) * 4)
 	b.ResetTimer()
@@ -88,6 +115,8 @@ func BenchmarkConcurrentArchive4Workers(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_ = ca
+		if err := ca.Archive(paths); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
