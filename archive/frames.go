@@ -4,7 +4,6 @@
 package archive
 
 import (
-	"crypto/rand"
 	"fmt"
 	"io"
 
@@ -18,37 +17,47 @@ const (
 )
 
 // FrameBuilder assembles the on-disk layout for a single file entry.
+// A single BufferedRand is seeded once from crypto/rand and supplies all
+// randomness needed for nonces, variance, padding, and structural fields.
 type FrameBuilder struct {
 	em      *crypto.EncryptionManager
 	padding *crypto.PaddingManager
 	varGen  crypto.VarianceGenerator
+	br      *crypto.BufferedRand
 }
 
 // NewFrameBuilder returns a FrameBuilder for a specific file key.
+// One BufferedRand is seeded from crypto/rand; all per-block random reads
+// are served from its ChaCha20 keystream with no further syscalls.
 func NewFrameBuilder(key [crypto.KeySize]byte) (*FrameBuilder, error) {
-	em, err := crypto.NewEncryptionManager(key)
+	br, err := crypto.NewBufferedRand()
+	if err != nil {
+		return nil, fmt.Errorf("archive/frames: buffered rand: %w", err)
+	}
+	em, err := crypto.NewEncryptionManagerWithRand(key, br)
 	if err != nil {
 		return nil, fmt.Errorf("archive/frames: init encryption: %w", err)
 	}
 	return &FrameBuilder{
 		em:      em,
-		padding: crypto.NewPaddingManager(),
-		varGen:  crypto.NewRandomVarianceGenerator(blockVariance),
+		padding: crypto.NewPaddingManagerWithRand(br),
+		varGen:  crypto.NewRandomVarianceGeneratorWithRand(blockVariance, br),
+		br:      br,
 	}, nil
 }
 
-// RandomFrameHeader returns a 32-byte random opaque header.
-func RandomFrameHeader() (FrameHeader, error) {
+// FrameHeader returns a 32-byte random opaque header drawn from the per-file CSPRNG.
+func (fb *FrameBuilder) FrameHeader() (FrameHeader, error) {
 	var fh FrameHeader
-	if _, err := rand.Read(fh[:]); err != nil {
-		return fh, fmt.Errorf("archive/frames: random frame header: %w", err)
+	if _, err := io.ReadFull(fb.br, fh[:]); err != nil {
+		return fh, fmt.Errorf("archive/frames: frame header: %w", err)
 	}
 	return fh, nil
 }
 
 // InterBlockPadding returns random bytes in [interBlockPadMin, interBlockPadMax].
 func (fb *FrameBuilder) InterBlockPadding() ([]byte, error) {
-	pad, err := randomRange(interBlockPadMin, interBlockPadMax)
+	pad, err := fb.randomRange(interBlockPadMin, interBlockPadMax)
 	if err != nil {
 		return nil, fmt.Errorf("archive/frames: inter-block padding: %w", err)
 	}
@@ -78,7 +87,7 @@ func (fb *FrameBuilder) BuildTrailer(plaintextHMAC [crypto.HMACSize]byte) (FileT
 	if err != nil {
 		return FileTrailer{}, fmt.Errorf("archive/frames: seal HMAC: %w", err)
 	}
-	cs, err := entryChecksum()
+	cs, err := fb.entryChecksum()
 	if err != nil {
 		return FileTrailer{}, fmt.Errorf("archive/frames: entry checksum: %w", err)
 	}
@@ -99,22 +108,22 @@ func (fb *FrameBuilder) BuildHeaderPadding() ([]byte, error) {
 	return pad, nil
 }
 
-func entryChecksum() ([8]byte, error) {
+func (fb *FrameBuilder) entryChecksum() ([8]byte, error) {
 	var cs [8]byte
-	if _, err := rand.Read(cs[:]); err != nil {
+	if _, err := io.ReadFull(fb.br, cs[:]); err != nil {
 		return cs, fmt.Errorf("archive/frames: entry checksum: %w", err)
 	}
 	return cs, nil
 }
 
-func randomRange(min, max int) ([]byte, error) {
+func (fb *FrameBuilder) randomRange(min, max int) ([]byte, error) {
 	b := make([]byte, 2)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(fb.br, b); err != nil {
 		return nil, err
 	}
 	size := min + (int(b[0])<<8|int(b[1]))%(max-min+1)
 	buf := make([]byte, size)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(fb.br, buf); err != nil {
 		return nil, err
 	}
 	return buf, nil

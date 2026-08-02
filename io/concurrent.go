@@ -175,9 +175,9 @@ func encryptFile(path string, aw *archive.ArchiveWriter, progress ProgressTracke
 	if err != nil {
 		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "init frame builder", err)
 	}
-	frameHdr, err := archive.RandomFrameHeader()
+	frameHdr, err := fb.FrameHeader()
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "random frame header", err)
+		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "frame header", err)
 	}
 	mm, err := archive.NewMetadataManager(fileKey)
 	if err != nil {

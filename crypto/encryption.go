@@ -6,7 +6,7 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
+	crand "crypto/rand"
 	"fmt"
 	"io"
 )
@@ -26,11 +26,19 @@ type EncryptedBlock struct {
 
 // EncryptionManager performs AES-256-GCM block encryption with a derived key.
 type EncryptionManager struct {
-	gcm cipher.AEAD
+	gcm  cipher.AEAD
+	rand io.Reader // nonce source; nil falls back to crypto/rand
 }
 
 // NewEncryptionManager returns an EncryptionManager keyed by a 32-byte AES-256 key.
+// Nonces are drawn from crypto/rand. Use NewEncryptionManagerWithRand on the archive
+// hot path to eliminate per-block syscalls.
 func NewEncryptionManager(key [KeySize]byte) (*EncryptionManager, error) {
+	return NewEncryptionManagerWithRand(key, crand.Reader)
+}
+
+// NewEncryptionManagerWithRand returns an EncryptionManager that draws nonces from r.
+func NewEncryptionManagerWithRand(key [KeySize]byte, r io.Reader) (*EncryptionManager, error) {
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return nil, fmt.Errorf("crypto/encryption: new cipher: %w", err)
@@ -39,13 +47,13 @@ func NewEncryptionManager(key [KeySize]byte) (*EncryptionManager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("crypto/encryption: new GCM: %w", err)
 	}
-	return &EncryptionManager{gcm: gcm}, nil
+	return &EncryptionManager{gcm: gcm, rand: r}, nil
 }
 
-// EncryptBlock encrypts plaintext with a fresh random nonce.
+// EncryptBlock encrypts plaintext with a fresh nonce drawn from em.rand.
 func (em *EncryptionManager) EncryptBlock(plaintext []byte) (EncryptedBlock, error) {
 	var nonce [NonceSize]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	if _, err := io.ReadFull(em.rand, nonce[:]); err != nil {
 		return EncryptedBlock{}, fmt.Errorf("crypto/encryption: generate nonce: %w", err)
 	}
 	return EncryptedBlock{
@@ -99,20 +107,26 @@ type VarianceGenerator interface {
 // RandomVarianceGenerator returns a random delta in [-maxDelta, +maxDelta] per call.
 type RandomVarianceGenerator struct {
 	maxDelta int
+	rand     io.Reader
 }
 
-// NewRandomVarianceGenerator returns a generator with variance up to maxDelta bytes.
+// NewRandomVarianceGenerator returns a generator that draws randomness from crypto/rand.
 func NewRandomVarianceGenerator(maxDelta int) *RandomVarianceGenerator {
-	return &RandomVarianceGenerator{maxDelta: maxDelta}
+	return &RandomVarianceGenerator{maxDelta: maxDelta, rand: crand.Reader}
 }
 
-// Next returns a cryptographically random delta in [-maxDelta, +maxDelta].
+// NewRandomVarianceGeneratorWithRand returns a generator that draws randomness from r.
+func NewRandomVarianceGeneratorWithRand(maxDelta int, r io.Reader) *RandomVarianceGenerator {
+	return &RandomVarianceGenerator{maxDelta: maxDelta, rand: r}
+}
+
+// Next returns a random delta in [-maxDelta, +maxDelta].
 func (g *RandomVarianceGenerator) Next() int {
 	if g.maxDelta == 0 {
 		return 0
 	}
 	b := make([]byte, 2)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := io.ReadFull(g.rand, b); err != nil {
 		return 0
 	}
 	span := 2*g.maxDelta + 1

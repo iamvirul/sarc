@@ -83,9 +83,9 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return fatal(ErrCodeWriteFailed, "init frame builder", err)
 	}
 
-	frameHdr, err := archive.RandomFrameHeader()
+	frameHdr, err := fb.FrameHeader()
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "random frame header", err)
+		return fatal(ErrCodeWriteFailed, "frame header", err)
 	}
 
 	mm, err := archive.NewMetadataManager(fileKey)
