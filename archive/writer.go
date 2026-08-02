@@ -4,6 +4,7 @@
 package archive
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
@@ -14,12 +15,18 @@ import (
 	"github.com/iamvirul/sarc/crypto"
 )
 
+// writeBufferSize is the size of the userspace write buffer wrapping the output sink.
+// Batching writes into 4 MB chunks reduces OS write syscalls from O(blocks) to O(MB/4).
+const writeBufferSize = 4 * 1024 * 1024
+
 // ArchiveWriter serialises a SARC archive to an io.Writer.
-// A tee maintains a running SHA-256 over all bytes written for the footer HMAC.
+// Writes are buffered through a 4 MB bufio.Writer to batch OS syscalls.
+// A MultiWriter tees every buffered write into a running SHA-256 for the footer HMAC.
 type ArchiveWriter struct {
-	w         io.Writer
+	w         io.Writer     // points to bw; footer writes bypass tee but still go here
+	bw        *bufio.Writer // flushed once in WriteFooter
 	hasher    hash.Hash
-	tee       io.Writer
+	tee       io.Writer // MultiWriter(bw, hasher) — all archive content goes through this
 	kd        *crypto.KeyDeriver
 	masterKey [crypto.KeySize]byte
 }
@@ -27,13 +34,15 @@ type ArchiveWriter struct {
 // NewArchiveWriter returns an ArchiveWriter that writes to w.
 // archiveSalt must be generated before calling this and embedded in the header.
 func NewArchiveWriter(w io.Writer, password string, archiveSalt [crypto.SaltSize]byte) (*ArchiveWriter, error) {
+	bw := bufio.NewWriterSize(w, writeBufferSize)
 	kd := crypto.NewKeyDeriver(password)
 	masterKey := kd.DeriveKey(archiveSalt)
 	hasher := sha256.New()
 	return &ArchiveWriter{
-		w:         w,
+		w:         bw,
+		bw:        bw,
 		hasher:    hasher,
-		tee:       io.MultiWriter(w, hasher),
+		tee:       io.MultiWriter(bw, hasher),
 		kd:        kd,
 		masterKey: masterKey,
 	}, nil
@@ -118,11 +127,12 @@ func (aw *ArchiveWriter) EndFileEntry(trailer FileTrailer) error {
 	return aw.writeTrailer(trailer)
 }
 
-// WriteFooter computes the archive HMAC and flushes the ArchiveFooter.
+// WriteFooter computes the archive HMAC, writes the footer, and flushes the buffer.
 // No further writes must occur after this call.
 func (aw *ArchiveWriter) WriteFooter() error {
 	var footer ArchiveFooter
 	copy(footer.ArchiveHMAC[:], aw.hasher.Sum(nil))
+	// Footer bytes go to aw.w (bufio), not aw.tee — footer must not feed the hasher.
 	if _, err := aw.w.Write(footer.ArchiveHMAC[:]); err != nil {
 		return fmt.Errorf("archive/writer: footer HMAC: %w", err)
 	}
@@ -130,7 +140,7 @@ func (aw *ArchiveWriter) WriteFooter() error {
 	if _, err := aw.w.Write(reserved); err != nil {
 		return fmt.Errorf("archive/writer: footer reserved: %w", err)
 	}
-	return nil
+	return aw.bw.Flush()
 }
 
 // DeriveFileKey derives the per-file AES-256 key from the master password and salt.
