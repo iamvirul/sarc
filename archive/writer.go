@@ -86,6 +86,38 @@ func (aw *ArchiveWriter) WriteFileEntry(entry FileEntry) error {
 	return aw.writeTrailer(entry.Trailer)
 }
 
+// BeginFileEntry writes all fields of a file entry up to (but not including) data blocks.
+// Follow with one AppendDataBlock call per encrypted chunk, then EndFileEntry.
+func (aw *ArchiveWriter) BeginFileEntry(entryType byte, salt [crypto.SaltSize]byte, frameHdr FrameHeader, meta MetadataBlock, interPad []byte) error {
+	if err := writeByte(aw.tee, entryType); err != nil {
+		return fmt.Errorf("archive/writer: entry type: %w", err)
+	}
+	if _, err := aw.tee.Write(salt[:]); err != nil {
+		return fmt.Errorf("archive/writer: entry salt: %w", err)
+	}
+	if _, err := aw.tee.Write(frameHdr[:]); err != nil {
+		return fmt.Errorf("archive/writer: frame header: %w", err)
+	}
+	if err := aw.writeMetadataBlock(meta); err != nil {
+		return err
+	}
+	return aw.writePadding(interPad)
+}
+
+// AppendDataBlock writes one encrypted data block to the stream.
+func (aw *ArchiveWriter) AppendDataBlock(db DataBlock) error {
+	return aw.writeDataBlock(db)
+}
+
+// EndFileEntry writes the data-block sentinel and the file trailer.
+// Must be called exactly once after all AppendDataBlock calls for a file.
+func (aw *ArchiveWriter) EndFileEntry(trailer FileTrailer) error {
+	if _, err := aw.tee.Write(make([]byte, crypto.NonceSize+4)); err != nil {
+		return fmt.Errorf("archive/writer: data block sentinel: %w", err)
+	}
+	return aw.writeTrailer(trailer)
+}
+
 // WriteFooter computes the archive HMAC and flushes the ArchiveFooter.
 // No further writes must occur after this call.
 func (aw *ArchiveWriter) WriteFooter() error {

@@ -4,7 +4,6 @@
 package io
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -47,7 +46,9 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 }
 
 // AddFile reads path from disk and appends it to the archive as a single file entry.
-// The file is read in chunks; plaintext HMAC is accumulated incrementally.
+// A 2-stage pipeline overlaps read+encrypt with disk writes so neither the AES unit
+// nor the I/O bus sits idle. Memory footprint is bounded to a small multiple of
+// archive.MaxChunkSize regardless of file size.
 func (sa *StreamingArchiver) AddFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -67,16 +68,6 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return fatal(ErrCodeWriteFailed, "generate file salt", err)
 	}
 	fileKey := sa.w.DeriveFileKey(salt)
-
-	// Read full plaintext into a progress-tracked buffer for HMAC and encryption.
-	// For files larger than ~200 MB the caller should use ConcurrentArchiver instead.
-	tracked := &progressReader{r: f, progress: sa.progress}
-	plaintext, err := io.ReadAll(tracked)
-	if err != nil {
-		return recoverable(ErrCodeReadFailed, "read file", err)
-	}
-
-	plaintextHMAC := crypto.ComputeHMAC(fileKey, plaintext)
 
 	fb, err := archive.NewFrameBuilder(fileKey)
 	if err != nil {
@@ -114,7 +105,14 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return fatal(ErrCodeWriteFailed, "inter-block padding", err)
 	}
 
-	dataBlocks, err := fb.EncryptStream(bytes.NewReader(plaintext))
+	if err := sa.w.BeginFileEntry(archive.EntryTypeFile, salt, frameHdr, metaBlock, interPad); err != nil {
+		return fatal(ErrCodeWriteFailed, "begin file entry", err)
+	}
+
+	tracked := &progressReader{r: f, progress: sa.progress}
+	plaintextHMAC, err := encryptAndStream(tracked, fb, fileKey, func(db archive.DataBlock) error {
+		return sa.w.AppendDataBlock(db)
+	})
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "encrypt stream", err)
 	}
@@ -124,17 +122,8 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
 
-	entry := archive.FileEntry{
-		EntryType:     archive.EntryTypeFile,
-		EntrySalt:     salt,
-		FrameHdr:      frameHdr,
-		Metadata:      metaBlock,
-		InterBlockPad: interPad,
-		DataBlocks:    dataBlocks,
-		Trailer:       trailer,
-	}
-	if err := sa.w.WriteFileEntry(entry); err != nil {
-		return fatal(ErrCodeWriteFailed, "write file entry", err)
+	if err := sa.w.EndFileEntry(trailer); err != nil {
+		return fatal(ErrCodeWriteFailed, "end file entry", err)
 	}
 
 	sa.progress.FileFinished(info.Name())
