@@ -132,13 +132,13 @@ func TestEncryptStreamRoundtrip(t *testing.T) {
 	key := crypto.NewKeyDeriver("password123").DeriveKey(salt)
 	em, _ := crypto.NewEncryptionManager(key)
 
-	content := bytes.Repeat([]byte("ABCD"), 40*1024) // ~160 KB
-	blocks, err := em.EncryptStream(bytes.NewReader(content), crypto.NewRandomVarianceGenerator(8192))
+	content := bytes.Repeat([]byte("ABCD"), 150*1024) // ~600 KB: spans at least 2 blocks at 256 KB base
+	blocks, err := em.EncryptStream(bytes.NewReader(content), crypto.NewRandomVarianceGenerator(32*1024))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(blocks) < 2 {
-		t.Fatalf("expected multiple blocks for 160 KB content, got %d", len(blocks))
+		t.Fatalf("expected multiple blocks for 600 KB content, got %d", len(blocks))
 	}
 
 	var recovered bytes.Buffer

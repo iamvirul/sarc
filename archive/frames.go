@@ -14,7 +14,7 @@ import (
 const (
 	interBlockPadMin = 256
 	interBlockPadMax = 1024
-	blockVariance    = 8 * 1024
+	blockVariance    = 32 * 1024
 )
 
 // FrameBuilder assembles the on-disk layout for a single file entry.

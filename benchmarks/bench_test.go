@@ -13,11 +13,11 @@ import (
 
 const benchPassword = "benchmark-password1"
 
-func BenchmarkEncryptBlock64KB(b *testing.B) {
+func BenchmarkEncryptBlock256KB(b *testing.B) {
 	salt, _ := crypto.GenerateSalt()
 	key := crypto.NewKeyDeriver(benchPassword).DeriveKey(salt)
 	em, _ := crypto.NewEncryptionManager(key)
-	plaintext := bytes.Repeat([]byte("X"), 64*1024)
+	plaintext := bytes.Repeat([]byte("X"), crypto.BaseBlockSize)
 
 	b.SetBytes(int64(len(plaintext)))
 	b.ResetTimer()
@@ -28,11 +28,11 @@ func BenchmarkEncryptBlock64KB(b *testing.B) {
 	}
 }
 
-func BenchmarkDecryptBlock64KB(b *testing.B) {
+func BenchmarkDecryptBlock256KB(b *testing.B) {
 	salt, _ := crypto.GenerateSalt()
 	key := crypto.NewKeyDeriver(benchPassword).DeriveKey(salt)
 	em, _ := crypto.NewEncryptionManager(key)
-	plaintext := bytes.Repeat([]byte("Y"), 64*1024)
+	plaintext := bytes.Repeat([]byte("Y"), crypto.BaseBlockSize)
 	block, _ := em.EncryptBlock(plaintext)
 
 	b.SetBytes(int64(len(plaintext)))
@@ -59,7 +59,7 @@ func BenchmarkStreamingArchive1MB(b *testing.B) {
 		salt, _ := crypto.GenerateSalt()
 		key := crypto.NewKeyDeriver(benchPassword).DeriveKey(salt)
 		em, _ := crypto.NewEncryptionManager(key)
-		vg := crypto.NewRandomVarianceGenerator(8192)
+		vg := crypto.NewRandomVarianceGenerator(32 * 1024)
 		if _, err := em.EncryptStream(r, vg); err != nil {
 			b.Fatal(err)
 		}
