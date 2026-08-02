@@ -13,7 +13,10 @@ import (
 const (
 	interBlockPadMin = 256
 	interBlockPadMax = 1024
-	blockVariance    = 32 * 1024
+	// BlockVariance is the maximum per-block size delta applied by the variance generator.
+	BlockVariance = 32 * 1024
+	// MaxChunkSize is the largest plaintext chunk the pipeline reader needs to buffer.
+	MaxChunkSize = crypto.BaseBlockSize + BlockVariance
 )
 
 // FrameBuilder assembles the on-disk layout for a single file entry.
@@ -41,9 +44,30 @@ func NewFrameBuilder(key [crypto.KeySize]byte) (*FrameBuilder, error) {
 	return &FrameBuilder{
 		em:      em,
 		padding: crypto.NewPaddingManagerWithRand(br),
-		varGen:  crypto.NewRandomVarianceGeneratorWithRand(blockVariance, br),
+		varGen:  crypto.NewRandomVarianceGeneratorWithRand(BlockVariance, br),
 		br:      br,
 	}, nil
+}
+
+// NextChunkSize returns the byte count the pipeline reader should fill for the next block.
+// Draws from the per-file variance generator; must be called on the same goroutine that
+// will call EncryptChunk so that the shared BufferedRand is not accessed concurrently.
+func (fb *FrameBuilder) NextChunkSize() int {
+	size := crypto.BaseBlockSize + fb.varGen.Next()
+	if size < 1 {
+		size = 1
+	}
+	return size
+}
+
+// EncryptChunk encrypts a single plaintext chunk and returns a DataBlock.
+// Intended for the pipeline path; the caller manages chunking via NextChunkSize.
+func (fb *FrameBuilder) EncryptChunk(plaintext []byte) (DataBlock, error) {
+	b, err := fb.em.EncryptBlock(plaintext)
+	if err != nil {
+		return DataBlock{}, fmt.Errorf("archive/frames: encrypt chunk: %w", err)
+	}
+	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}, nil
 }
 
 // FrameHeader returns a 32-byte random opaque header drawn from the per-file CSPRNG.
