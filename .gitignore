@@ -44,3 +44,9 @@ mem.out
 
 # Benchmark outputs
 /benchmarks/results/
+
+# Graphify folder
+/graphify-out
+
+# Memory
+/memory
