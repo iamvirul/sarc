@@ -14,7 +14,7 @@ import (
 const (
 	NonceSize     = 12
 	GCMTagSize    = 16
-	BaseBlockSize = 64 * 1024
+	BaseBlockSize = 256 * 1024
 )
 
 // EncryptedBlock holds one AES-256-GCM encrypted chunk with its nonce.
