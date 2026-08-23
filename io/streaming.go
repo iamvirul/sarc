@@ -131,15 +131,28 @@ func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progr
 		workers = 1
 	}
 
-	tracked := &progressReader{r: f, progress: progress}
 	send := func(db archive.DataBlock) error {
 		return aw.AppendDataBlock(db)
 	}
+
 	var plaintextHMAC [crypto.HMACSize]byte
-	if workers > 1 {
-		plaintextHMAC, err = encryptAndStreamParallel(tracked, fb, fileKey, workers, send)
+	if mapped, mmapErr := tryMmap(f, info.Size()); mmapErr == nil {
+		// mmap succeeded: encrypt straight out of the mapped page-cache pages,
+		// skipping the buffered-reader copy entirely.
+		plaintextHMAC, err = encryptAndStreamMmap(mapped.data, fb, fileKey, workers, progress, send)
+		closeErr := mapped.close()
+		if err == nil {
+			err = closeErr
+		}
 	} else {
-		plaintextHMAC, err = encryptAndStream(tracked, fb, fileKey, send)
+		// mmap unavailable (small file, unsupported platform, or a syscall failure):
+		// fall back to the buffered reader, which is always correct.
+		tracked := &progressReader{r: f, progress: progress}
+		if workers > 1 {
+			plaintextHMAC, err = encryptAndStreamParallel(tracked, fb, fileKey, workers, send)
+		} else {
+			plaintextHMAC, err = encryptAndStream(tracked, fb, fileKey, send)
+		}
 	}
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "encrypt stream", err)
