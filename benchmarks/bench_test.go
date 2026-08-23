@@ -5,7 +5,9 @@ package benchmarks_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/iamvirul/sarc/crypto"
@@ -118,5 +120,46 @@ func BenchmarkConcurrentArchive4Workers(b *testing.B) {
 		if err := ca.Archive(paths); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkSingleFileArchiveScaling archives one large file at GOMAXPROCS = 1, 2, 4, 8
+// to show intra-file block encryption scales with available cores instead of pinning a
+// single-file archive to one core regardless of machine size.
+func BenchmarkSingleFileArchiveScaling(b *testing.B) {
+	const size = 32 * 1024 * 1024
+	pattern := []byte("single-file-scaling-benchmark-data")
+	content := bytes.Repeat(pattern, size/len(pattern)+1)
+	content = content[:size]
+
+	tmp, err := os.CreateTemp("", "sarc-bench-scaling-*.bin")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := tmp.Write(content); err != nil {
+		b.Fatal(err)
+	}
+	tmp.Close()
+	b.Cleanup(func() { os.Remove(tmp.Name()) })
+
+	prevGOMAXPROCS := runtime.GOMAXPROCS(0)
+
+	for _, procs := range []int{1, 2, 4, 8} {
+		b.Run(fmt.Sprintf("GOMAXPROCS=%d", procs), func(b *testing.B) {
+			runtime.GOMAXPROCS(procs)
+			b.Cleanup(func() { runtime.GOMAXPROCS(prevGOMAXPROCS) })
+			b.SetBytes(size)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var out bytes.Buffer
+				ca, err := sarcio.NewConcurrentArchiver(&out, benchPassword, 0, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := ca.Archive([]string{tmp.Name()}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

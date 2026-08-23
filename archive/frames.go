@@ -82,6 +82,26 @@ func (fb *FrameBuilder) EncryptChunkInto(plaintext, dst []byte) (DataBlock, erro
 	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}, nil
 }
 
+// NextNonce draws the next 12-byte nonce from the per-file CSPRNG. Like NextChunkSize,
+// it must be called only from the goroutine that owns this FrameBuilder's BufferedRand;
+// pair it with EncryptChunkWithNonceInto to let the actual AES-GCM seal run on a worker
+// goroutine while nonce generation stays single-threaded.
+func (fb *FrameBuilder) NextNonce() ([crypto.NonceSize]byte, error) {
+	var nonce [crypto.NonceSize]byte
+	if _, err := io.ReadFull(fb.br, nonce[:]); err != nil {
+		return nonce, fmt.Errorf("archive/frames: next nonce: %w", err)
+	}
+	return nonce, nil
+}
+
+// EncryptChunkWithNonceInto encrypts plaintext under a nonce obtained from NextNonce,
+// writing into dst without allocating. Safe to call concurrently from multiple goroutines
+// sharing this FrameBuilder, since it touches no FrameBuilder-owned mutable state.
+func (fb *FrameBuilder) EncryptChunkWithNonceInto(nonce [crypto.NonceSize]byte, plaintext, dst []byte) DataBlock {
+	b := fb.em.EncryptBlockWithNonceInto(nonce, plaintext, dst)
+	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}
+}
+
 // FrameHeader returns a 32-byte random opaque header drawn from the per-file CSPRNG.
 func (fb *FrameBuilder) FrameHeader() (FrameHeader, error) {
 	var fh FrameHeader

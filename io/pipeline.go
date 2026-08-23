@@ -6,6 +6,7 @@ package io
 import (
 	stdhmac "crypto/hmac"
 	"crypto/sha256"
+	"errors"
 	"io"
 	"sync"
 
@@ -123,4 +124,147 @@ func encryptAndStream(
 
 	out := <-macCh
 	return out.mac, out.err
+}
+
+// parallelPipelineDepth is the number of in-flight blocks buffered per worker.
+// Total buffers in flight are bounded by workers*parallelPipelineDepth, so peak
+// memory stays a small, fixed multiple of bufSize regardless of file size.
+const parallelPipelineDepth = 4
+
+type parallelJob struct {
+	buf    *[]byte
+	n      int
+	nonce  [crypto.NonceSize]byte
+	result chan parallelResult
+}
+
+type parallelResult struct {
+	block archive.DataBlock
+	buf   *[]byte
+}
+
+type dispatchOutcome struct {
+	mac [crypto.HMACSize]byte
+	err error
+}
+
+var errDispatchCanceled = errors.New("io: encryption pipeline canceled after write failure")
+
+// encryptAndStreamParallel is a multi-worker variant of encryptAndStream: a single
+// dispatcher goroutine reads plaintext, updates the running HMAC, and draws nonces
+// (all of which must happen on one goroutine, since both the reader and the
+// FrameBuilder's BufferedRand are single-threaded by contract). The actual AES-256-GCM
+// seal for each chunk, the CPU-bound step, is handed off to one of `workers` goroutines
+// sharing the FrameBuilder's EncryptionManager, which is safe for concurrent Seal calls
+// given distinct nonces (see EncryptBlockWithNonceInto).
+//
+// Output order is preserved via a channel-of-channels: the dispatcher enqueues each
+// job's dedicated result channel onto `ordered` in dispatch order, so the caller drains
+// results in that same order regardless of which worker finishes first.
+//
+// Falls back to the sequential single-worker pipeline when workers < 2.
+func encryptAndStreamParallel(
+	r io.Reader,
+	fb *archive.FrameBuilder,
+	hmacKey [crypto.KeySize]byte,
+	workers int,
+	send func(archive.DataBlock) error,
+) ([crypto.HMACSize]byte, error) {
+	if workers < 2 {
+		return encryptAndStream(r, fb, hmacKey, send)
+	}
+
+	bufCount := workers * parallelPipelineDepth
+	freeList := make(chan *[]byte, bufCount)
+	for i := 0; i < bufCount; i++ {
+		b := make([]byte, bufSize)
+		freeList <- &b
+	}
+
+	jobs := make(chan parallelJob, bufCount)
+	ordered := make(chan chan parallelResult, bufCount)
+	cancel := make(chan struct{})
+	var cancelOnce sync.Once
+
+	var workerWG sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for j := range jobs {
+				block := fb.EncryptChunkWithNonceInto(j.nonce, (*j.buf)[:j.n], (*j.buf)[j.n:])
+				j.result <- parallelResult{block: block, buf: j.buf}
+			}
+		}()
+	}
+
+	outcomeCh := make(chan dispatchOutcome, 1)
+	go func() {
+		defer close(jobs)
+		defer close(ordered)
+		h := stdhmac.New(sha256.New, hmacKey[:])
+		for {
+			select {
+			case <-cancel:
+				outcomeCh <- dispatchOutcome{err: errDispatchCanceled}
+				return
+			default:
+			}
+
+			size := fb.NextChunkSize()
+			bp := <-freeList
+			b := *bp
+
+			n, err := io.ReadFull(r, b[:size])
+			if n > 0 {
+				h.Write(b[:n])
+				nonce, nerr := fb.NextNonce()
+				if nerr != nil {
+					freeList <- bp
+					outcomeCh <- dispatchOutcome{err: nerr}
+					return
+				}
+				resCh := make(chan parallelResult, 1)
+				ordered <- resCh
+				jobs <- parallelJob{buf: bp, n: n, nonce: nonce, result: resCh}
+			} else {
+				freeList <- bp
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			if err != nil {
+				outcomeCh <- dispatchOutcome{err: err}
+				return
+			}
+		}
+		var sum [crypto.HMACSize]byte
+		copy(sum[:], h.Sum(nil))
+		outcomeCh <- dispatchOutcome{mac: sum}
+	}()
+
+	// Drain in dispatch order. Buffers are always returned to freeList, even after a
+	// send error, so the dispatcher never stalls waiting on freeList and the pipeline
+	// can wind down cleanly instead of deadlocking.
+	var sendErr error
+	for resCh := range ordered {
+		res := <-resCh
+		if sendErr == nil {
+			if err := send(res.block); err != nil {
+				sendErr = err
+				cancelOnce.Do(func() { close(cancel) })
+			}
+		}
+		freeList <- res.buf
+	}
+	workerWG.Wait()
+	outcome := <-outcomeCh
+
+	if sendErr != nil {
+		return [crypto.HMACSize]byte{}, sendErr
+	}
+	if outcome.err != nil {
+		return [crypto.HMACSize]byte{}, outcome.err
+	}
+	return outcome.mac, nil
 }

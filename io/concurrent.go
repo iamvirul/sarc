@@ -71,7 +71,30 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 
 // Archive encrypts all paths concurrently and writes them to the archive in order.
 // Returns the first fatal error, if any. Recoverable per-file errors are reported via progress.
+//
+// A single input file cannot be parallelised across the file-level worker pool below
+// (there is only one job), so that case is routed through addFileStreaming instead,
+// which parallelises the block-level AES-256-GCM encryption of that one file across
+// ca.workers goroutines so it still saturates all available cores.
 func (ca *ConcurrentArchiver) Archive(paths []string) error {
+	if len(paths) == 1 {
+		var size int64
+		if err := addFileStreaming(ca.w, paths[0], ca.workers, ca.progress); err != nil {
+			ae, ok := err.(*ArchiveError)
+			if !ok || ae.IsFatal() {
+				return err
+			}
+			ca.progress.FileError(paths[0], err)
+		} else if info, statErr := os.Stat(paths[0]); statErr == nil {
+			size = info.Size()
+		}
+		if err := ca.w.WriteFooter(); err != nil {
+			return fatal(ErrCodeWriteFailed, "write footer", err)
+		}
+		ca.progress.Done(len(paths), size, time.Since(ca.start))
+		return nil
+	}
+
 	jobs := make(chan fileJob, len(paths))
 	results := make(chan fileResult, len(paths))
 
