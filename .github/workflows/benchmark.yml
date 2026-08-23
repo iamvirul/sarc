@@ -1,8 +1,8 @@
 name: Benchmark vs zip
 
 # Runs on every PR to master.
-# Peak disk usage: input (1 GB) + one archive (1 GB) = ~2 GB at any point.
-# To use a larger file, set TEST_FILE_GB and switch to a runner with enough disk:
+# Peak disk usage: input (1 GB) + one archive (1 GB) = ~2 GB at any point per dataset.
+# To use a larger random-data file, set TEST_FILE_GB and switch to a runner with enough disk:
 #   ubuntu-latest          14 GB disk  -> safe up to TEST_FILE_GB: 5
 #   ubuntu-latest-16-core  32 GB disk  -> safe up to TEST_FILE_GB: 10 (Team/Enterprise)
 
@@ -16,6 +16,7 @@ permissions:
 
 env:
   TEST_FILE_GB: 1
+  MESH_FILE_MB: 512
 
 jobs:
   benchmark:
@@ -43,10 +44,11 @@ jobs:
       - name: Show available disk
         run: df -h .
 
-      # ----------------------------------------------------------------
-      # Generate test file and compute reference checksum.
-      # ----------------------------------------------------------------
-      - name: Generate test file (${{ env.TEST_FILE_GB }} GB random data)
+      # ==================================================================
+      # Dataset 1: opaque random data.
+      # ==================================================================
+
+      - name: Generate random-data test file (${{ env.TEST_FILE_GB }} GB)
         run: |
           dd if=/dev/urandom of=testfile.bin \
             bs=1M count=$(( TEST_FILE_GB * 1024 )) \
@@ -54,11 +56,9 @@ jobs:
           sha256sum testfile.bin | awk '{print $1}' > original.sha256
           echo "sha256: $(cat original.sha256)"
 
-      # ----------------------------------------------------------------
       # sarc: archive -> delete original -> extract -> verify -> delete all
       # Deleting the original before extraction keeps peak usage at 2x file size.
-      # ----------------------------------------------------------------
-      - name: sarc archive
+      - name: sarc archive (random data)
         run: |
           START_NS=$(date +%s%N)
           ./sarc-bin archive \
@@ -69,7 +69,7 @@ jobs:
           echo "SARC_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
           rm -f testfile.bin
 
-      - name: sarc extract
+      - name: sarc extract (random data)
         run: |
           START_NS=$(date +%s%N)
           ./sarc-bin extract \
@@ -80,7 +80,7 @@ jobs:
           echo "SARC_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
           rm -f testfile.sarc
 
-      - name: Verify sarc integrity
+      - name: Verify sarc integrity (random data)
         run: |
           EXTRACTED_SHA=$(sha256sum sarc-out/testfile.bin | awk '{print $1}')
           ORIGINAL_SHA=$(cat original.sha256)
@@ -95,19 +95,15 @@ jobs:
           fi
           rm -rf sarc-out
 
-      # ----------------------------------------------------------------
       # Regenerate test file for zip (original was deleted after sarc archive).
-      # ----------------------------------------------------------------
-      - name: Regenerate test file for zip
+      - name: Regenerate random-data test file for zip
         run: |
           dd if=/dev/urandom of=testfile.bin \
             bs=1M count=$(( TEST_FILE_GB * 1024 )) \
             status=progress 2>&1
 
-      # ----------------------------------------------------------------
       # zip: archive -> delete original -> extract -> delete all
-      # ----------------------------------------------------------------
-      - name: zip archive
+      - name: zip archive (random data)
         run: |
           START_NS=$(date +%s%N)
           zip -0 testfile.zip testfile.bin
@@ -115,7 +111,7 @@ jobs:
           echo "ZIP_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
           rm -f testfile.bin
 
-      - name: zip extract
+      - name: zip extract (random data)
         run: |
           START_NS=$(date +%s%N)
           unzip -q testfile.zip -d zip-out
@@ -124,9 +120,77 @@ jobs:
           rm -f testfile.zip zip-out/testfile.bin
           rmdir zip-out 2>/dev/null || true
 
-      # ----------------------------------------------------------------
-      # Generate chart and commit to branch.
-      # ----------------------------------------------------------------
+      # ==================================================================
+      # Dataset 2: 3D mesh (binary STL layout - packed float32 geometry).
+      # ==================================================================
+
+      - name: Generate 3D mesh test file (${{ env.MESH_FILE_MB }} MB)
+        run: |
+          go run scripts/genmesh.go mesh.stl "${MESH_FILE_MB}"
+          sha256sum mesh.stl | awk '{print $1}' > mesh_original.sha256
+          echo "sha256: $(cat mesh_original.sha256)"
+
+      - name: sarc archive (3D mesh)
+        run: |
+          START_NS=$(date +%s%N)
+          ./sarc-bin archive \
+            --password "benchmark-password-1" \
+            --output mesh.sarc \
+            mesh.stl
+          END_NS=$(date +%s%N)
+          echo "MESH_SARC_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f mesh.stl
+
+      - name: sarc extract (3D mesh)
+        run: |
+          START_NS=$(date +%s%N)
+          ./sarc-bin extract \
+            --password "benchmark-password-1" \
+            --archive mesh.sarc \
+            --output ./mesh-sarc-out
+          END_NS=$(date +%s%N)
+          echo "MESH_SARC_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f mesh.sarc
+
+      - name: Verify sarc integrity (3D mesh)
+        run: |
+          EXTRACTED_SHA=$(sha256sum mesh-sarc-out/mesh.stl | awk '{print $1}')
+          ORIGINAL_SHA=$(cat mesh_original.sha256)
+          echo "Original : $ORIGINAL_SHA"
+          echo "Extracted: $EXTRACTED_SHA"
+          if [ "$EXTRACTED_SHA" = "$ORIGINAL_SHA" ]; then
+            echo "MESH_SARC_INTEGRITY=PASS" >> "$GITHUB_ENV"
+          else
+            echo "MESH_SARC_INTEGRITY=FAIL" >> "$GITHUB_ENV"
+            echo "DATA CORRUPTION DETECTED" >&2
+            exit 1
+          fi
+          rm -rf mesh-sarc-out
+
+      - name: Regenerate 3D mesh test file for zip
+        run: go run scripts/genmesh.go mesh.stl "${MESH_FILE_MB}"
+
+      - name: zip archive (3D mesh)
+        run: |
+          START_NS=$(date +%s%N)
+          zip -0 mesh.zip mesh.stl
+          END_NS=$(date +%s%N)
+          echo "MESH_ZIP_ARCHIVE_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f mesh.stl
+
+      - name: zip extract (3D mesh)
+        run: |
+          START_NS=$(date +%s%N)
+          unzip -q mesh.zip -d mesh-zip-out
+          END_NS=$(date +%s%N)
+          echo "MESH_ZIP_EXTRACT_MS=$(( (END_NS - START_NS) / 1000000 ))" >> "$GITHUB_ENV"
+          rm -f mesh.zip mesh-zip-out/mesh.stl
+          rmdir mesh-zip-out 2>/dev/null || true
+
+      # ==================================================================
+      # Chart + PR comment covering both datasets.
+      # ==================================================================
+
       - name: Generate benchmark chart
         env:
           SARC_ARCHIVE_MS: ${{ env.SARC_ARCHIVE_MS }}
@@ -134,6 +198,11 @@ jobs:
           SARC_EXTRACT_MS: ${{ env.SARC_EXTRACT_MS }}
           ZIP_EXTRACT_MS:  ${{ env.ZIP_EXTRACT_MS }}
           FILE_SIZE_GB:    ${{ env.TEST_FILE_GB }}
+          MESH_SARC_ARCHIVE_MS: ${{ env.MESH_SARC_ARCHIVE_MS }}
+          MESH_ZIP_ARCHIVE_MS:  ${{ env.MESH_ZIP_ARCHIVE_MS }}
+          MESH_SARC_EXTRACT_MS: ${{ env.MESH_SARC_EXTRACT_MS }}
+          MESH_ZIP_EXTRACT_MS:  ${{ env.MESH_ZIP_EXTRACT_MS }}
+          MESH_FILE_MB:         ${{ env.MESH_FILE_MB }}
         run: python3 scripts/gen-benchmark-chart.py
 
       - name: Commit chart to PR branch
@@ -144,9 +213,6 @@ jobs:
           git diff --cached --quiet || git commit -m "Update benchmark results chart [skip ci]"
           git push
 
-      # ----------------------------------------------------------------
-      # Post summary as PR comment.
-      # ----------------------------------------------------------------
       - name: Post benchmark results as PR comment
         uses: actions/github-script@v7
         env:
@@ -156,11 +222,17 @@ jobs:
           ZIP_EXTRACT_MS:  ${{ env.ZIP_EXTRACT_MS }}
           SARC_INTEGRITY:  ${{ env.SARC_INTEGRITY }}
           FILE_SIZE_GB:    ${{ env.TEST_FILE_GB }}
+          MESH_SARC_ARCHIVE_MS: ${{ env.MESH_SARC_ARCHIVE_MS }}
+          MESH_ZIP_ARCHIVE_MS:  ${{ env.MESH_ZIP_ARCHIVE_MS }}
+          MESH_SARC_EXTRACT_MS: ${{ env.MESH_SARC_EXTRACT_MS }}
+          MESH_ZIP_EXTRACT_MS:  ${{ env.MESH_ZIP_EXTRACT_MS }}
+          MESH_SARC_INTEGRITY:  ${{ env.MESH_SARC_INTEGRITY }}
+          MESH_FILE_MB:         ${{ env.MESH_FILE_MB }}
         with:
           script: |
             const gb       = parseFloat(process.env.FILE_SIZE_GB);
             const mbTotal  = gb * 1024;
-            const toMBs    = ms => ms > 0 ? (mbTotal / (ms / 1000)).toFixed(0) : "n/a";
+            const toMBs    = (ms, totalMb) => ms > 0 ? (totalMb / (ms / 1000)).toFixed(0) : "n/a";
             const toSec    = ms => (ms / 1000).toFixed(2);
 
             const sa_ms = parseInt(process.env.SARC_ARCHIVE_MS);
@@ -168,14 +240,30 @@ jobs:
             const se_ms = parseInt(process.env.SARC_EXTRACT_MS);
             const ze_ms = parseInt(process.env.ZIP_EXTRACT_MS);
 
+            const meshMb = parseFloat(process.env.MESH_FILE_MB);
+            const msa_ms = parseInt(process.env.MESH_SARC_ARCHIVE_MS);
+            const mza_ms = parseInt(process.env.MESH_ZIP_ARCHIVE_MS);
+            const mse_ms = parseInt(process.env.MESH_SARC_EXTRACT_MS);
+            const mze_ms = parseInt(process.env.MESH_ZIP_EXTRACT_MS);
+
             const body = [
-              `## Benchmark results - ${gb} GB random data`,
+              `## Benchmark results - sarc vs zip`,
+              ``,
+              `### Random data - ${gb} GB`,
               ``,
               `| Operation | sarc | zip | winner |`,
               `|---|---|---|---|`,
-              `| Archive time | ${toSec(sa_ms)} s (${toMBs(sa_ms)} MB/s) | ${toSec(za_ms)} s (${toMBs(za_ms)} MB/s) | ${sa_ms <= za_ms ? "**sarc**" : "zip"} |`,
-              `| Extract time | ${toSec(se_ms)} s (${toMBs(se_ms)} MB/s) | ${toSec(ze_ms)} s (${toMBs(ze_ms)} MB/s) | ${se_ms <= ze_ms ? "**sarc**" : "zip"} |`,
+              `| Archive time | ${toSec(sa_ms)} s (${toMBs(sa_ms, mbTotal)} MB/s) | ${toSec(za_ms)} s (${toMBs(za_ms, mbTotal)} MB/s) | ${sa_ms <= za_ms ? "**sarc**" : "zip"} |`,
+              `| Extract time | ${toSec(se_ms)} s (${toMBs(se_ms, mbTotal)} MB/s) | ${toSec(ze_ms)} s (${toMBs(ze_ms, mbTotal)} MB/s) | ${se_ms <= ze_ms ? "**sarc**" : "zip"} |`,
               `| Data integrity | ${process.env.SARC_INTEGRITY} | n/a | - |`,
+              ``,
+              `### 3D mesh (binary STL) - ${meshMb} MB`,
+              ``,
+              `| Operation | sarc | zip | winner |`,
+              `|---|---|---|---|`,
+              `| Archive time | ${toSec(msa_ms)} s (${toMBs(msa_ms, meshMb)} MB/s) | ${toSec(mza_ms)} s (${toMBs(mza_ms, meshMb)} MB/s) | ${msa_ms <= mza_ms ? "**sarc**" : "zip"} |`,
+              `| Extract time | ${toSec(mse_ms)} s (${toMBs(mse_ms, meshMb)} MB/s) | ${toSec(mze_ms)} s (${toMBs(mze_ms, meshMb)} MB/s) | ${mse_ms <= mze_ms ? "**sarc**" : "zip"} |`,
+              `| Data integrity | ${process.env.MESH_SARC_INTEGRITY} | n/a | - |`,
               ``,
               `Chart committed to \`benchmarks/benchmark_results.png\`.`,
             ].join("\n");
