@@ -13,6 +13,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -106,6 +107,131 @@ func buildBinarySTL(triangleCount int) []byte {
 		binary.Write(buf, binary.LittleEndian, uint16(0))
 	}
 	return buf.Bytes()
+}
+
+// buildBinarySTLFile streams a synthetic binary STL mesh directly to path,
+// using the same layout as buildBinarySTL, without holding the full file in
+// memory. Returns the SHA-256 of the bytes written.
+func buildBinarySTLFile(t *testing.T, path string, triangleCount int) [32]byte {
+	t.Helper()
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create mesh file: %v", err)
+	}
+	hasher := sha256.New()
+	w := io.MultiWriter(f, hasher)
+
+	if _, err := w.Write(bytes.Repeat([]byte{0xAB}, 80)); err != nil {
+		t.Fatalf("write mesh header: %v", err)
+	}
+	countBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(countBuf, uint32(triangleCount))
+	if _, err := w.Write(countBuf); err != nil {
+		t.Fatalf("write triangle count: %v", err)
+	}
+
+	triBuf := make([]byte, 50)
+	for i := 0; i < triangleCount; i++ {
+		vals := [12]float32{
+			0, 0, 1,
+			float32(i), float32(i) + 1, float32(i) + 2,
+			float32(i) + 3, float32(i) + 4, float32(i) + 5,
+			float32(i) + 6, float32(i) + 7, float32(i) + 8,
+		}
+		for j, v := range vals {
+			binary.LittleEndian.PutUint32(triBuf[j*4:], math.Float32bits(v))
+		}
+		binary.LittleEndian.PutUint16(triBuf[48:], 0)
+		if _, err := w.Write(triBuf); err != nil {
+			t.Fatalf("write triangle %d: %v", i, err)
+		}
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close mesh file: %v", err)
+	}
+	var sum [32]byte
+	copy(sum[:], hasher.Sum(nil))
+	return sum
+}
+
+// hashFile computes the SHA-256 of the file at path by streaming it in
+// fixed-size chunks, without loading the whole file into memory.
+func hashFile(t *testing.T, path string) [32]byte {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s for hashing: %v", path, err)
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	buf := make([]byte, 4<<20)
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			hasher.Write(buf[:n])
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	var sum [32]byte
+	copy(sum[:], hasher.Sum(nil))
+	return sum
+}
+
+// archiveExtractFile archives src into a sarc container and extracts it back,
+// streaming through disk at every stage (no full-file in-memory buffers), and
+// returns the path to the extracted file. Suitable for large payloads.
+func archiveExtractFile(t *testing.T, src string) string {
+	t.Helper()
+
+	archivePath := filepath.Join(t.TempDir(), "archive.sarc")
+	archiveFile, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatalf("create archive file: %v", err)
+	}
+	sa, err := sarcio.NewStreamingArchiver(archiveFile, binaryRoundtripPassword, nil)
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	if err := sa.AddFile(src); err != nil {
+		t.Fatalf("add file: %v", err)
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("stat src: %v", err)
+	}
+	if err := sa.Finalize(1, info.Size()); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if err := archiveFile.Close(); err != nil {
+		t.Fatalf("close archive file: %v", err)
+	}
+
+	archiveRead, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatalf("reopen archive file: %v", err)
+	}
+	defer archiveRead.Close()
+
+	outDir := t.TempDir()
+	ex := sarcio.NewSafeExtractor(archiveRead, binaryRoundtripPassword, nil)
+	results, err := ex.Extract(outDir)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if len(results) != 1 || !results[0].OK {
+		var extractErr error
+		if len(results) == 1 {
+			extractErr = results[0].Err
+		}
+		t.Fatalf("extraction failed: %v", extractErr)
+	}
+
+	return filepath.Join(outDir, filepath.Base(src))
 }
 
 // buildELF produces a minimal valid ELF64 header (little-endian, x86-64)
@@ -219,6 +345,27 @@ func TestBinaryRoundtrip3DMesh(t *testing.T) {
 	assertByteIdentical(t, original, extracted)
 }
 
+// TestBinaryRoundtrip3DMeshLarge verifies a large packed float32 mesh
+// (~200 MB binary STL, several million triangles) survives archive +
+// extract byte-for-byte. Skipped under -short.
+func TestBinaryRoundtrip3DMeshLarge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large 3D mesh roundtrip test in -short mode")
+	}
+
+	const triangleCount = 4_000_000 // ~200 MB (84-byte header + 50 bytes/triangle)
+
+	src := filepath.Join(t.TempDir(), "large_mesh.stl")
+	wantSum := buildBinarySTLFile(t, src, triangleCount)
+
+	extractedPath := archiveExtractFile(t, src)
+	gotSum := hashFile(t, extractedPath)
+
+	if wantSum != gotSum {
+		t.Fatalf("SHA-256 mismatch on large mesh roundtrip: want %x, got %x", wantSum, gotSum)
+	}
+}
+
 // TestBinaryRoundtripPNG verifies a valid PNG (with correct chunk CRCs)
 // survives archive + extract byte-for-byte.
 func TestBinaryRoundtripPNG(t *testing.T) {
@@ -316,6 +463,7 @@ func TestBinaryRoundtripLargeFile1GB(t *testing.T) {
 		t.Fatalf("create large file: %v", err)
 	}
 	hasher := sha256.New()
+	w := io.MultiWriter(f, hasher)
 	buf := make([]byte, 4<<20)
 	remaining := int64(size)
 	for remaining > 0 {
@@ -326,76 +474,21 @@ func TestBinaryRoundtripLargeFile1GB(t *testing.T) {
 		if _, err := rand.Read(buf[:n]); err != nil {
 			t.Fatalf("generate random data: %v", err)
 		}
-		if _, err := f.Write(buf[:n]); err != nil {
+		if _, err := w.Write(buf[:n]); err != nil {
 			t.Fatalf("write large file: %v", err)
 		}
-		hasher.Write(buf[:n])
 		remaining -= n
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("close large file: %v", err)
 	}
-	wantSum := hasher.Sum(nil)
+	var wantSum [32]byte
+	copy(wantSum[:], hasher.Sum(nil))
 
-	archivePath := filepath.Join(t.TempDir(), "large.sarc")
-	archiveFile, err := os.Create(archivePath)
-	if err != nil {
-		t.Fatalf("create archive file: %v", err)
-	}
-	sa, err := sarcio.NewStreamingArchiver(archiveFile, binaryRoundtripPassword, nil)
-	if err != nil {
-		t.Fatalf("new archiver: %v", err)
-	}
-	if err := sa.AddFile(src); err != nil {
-		t.Fatalf("add file: %v", err)
-	}
-	if err := sa.Finalize(1, size); err != nil {
-		t.Fatalf("finalize: %v", err)
-	}
-	if err := archiveFile.Close(); err != nil {
-		t.Fatalf("close archive file: %v", err)
-	}
+	extractedPath := archiveExtractFile(t, src)
+	gotSum := hashFile(t, extractedPath)
 
-	archiveRead, err := os.Open(archivePath)
-	if err != nil {
-		t.Fatalf("reopen archive file: %v", err)
-	}
-	defer archiveRead.Close()
-
-	outDir := t.TempDir()
-	ex := sarcio.NewSafeExtractor(archiveRead, binaryRoundtripPassword, nil)
-	results, err := ex.Extract(outDir)
-	if err != nil {
-		t.Fatalf("extract: %v", err)
-	}
-	if len(results) != 1 || !results[0].OK {
-		var extractErr error
-		if len(results) == 1 {
-			extractErr = results[0].Err
-		}
-		t.Fatalf("extraction failed: %v", extractErr)
-	}
-
-	extractedFile, err := os.Open(filepath.Join(outDir, "large.bin"))
-	if err != nil {
-		t.Fatalf("open extracted large file: %v", err)
-	}
-	defer extractedFile.Close()
-
-	extractedHasher := sha256.New()
-	buf2 := make([]byte, 4<<20)
-	for {
-		n, rerr := extractedFile.Read(buf2)
-		if n > 0 {
-			extractedHasher.Write(buf2[:n])
-		}
-		if rerr != nil {
-			break
-		}
-	}
-	gotSum := extractedHasher.Sum(nil)
-
-	if !bytes.Equal(wantSum, gotSum) {
+	if wantSum != gotSum {
 		t.Fatalf("SHA-256 mismatch on 1 GB roundtrip: want %x, got %x", wantSum, gotSum)
 	}
 }
