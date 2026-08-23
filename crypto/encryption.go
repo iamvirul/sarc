@@ -76,6 +76,20 @@ func (em *EncryptionManager) EncryptBlockInto(plaintext, dst []byte) (EncryptedB
 	}, nil
 }
 
+// EncryptBlockWithNonceInto seals plaintext under an externally supplied nonce, writing
+// into dst without allocating. dst must have cap >= len(plaintext)+GCMTagSize.
+//
+// The nonce must never repeat under this key. Unlike EncryptBlock/EncryptBlockInto, this
+// method draws no randomness and touches no em fields, so it is safe to call concurrently
+// from multiple goroutines sharing one EncryptionManager as long as each call is given a
+// distinct nonce (e.g. generated sequentially by a single caller before dispatch).
+func (em *EncryptionManager) EncryptBlockWithNonceInto(nonce [NonceSize]byte, plaintext, dst []byte) EncryptedBlock {
+	return EncryptedBlock{
+		Nonce:      nonce,
+		Ciphertext: em.gcm.Seal(dst[:0], nonce[:], plaintext, nil),
+	}
+}
+
 // DecryptBlock authenticates and decrypts a block. Returns an error if the GCM tag fails.
 func (em *EncryptionManager) DecryptBlock(block EncryptedBlock) ([]byte, error) {
 	pt, err := em.gcm.Open(nil, block.Nonce[:], block.Ciphertext, nil)

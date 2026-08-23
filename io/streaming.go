@@ -7,11 +7,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
 )
+
+// minParallelFileSize is the smallest file size for which intra-file parallel block
+// encryption is worth the goroutine/channel setup cost. Below this, files rarely span
+// more than a handful of blocks per worker, so the sequential pipeline wins on overhead.
+const minParallelFileSize = 4 * 1024 * 1024
 
 // StreamingArchiver archives files one at a time without loading entire files into memory.
 // Maximum memory footprint is approximately one chunk (~64 KB) per file at any point.
@@ -46,10 +52,19 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 }
 
 // AddFile reads path from disk and appends it to the archive as a single file entry.
-// A 2-stage pipeline overlaps read+encrypt with disk writes so neither the AES unit
-// nor the I/O bus sits idle. Memory footprint is bounded to a small multiple of
-// archive.MaxChunkSize regardless of file size.
+// Plaintext is read from disk, HMAC'd, and chunked on one goroutine; the AES-256-GCM
+// seal for each chunk runs across up to GOMAXPROCS worker goroutines once the file is
+// large enough to benefit (see minParallelFileSize), so a single large file saturates
+// all available cores instead of just one. Memory footprint stays a small, fixed
+// multiple of archive.MaxChunkSize regardless of file size.
 func (sa *StreamingArchiver) AddFile(path string) error {
+	return addFileStreaming(sa.w, path, runtime.GOMAXPROCS(0), sa.progress)
+}
+
+// addFileStreaming streams path into aw as one file entry, encrypting chunks across
+// `workers` goroutines when the file is large enough to benefit (see minParallelFileSize).
+// Shared by StreamingArchiver and ConcurrentArchiver's single-file fast path.
+func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progress ProgressTracker) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return recoverable(ErrCodeReadFailed, "open file", err)
@@ -61,13 +76,13 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return recoverable(ErrCodeReadFailed, "stat file", err)
 	}
 
-	sa.progress.FileStarted(info.Name(), info.Size())
+	progress.FileStarted(info.Name(), info.Size())
 
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "generate file salt", err)
 	}
-	fileKey := sa.w.DeriveFileKey(salt)
+	fileKey := aw.DeriveFileKey(salt)
 
 	fb, err := archive.NewFrameBuilder(fileKey)
 	if err != nil {
@@ -105,14 +120,27 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return fatal(ErrCodeWriteFailed, "inter-block padding", err)
 	}
 
-	if err := sa.w.BeginFileEntry(archive.EntryTypeFile, salt, frameHdr, metaBlock, interPad); err != nil {
+	if err := aw.BeginFileEntry(archive.EntryTypeFile, salt, frameHdr, metaBlock, interPad); err != nil {
 		return fatal(ErrCodeWriteFailed, "begin file entry", err)
 	}
 
-	tracked := &progressReader{r: f, progress: sa.progress}
-	plaintextHMAC, err := encryptAndStream(tracked, fb, fileKey, func(db archive.DataBlock) error {
-		return sa.w.AppendDataBlock(db)
-	})
+	if workers < 1 {
+		workers = 1
+	}
+	if info.Size() < minParallelFileSize {
+		workers = 1
+	}
+
+	tracked := &progressReader{r: f, progress: progress}
+	send := func(db archive.DataBlock) error {
+		return aw.AppendDataBlock(db)
+	}
+	var plaintextHMAC [crypto.HMACSize]byte
+	if workers > 1 {
+		plaintextHMAC, err = encryptAndStreamParallel(tracked, fb, fileKey, workers, send)
+	} else {
+		plaintextHMAC, err = encryptAndStream(tracked, fb, fileKey, send)
+	}
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "encrypt stream", err)
 	}
@@ -122,11 +150,11 @@ func (sa *StreamingArchiver) AddFile(path string) error {
 		return fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
 
-	if err := sa.w.EndFileEntry(trailer); err != nil {
+	if err := aw.EndFileEntry(trailer); err != nil {
 		return fatal(ErrCodeWriteFailed, "end file entry", err)
 	}
 
-	sa.progress.FileFinished(info.Name())
+	progress.FileFinished(info.Name())
 	return nil
 }
 

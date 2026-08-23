@@ -4,12 +4,12 @@
 package io
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
@@ -157,7 +157,7 @@ func (se *SafeExtractor) extractNext(hdr archive.ArchiveHeader, kd *crypto.KeyDe
 		return ExtractionResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
 
-	plaintext, err := se.decryptDataBlocks(fileKey)
+	plaintext, err := se.decryptDataBlocks(fileKey, pm.SizeBucket)
 	if err != nil {
 		return ExtractionResult{}, false, err
 	}
@@ -208,44 +208,64 @@ func (se *SafeExtractor) skipPadding() error {
 	return nil
 }
 
-func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte) ([]byte, error) {
+// decryptDataBlocks reads and authenticates a file's data blocks, decrypting them in
+// parallel across up to GOMAXPROCS worker goroutines for entries large enough to
+// benefit (BucketLarge/BucketHuge, i.e. > 100 KB). Block framing (nonce, size,
+// ciphertext) is parsed sequentially since block boundaries can only be found by
+// reading in order; the CPU-bound AES-256-GCM Open call for each block is what gets
+// parallelised.
+func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket archive.SizeBucket) ([]byte, error) {
 	em, err := crypto.NewEncryptionManager(fileKey)
 	if err != nil {
 		return nil, fatal(ErrCodeAuthFailed, "init block decryptor", err)
 	}
-	var buf bytes.Buffer
-	for {
+
+	var readErr error
+	next := func() ([crypto.NonceSize]byte, []byte, bool, error) {
 		var nonce [crypto.NonceSize]byte
 		_, err := io.ReadFull(se.r, nonce[:])
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
+			return nonce, nil, false, nil
 		}
 		if err != nil {
-			return nil, recoverable(ErrCodeTruncated, "read block nonce", err)
+			readErr = recoverable(ErrCodeTruncated, "read block nonce", err)
+			return nonce, nil, false, readErr
 		}
 
 		sizeBuf := make([]byte, 4)
 		if _, err := io.ReadFull(se.r, sizeBuf); err != nil {
-			return nil, recoverable(ErrCodeTruncated, "read block size", err)
+			readErr = recoverable(ErrCodeTruncated, "read block size", err)
+			return nonce, nil, false, readErr
 		}
 		blockSize := binary.LittleEndian.Uint32(sizeBuf)
 
 		// Sentinel: a zero-length block marks the end of data blocks.
 		if blockSize == 0 {
-			break
+			return nonce, nil, false, nil
 		}
 
 		ct := make([]byte, blockSize)
 		if _, err := io.ReadFull(se.r, ct); err != nil {
-			return nil, recoverable(ErrCodeTruncated, "read block ciphertext", err)
+			readErr = recoverable(ErrCodeTruncated, "read block ciphertext", err)
+			return nonce, nil, false, readErr
 		}
-		pt, err := em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: ct})
-		if err != nil {
-			return nil, recoverable(ErrCodeAuthFailed, "decrypt block", err)
-		}
-		buf.Write(pt)
+		return nonce, ct, true, nil
 	}
-	return buf.Bytes(), nil
+
+	workers := 1
+	if bucket >= archive.BucketLarge {
+		if w := runtime.GOMAXPROCS(0); w > 1 {
+			workers = w
+		}
+	}
+	plaintext, err := decryptBlocksParallel(em, workers, next)
+	if err != nil {
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, recoverable(ErrCodeAuthFailed, "decrypt block", err)
+	}
+	return plaintext, nil
 }
 
 func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plaintext []byte) ([crypto.HMACSize]byte, error) {
@@ -362,7 +382,7 @@ func (se *SafeExtractor) listNext(kd *crypto.KeyDeriver) (ListResult, bool, erro
 	if err := se.skipPadding(); err != nil {
 		return ListResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
-	if _, err := se.decryptDataBlocks(fileKey); err != nil {
+	if _, err := se.decryptDataBlocks(fileKey, pm.SizeBucket); err != nil {
 		return ListResult{}, false, err
 	}
 	if _, err := se.readAndVerifyTrailer(fileKey, nil); err != nil {
