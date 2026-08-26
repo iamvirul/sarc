@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.1.0 - 2026-08-26
+
+<!-- Release notes generated using configuration in .github/release.yml at 1.1.0 -->
+
+## What's Changed
+### New Features
+* perf: replace crypto/rand hot-path reads with BufferedRand by @iamvirul in https://github.com/iamvirul/sarc/pull/37
+* perf: pipeline read+encrypt with write via 2-stage goroutine by @iamvirul in https://github.com/iamvirul/sarc/pull/38
+* perf: zero-alloc hot path via combined plaintext+ciphertext pool by @iamvirul in https://github.com/iamvirul/sarc/pull/39
+* Parallelise intra-file block encryption and decryption by @iamvirul in https://github.com/iamvirul/sarc/pull/42
+* Memory-mapped I/O for files >= 64 MB by @iamvirul in https://github.com/iamvirul/sarc/pull/43
+* Pre-allocate output file to reduce fragmentation on large archives by @iamvirul in https://github.com/iamvirul/sarc/pull/45
+### Bug Fixes
+* Replace broken SLSA workflow with GoReleaser for release binaries by @iamvirul in https://github.com/iamvirul/sarc/pull/13
+* Replace broken SLSA workflow with GoReleaser for release binaries by @iamvirul in https://github.com/iamvirul/sarc/pull/14
+* Add binary format roundtrip tests and 3D mesh benchmark by @iamvirul in https://github.com/iamvirul/sarc/pull/41
+### Security
+* perf: increase block size from 64 KB to 256 KB by @iamvirul in https://github.com/iamvirul/sarc/pull/36
+* perf: buffer ArchiveWriter output to batch OS write syscalls by @iamvirul in https://github.com/iamvirul/sarc/pull/40
+### Documentation
+* Add CLAUDE.md for Claude Code guidance by @iamvirul in https://github.com/iamvirul/sarc/pull/35
+### Other Changes
+* Add regression benchmarks for small-file archive targets by @iamvirul in https://github.com/iamvirul/sarc/pull/44
+
+## New Contributors
+* @github-actions[bot] made their first contribution in https://github.com/iamvirul/sarc/pull/12
+
+**Full Changelog**: https://github.com/iamvirul/sarc/compare/1.0.0...1.1.0
+
+---
+
 ## 1.0.0 - 2026-07-19
 
 <!-- Release notes generated using configuration in .github/release.yml at 1.0.0 -->
