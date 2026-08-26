@@ -41,6 +41,16 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 	defer f.Close()
 
+	var totalInputBytes int64
+	for _, path := range args {
+		if info, statErr := os.Stat(path); statErr == nil {
+			totalInputBytes += info.Size()
+		}
+	}
+	if err := sarcio.PreallocateOutput(f, totalInputBytes); err != nil {
+		log.Debug("preallocate output file skipped", "err", err)
+	}
+
 	progress := sarcio.NewConsoleProgressBar(os.Stdout)
 
 	if flagParallel != 1 {
@@ -57,17 +67,12 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	var totalBytes int64
 	for _, path := range args {
-		info, statErr := os.Stat(path)
-		if statErr == nil {
-			totalBytes += info.Size()
-		}
 		if err := sa.AddFile(path); err != nil {
 			log.Error("file failed", "path", path, "err", err)
 		}
 	}
-	return sa.Finalize(len(args), totalBytes)
+	return sa.Finalize(len(args), totalInputBytes)
 }
 
 func validatePassword(p string) error {
