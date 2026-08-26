@@ -163,3 +163,62 @@ func BenchmarkSingleFileArchiveScaling(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkArchiveSizeTargets times a single-file archive through NewConcurrentArchiver
+// (the CLI's default path for `sarc archive <file>`) at each size from issue #24's
+// target table, as a permanent, visible regression guard:
+//
+//	1 KB   < 50ms   1 MB   < 100ms   10 MB  < 500ms   100 MB < 2s
+//
+// The table's 1 GB / < 10s row is already covered on every PR by the "sarc vs zip"
+// workflow (.github/workflows/benchmark.yml), which archives a real 1 GB file with the
+// built CLI binary and posts throughput as a PR comment; duplicating that here would
+// make the `-benchtime=1x` smoke run (see CLAUDE.md) write and archive an extra 1 GB
+// file on every CI run for no new coverage.
+//
+// Read ns/op from `go test -bench=BenchmarkArchiveSizeTargets -benchtime=Nx` output and
+// compare against the target in each sub-benchmark's name; this file intentionally does
+// not assert against the targets with b.Fatal, since a hard time-based pass/fail is
+// prone to flake on shared/noisy CI runners.
+func BenchmarkArchiveSizeTargets(b *testing.B) {
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"1KB_target-50ms", 1024},
+		{"1MB_target-100ms", 1024 * 1024},
+		{"10MB_target-500ms", 10 * 1024 * 1024},
+		{"100MB_target-2s", 100 * 1024 * 1024},
+	}
+
+	for _, s := range sizes {
+		b.Run(s.name, func(b *testing.B) {
+			pattern := []byte("sarc-archive-size-target-benchmark")
+			content := bytes.Repeat(pattern, s.size/len(pattern)+1)
+			content = content[:s.size]
+
+			tmp, err := os.CreateTemp("", "sarc-bench-target-*.bin")
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := tmp.Write(content); err != nil {
+				b.Fatal(err)
+			}
+			tmp.Close()
+			b.Cleanup(func() { os.Remove(tmp.Name()) })
+
+			b.SetBytes(int64(s.size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var out bytes.Buffer
+				ca, err := sarcio.NewConcurrentArchiver(&out, benchPassword, 0, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := ca.Archive([]string{tmp.Name()}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
