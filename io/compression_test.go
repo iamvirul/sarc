@@ -96,3 +96,14 @@ func TestArchiverRejectsInvalidCompressionOptions(t *testing.T) {
 		t.Fatalf("concurrent: want %s, got %v", ErrCodeInvalidOption, err)
 	}
 }
+
+func TestOnlyAutoModeBuildsProbeCompressor(t *testing.T) {
+	if mustPolicy(t, CompressionAuto).probeCompressor == nil {
+		t.Fatal("auto mode has no probe compressor")
+	}
+	for _, mode := range []CompressionMode{CompressionAlways, CompressionNever} {
+		if mustPolicy(t, mode).probeCompressor != nil {
+			t.Fatalf("%v mode built an unused probe compressor", mode)
+		}
+	}
+}

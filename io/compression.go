@@ -84,6 +84,9 @@ func WithCompression(opts CompressionOptions) ArchiverOption {
 type compressionPolicy struct {
 	mode       CompressionMode
 	compressor *archive.BlockCompressor // nil when mode is CompressionNever
+	// probeCompressor runs CompressionAuto's test compression at the fastest level: the
+	// probe only estimates compressibility, and a high-level encoder would cost tens of MB.
+	probeCompressor *archive.BlockCompressor // nil unless mode is CompressionAuto
 }
 
 // newCompressionPolicy validates opts and builds the shared compressor.
@@ -96,7 +99,13 @@ func newCompressionPolicy(opts CompressionOptions) (*compressionPolicy, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &compressionPolicy{mode: opts.Mode, compressor: bc}, nil
+		p := &compressionPolicy{mode: opts.Mode, compressor: bc}
+		if opts.Mode == CompressionAuto {
+			if p.probeCompressor, err = archive.NewBlockCompressor(archive.MinCompressionLevel); err != nil {
+				return nil, err
+			}
+		}
+		return p, nil
 	default:
 		return nil, fmt.Errorf("io/compression: unknown compression mode %d", opts.Mode)
 	}
@@ -125,7 +134,7 @@ func (p *compressionPolicy) codecFor(name string, probe []byte) archive.Codec {
 		if _, skip := incompressibleExtensions[strings.ToLower(filepath.Ext(name))]; skip || len(probe) == 0 {
 			return archive.CodecNone
 		}
-		compressed := p.compressor.Compress(make([]byte, 0, len(probe)), probe)
+		compressed := p.probeCompressor.Compress(make([]byte, 0, len(probe)), probe)
 		if len(compressed)*100 <= len(probe)*(100-compressionMinSavingsPercent) {
 			return archive.CodecZstd
 		}

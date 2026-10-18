@@ -48,6 +48,10 @@ const (
 	// zstdMaxOverhead bounds frame header plus raw-block headers zstd adds to an
 	// incompressible MaxChunkSize input (checksums are disabled; GCM authenticates).
 	zstdMaxOverhead = 256
+	// bestTierMaxEncoders caps concurrent encoders at the best-compression tier, where
+	// each encoder holds roughly 35 MB of state. Uncapped, GOMAXPROCS of them push peak
+	// memory past several hundred MB.
+	bestTierMaxEncoders = 2
 )
 
 // MaxPayloadSize is the largest encoded block payload (before the GCM tag) a writer emits.
@@ -70,9 +74,10 @@ func NewBlockCompressor(level int) (*BlockCompressor, error) {
 	if level < MinCompressionLevel || level > MaxCompressionLevel {
 		return nil, fmt.Errorf("%w: %d (want %d-%d)", ErrInvalidCompressionLevel, level, MinCompressionLevel, MaxCompressionLevel)
 	}
+	encLevel := zstd.EncoderLevelFromZstd(level)
 	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
-		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
+		zstd.WithEncoderLevel(encLevel),
+		zstd.WithEncoderConcurrency(encoderConcurrency(encLevel)),
 		zstd.WithEncoderCRC(false),
 		zstd.WithWindowSize(zstdWindowSize),
 	)
@@ -80,6 +85,16 @@ func NewBlockCompressor(level int) (*BlockCompressor, error) {
 		return nil, fmt.Errorf("archive/codec: new zstd encoder: %w", err)
 	}
 	return &BlockCompressor{enc: enc}, nil
+}
+
+// encoderConcurrency returns how many encoders may run at once for level: GOMAXPROCS,
+// capped at bestTierMaxEncoders for the memory-hungry best-compression tier.
+func encoderConcurrency(level zstd.EncoderLevel) int {
+	n := runtime.GOMAXPROCS(0)
+	if level >= zstd.SpeedBestCompression {
+		return min(n, bestTierMaxEncoders)
+	}
+	return n
 }
 
 // Compress appends one zstd frame of src to dst and returns the extended slice.
