@@ -40,6 +40,17 @@ type ListResult struct {
 // allocated, so a corrupt or hostile size field cannot force a huge allocation.
 const maxBlockCiphertext = archive.MaxPayloadSize + crypto.GCMTagSize
 
+// maxMetadataCiphertext bounds a sealed metadata block: a 64 KiB filename blob plus the
+// fixed fields (see archive.marshalMetadata) and the GCM tag.
+const maxMetadataCiphertext = 2 + 0xFFFF + 1 + 32 + 4 + 1 + crypto.GCMTagSize
+
+// isFatal reports whether err is a fatal ArchiveError, after which the entry stream
+// cannot be parsed further.
+func isFatal(err error) bool {
+	var ae *ArchiveError
+	return errors.As(err, &ae) && ae.IsFatal()
+}
+
 // errDecompress marks a block that authenticated but failed to decode.
 var errDecompress = errors.New("io: block decompression failed")
 
@@ -107,7 +118,10 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 			break
 		}
 		if err != nil {
-			// Recoverable: record and continue to next entry.
+			if isFatal(err) {
+				return results, err
+			}
+			// Recoverable: the entry was consumed in full, so continue with the next one.
 			results = append(results, ExtractionResult{Err: err})
 			se.progress.FileError("unknown", err)
 			continue
@@ -238,12 +252,12 @@ func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, dec *archive.Blo
 	}
 	pm, err := mm.Open(metaBlock)
 	if err != nil {
-		return ExtractionResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt metadata", err)
+		return ExtractionResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt metadata", err))
 	}
 
 	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
 	if err != nil {
-		return ExtractionResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt filename", err)
+		return ExtractionResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
 	}
 
 	if err := se.skipPadding(); err != nil {
@@ -252,7 +266,12 @@ func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, dec *archive.Blo
 
 	plaintext, err := se.decryptDataBlocks(fileKey, pm.SizeBucket, pm.Codec, dec)
 	if err != nil {
-		return ExtractionResult{}, false, err
+		if isFatal(err) {
+			return ExtractionResult{}, false, err
+		}
+		// Block framing is intact (decryptDataBlocks drains to the sentinel), so skip
+		// the trailer and leave the reader at the next entry.
+		return ExtractionResult{}, false, se.skipTrailer(err)
 	}
 
 	trailer, err := se.readTrailer(fileKey, keys.Version())
@@ -284,11 +303,48 @@ func (se *SafeExtractor) readMetadataBlock() (archive.MetadataBlock, error) {
 	if _, err := io.ReadFull(se.r, sizeBuf); err != nil {
 		return archive.MetadataBlock{}, recoverable(ErrCodeTruncated, "read metadata size", err)
 	}
-	ct := make([]byte, binary.LittleEndian.Uint32(sizeBuf))
+	size := binary.LittleEndian.Uint32(sizeBuf)
+	if size > maxMetadataCiphertext {
+		return archive.MetadataBlock{}, fatal(ErrCodeIntegrityFail, "metadata size exceeds maximum", nil)
+	}
+	ct := make([]byte, size)
 	if _, err := io.ReadFull(se.r, ct); err != nil {
 		return archive.MetadataBlock{}, recoverable(ErrCodeTruncated, "read metadata ciphertext", err)
 	}
 	return archive.MetadataBlock{Nonce: nonce, Ciphertext: ct}, nil
+}
+
+// skipEntryBody consumes the rest of an entry after its metadata block without any
+// key, so a failure in one entry leaves the reader at the next. It returns cause, or
+// the framing error that prevented the skip.
+func (se *SafeExtractor) skipEntryBody(cause error) error {
+	if err := se.skipPadding(); err != nil {
+		return fatal(ErrCodeTruncated, "skip inter-block padding", err)
+	}
+	if _, err := se.skipDataBlocks(); err != nil {
+		return err
+	}
+	return se.skipTrailer(cause)
+}
+
+// skipTrailer consumes a trailer without opening it and returns cause, or the framing
+// error that prevented the skip.
+func (se *SafeExtractor) skipTrailer(cause error) error {
+	if err := se.skipPadding(); err != nil {
+		return fatal(ErrCodeTruncated, "skip trailer padding", err)
+	}
+	header := make([]byte, crypto.NonceSize+4)
+	if _, err := io.ReadFull(se.r, header); err != nil {
+		return fatal(ErrCodeTruncated, "read sealed trailer header", err)
+	}
+	sealedSize := binary.LittleEndian.Uint32(header[crypto.NonceSize:])
+	if sealedSize > archive.TrailerPayloadSize+crypto.GCMTagSize {
+		return fatal(ErrCodeIntegrityFail, "sealed trailer too large", nil)
+	}
+	if _, err := io.CopyN(io.Discard, se.r, int64(sealedSize)+8); err != nil {
+		return fatal(ErrCodeTruncated, "skip sealed trailer", err)
+	}
+	return cause
 }
 
 func (se *SafeExtractor) skipPadding() error {
@@ -344,7 +400,7 @@ func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket 
 			return nonce, nil, false, nil
 		}
 		if blockSize > maxBlockCiphertext {
-			readErr = recoverable(ErrCodeIntegrityFail, "block size exceeds maximum", nil)
+			readErr = fatal(ErrCodeIntegrityFail, "block size exceeds maximum", nil)
 			return nonce, nil, false, readErr
 		}
 
@@ -389,7 +445,7 @@ func (se *SafeExtractor) skipDataBlocks() (int64, error) {
 			return stored, nil
 		}
 		if blockSize > maxBlockCiphertext || blockSize < crypto.GCMTagSize {
-			return 0, recoverable(ErrCodeIntegrityFail, "block size out of range", nil)
+			return 0, fatal(ErrCodeIntegrityFail, "block size out of range", nil)
 		}
 		if _, err := io.CopyN(io.Discard, se.r, int64(blockSize)); err != nil {
 			return 0, recoverable(ErrCodeTruncated, "skip block ciphertext", err)
@@ -415,7 +471,7 @@ func (se *SafeExtractor) readTrailer(fileKey [crypto.KeySize]byte, version uint1
 	}
 	sealedSize := binary.LittleEndian.Uint32(sizeBuf)
 	if sealedSize > archive.TrailerPayloadSize+crypto.GCMTagSize {
-		return trailerInfo{}, recoverable(ErrCodeIntegrityFail, "sealed trailer too large", nil)
+		return trailerInfo{}, fatal(ErrCodeIntegrityFail, "sealed trailer too large", nil)
 	}
 	sealed := make([]byte, sealedSize)
 	if _, err := io.ReadFull(se.r, sealed); err != nil {
@@ -480,6 +536,9 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 			break
 		}
 		if err != nil {
+			if isFatal(err) {
+				return results, err
+			}
 			results = append(results, ListResult{Filename: "<decrypt error>", SizeBucket: "?", Codec: "?", Err: err})
 			continue
 		}
@@ -517,11 +576,11 @@ func (se *SafeExtractor) listNext(keys *archive.KeySchedule) (ListResult, bool, 
 	}
 	pm, err := mm.Open(metaBlock)
 	if err != nil {
-		return ListResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt metadata", err)
+		return ListResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt metadata", err))
 	}
 	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
 	if err != nil {
-		return ListResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt filename", err)
+		return ListResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
 	}
 
 	// Data blocks are skipped by their length prefixes, never decrypted: list needs only

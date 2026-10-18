@@ -105,8 +105,11 @@ func decryptBlocksParallel(em blockOpener, workers int, next blockReader) ([]byt
 }
 
 // decryptBlocksSequential decrypts blocks one at a time on the calling goroutine.
+// Like the parallel path, it keeps consuming blocks through the sentinel after a
+// decrypt failure so the caller's stream stays aligned on the next field.
 func decryptBlocksSequential(em blockOpener, next blockReader) ([]byte, error) {
 	var out bytes.Buffer
+	var decryptErr error
 	for {
 		nonce, ct, ok, err := next()
 		if err != nil {
@@ -115,11 +118,18 @@ func decryptBlocksSequential(em blockOpener, next blockReader) ([]byte, error) {
 		if !ok {
 			break
 		}
+		if decryptErr != nil {
+			continue
+		}
 		pt, err := em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: ct})
 		if err != nil {
-			return nil, err
+			decryptErr = err
+			continue
 		}
 		out.Write(pt)
+	}
+	if decryptErr != nil {
+		return nil, decryptErr
 	}
 	return out.Bytes(), nil
 }
