@@ -30,6 +30,7 @@ Thumbs.db
 
 # Archive test outputs (never commit encrypted archives)
 *.sarc
+!tests/testdata/*.sarc
 
 # Environment / secrets
 .env
