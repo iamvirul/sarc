@@ -106,7 +106,30 @@ func (se *SafeExtractor) readHeader() (*archive.KeySchedule, error) {
 	if err != nil {
 		return nil, fatal(ErrCodeAuthFailed, "init key schedule", err)
 	}
+	if v != archive.Version1 {
+		if err := openFileCount(keys, hdr.FileCountEncrypted); err != nil {
+			return nil, fatal(ErrCodeAuthFailed, "wrong password or corrupted header", err)
+		}
+	}
 	return keys, nil
+}
+
+// openFileCount authenticates the sealed header file count with the header key,
+// rejecting a wrong password before any entry is parsed. Version1 archives seal it
+// with a separate PBKDF2 key, so they skip this check to avoid an extra PBKDF2 run.
+func openFileCount(keys *archive.KeySchedule, sealed [8 + crypto.NonceSize + crypto.GCMTagSize]byte) error {
+	headerKey, err := keys.HeaderKey()
+	if err != nil {
+		return err
+	}
+	em, err := crypto.NewEncryptionManager(headerKey)
+	if err != nil {
+		return err
+	}
+	var nonce [crypto.NonceSize]byte
+	copy(nonce[:], sealed[:crypto.NonceSize])
+	_, err = em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: sealed[crypto.NonceSize:]})
+	return err
 }
 
 func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, outputDir string) (ExtractionResult, bool, error) {

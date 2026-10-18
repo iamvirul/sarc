@@ -150,21 +150,20 @@ func TestExtractRejectsUnknownVersion(t *testing.T) {
 }
 
 // TestVersion1ArchiveRelabelledAsVersion2Fails confirms the version field selects the
-// key schedule: a v1 body cannot be decrypted with v2 keys, so a downgrade or
-// upgrade of the version byte is detected rather than producing output.
+// key schedule: a v1 header cannot be opened with v2 keys, so relabelling the version
+// byte is rejected before any entry is parsed.
 func TestVersion1ArchiveRelabelledAsVersion2Fails(t *testing.T) {
 	data := readV1Fixture(t)
 	patched := append([]byte(nil), data...)
 	binary.LittleEndian.PutUint16(patched[versionOffset:], archive.Version2)
 
 	results, err := sarcio.NewSafeExtractor(bytes.NewReader(patched), v1FixturePassword, nil).Extract(t.TempDir())
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	var ae *sarcio.ArchiveError
+	if !errors.As(err, &ae) || ae.Code != sarcio.ErrCodeAuthFailed || !ae.IsFatal() {
+		t.Fatalf("want fatal %s, got %v", sarcio.ErrCodeAuthFailed, err)
 	}
-	for _, r := range results {
-		if r.OK {
-			t.Fatal("v1 entry decrypted under v2 key schedule")
-		}
+	if len(results) != 0 {
+		t.Fatalf("got %d results, want none", len(results))
 	}
 }
 
