@@ -22,13 +22,19 @@ const minParallelFileSize = 4 * 1024 * 1024
 // StreamingArchiver archives files one at a time without loading entire files into memory.
 // Maximum memory footprint is approximately one chunk (~64 KB) per file at any point.
 type StreamingArchiver struct {
-	w        *archive.ArchiveWriter
-	progress ProgressTracker
-	start    time.Time
+	w           *archive.ArchiveWriter
+	compression *compressionPolicy
+	progress    ProgressTracker
+	start       time.Time
 }
 
 // NewStreamingArchiver returns a StreamingArchiver writing to w with the given password.
-func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker) (*StreamingArchiver, error) {
+// Compression defaults to CompressionAuto at level 3; override with WithCompression.
+func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker, opts ...ArchiverOption) (*StreamingArchiver, error) {
+	compression, err := newArchiverConfig(opts)
+	if err != nil {
+		return nil, err
+	}
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return nil, fatal(ErrCodeWriteFailed, "generate archive salt", err)
@@ -48,7 +54,7 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 	if progress == nil {
 		progress = NopProgressTracker{}
 	}
-	return &StreamingArchiver{w: aw, progress: progress, start: time.Now()}, nil
+	return &StreamingArchiver{w: aw, compression: compression, progress: progress, start: time.Now()}, nil
 }
 
 // AddFile reads path from disk and appends it to the archive as a single file entry.
@@ -58,13 +64,13 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 // all available cores instead of just one. Memory footprint stays a small, fixed
 // multiple of archive.MaxChunkSize regardless of file size.
 func (sa *StreamingArchiver) AddFile(path string) error {
-	return addFileStreaming(sa.w, path, runtime.GOMAXPROCS(0), sa.progress)
+	return addFileStreaming(sa.w, sa.compression, path, runtime.GOMAXPROCS(0), sa.progress)
 }
 
 // addFileStreaming streams path into aw as one file entry, encrypting chunks across
 // `workers` goroutines when the file is large enough to benefit (see minParallelFileSize).
 // Shared by StreamingArchiver and ConcurrentArchiver's single-file fast path.
-func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progress ProgressTracker) error {
+func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy, path string, workers int, progress ProgressTracker) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return recoverable(ErrCodeReadFailed, "open file", err)
@@ -87,7 +93,13 @@ func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progr
 		return fatal(ErrCodeWriteFailed, "derive file key", err)
 	}
 
-	fb, err := archive.NewFrameBuilder(fileKey)
+	probe, err := readProbe(f, info.Size(), compression.mode)
+	if err != nil {
+		return recoverable(ErrCodeReadFailed, "read compression probe", err)
+	}
+	codec := compression.codecFor(info.Name(), probe)
+
+	fb, err := compression.newFrameBuilder(fileKey, codec)
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "init frame builder", err)
 	}
@@ -112,6 +124,7 @@ func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progr
 		SizeBucket:        archive.BucketizeSize(info.Size()),
 		TimestampHash:     archive.HashTimestamp(salt, info.ModTime()),
 		Permissions:       uint32(info.Mode().Perm()),
+		Codec:             codec,
 	}
 	metaBlock, err := mm.Seal(pm)
 	if err != nil {
@@ -139,9 +152,11 @@ func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progr
 	}
 
 	var plaintextHMAC [crypto.HMACSize]byte
+	var plaintextSize int64
 	if mapped, mmapErr := tryMmap(f, info.Size()); mmapErr == nil {
 		// mmap succeeded: encrypt straight out of the mapped page-cache pages,
 		// skipping the buffered-reader copy entirely.
+		plaintextSize = int64(len(mapped.data))
 		plaintextHMAC, err = encryptAndStreamMmap(mapped.data, fb, fileKey, workers, progress, send)
 		closeErr := mapped.close()
 		if err == nil {
@@ -156,12 +171,13 @@ func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progr
 		} else {
 			plaintextHMAC, err = encryptAndStream(tracked, fb, fileKey, send)
 		}
+		plaintextSize = tracked.total
 	}
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "encrypt stream", err)
 	}
 
-	trailer, err := fb.BuildTrailer(plaintextHMAC)
+	trailer, err := fb.BuildTrailer(plaintextHMAC, uint64(plaintextSize))
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
@@ -183,18 +199,36 @@ func (sa *StreamingArchiver) Finalize(totalFiles int, totalBytes int64) error {
 	return nil
 }
 
-// progressReader wraps an io.Reader and reports bytes read to a ProgressTracker.
+// progressReader wraps an io.Reader, reports bytes read to a ProgressTracker, and
+// counts the total read. It is not safe for concurrent use.
 type progressReader struct {
 	r        io.Reader
 	progress ProgressTracker
+	total    int64
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {
 	n, err := pr.r.Read(p)
 	if n > 0 {
+		pr.total += int64(n)
 		pr.progress.BytesProcessed(int64(n))
 	}
 	return n, err
+}
+
+// readProbe returns up to compressionProbeSize leading bytes of f for the compression
+// decision, using ReadAt so the sequential read position is untouched. It reads nothing
+// when mode never probes.
+func readProbe(f *os.File, size int64, mode CompressionMode) ([]byte, error) {
+	if mode != CompressionAuto || size == 0 {
+		return nil, nil
+	}
+	probe := make([]byte, min(size, compressionProbeSize))
+	n, err := f.ReadAt(probe, 0)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return probe[:n], nil
 }
 
 // encryptFilename seals name using a fresh block encryption under fileKey.

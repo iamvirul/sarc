@@ -61,7 +61,7 @@ func TestEncryptAndStreamParallelMatchesSequential(t *testing.T) {
 		fb, key := testFrameBuilder(t)
 		var blocks []archive.DataBlock
 		mac, err := encryptAndStreamParallel(bytes.NewReader(plaintext), fb, key, workers, func(db archive.DataBlock) error {
-			blocks = append(blocks, db)
+			blocks = append(blocks, copyDataBlock(db))
 			return nil
 		})
 		if err != nil {
@@ -92,7 +92,7 @@ func TestEncryptAndStreamParallelPreservesOrder(t *testing.T) {
 	fb, key := testFrameBuilder(t)
 	var blocks []archive.DataBlock
 	if _, err := encryptAndStreamParallel(bytes.NewReader(plaintext), fb, key, 8, func(db archive.DataBlock) error {
-		blocks = append(blocks, db)
+		blocks = append(blocks, copyDataBlock(db))
 		return nil
 	}); err != nil {
 		t.Fatalf("encryptAndStreamParallel: %v", err)
@@ -135,7 +135,7 @@ func TestEncryptAndStreamParallelFallsBackSequential(t *testing.T) {
 	fb, key := testFrameBuilder(t)
 	var blocks []archive.DataBlock
 	if _, err := encryptAndStreamParallel(bytes.NewReader(plaintext), fb, key, 1, func(db archive.DataBlock) error {
-		blocks = append(blocks, db)
+		blocks = append(blocks, copyDataBlock(db))
 		return nil
 	}); err != nil {
 		t.Fatalf("encryptAndStreamParallel: %v", err)

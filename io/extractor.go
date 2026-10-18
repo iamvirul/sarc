@@ -25,9 +25,47 @@ type ExtractionResult struct {
 }
 
 // ListResult holds decrypted metadata for one archive entry, used by the list command.
+// OriginalBytes is the plaintext size; StoredBytes is the encoded payload size before
+// encryption (equal to OriginalBytes for uncompressed entries).
 type ListResult struct {
-	Filename   string
-	SizeBucket string
+	Filename      string
+	SizeBucket    string
+	Codec         string
+	OriginalBytes int64
+	StoredBytes   int64
+	Err           error
+}
+
+// maxBlockCiphertext bounds a data block's on-disk ciphertext length before it is
+// allocated, so a corrupt or hostile size field cannot force a huge allocation.
+const maxBlockCiphertext = archive.MaxPayloadSize + crypto.GCMTagSize
+
+// errDecompress marks a block that authenticated but failed to decode.
+var errDecompress = errors.New("io: block decompression failed")
+
+// decompressingOpener decrypts a block and then zstd-decodes its payload.
+type decompressingOpener struct {
+	em  *crypto.EncryptionManager
+	dec *archive.BlockDecompressor
+}
+
+func (o decompressingOpener) DecryptBlock(block crypto.EncryptedBlock) ([]byte, error) {
+	payload, err := o.em.DecryptBlock(block)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := o.dec.Decompress(payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errDecompress, err)
+	}
+	return pt, nil
+}
+
+// trailerInfo is the opened sealed trailer of one file entry.
+type trailerInfo struct {
+	hmac          [crypto.HMACSize]byte
+	plaintextSize uint64
+	hasSize       bool // false for Version1 trailers, which seal only the HMAC
 }
 
 // SafeExtractor decrypts and verifies files from a SARC archive.
@@ -53,10 +91,15 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	dec, err := archive.NewBlockDecompressor()
+	if err != nil {
+		return nil, fatal(ErrCodeReadFailed, "init decompressor", err)
+	}
+	defer dec.Close()
 
 	var results []ExtractionResult
 	for {
-		result, done, err := se.extractNext(keys, outputDir)
+		result, done, err := se.extractNext(keys, dec, outputDir)
 		if done {
 			if err != nil {
 				return results, err
@@ -163,7 +206,7 @@ func (se *SafeExtractor) nextEntryType(version uint16) (bool, error) {
 	}
 }
 
-func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, outputDir string) (ExtractionResult, bool, error) {
+func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, dec *archive.BlockDecompressor, outputDir string) (ExtractionResult, bool, error) {
 	more, err := se.nextEntryType(keys.Version())
 	if err != nil || !more {
 		return ExtractionResult{}, true, err
@@ -207,16 +250,18 @@ func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, outputDir string
 		return ExtractionResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
 
-	plaintext, err := se.decryptDataBlocks(fileKey, pm.SizeBucket)
+	plaintext, err := se.decryptDataBlocks(fileKey, pm.SizeBucket, pm.Codec, dec)
 	if err != nil {
 		return ExtractionResult{}, false, err
 	}
 
-	plaintextHMAC, err := se.readAndVerifyTrailer(fileKey, plaintext)
+	trailer, err := se.readTrailer(fileKey, keys.Version())
 	if err != nil {
 		return ExtractionResult{}, false, err
 	}
-	_ = plaintextHMAC
+	if err := verifyPlaintext(fileKey, plaintext, trailer); err != nil {
+		return ExtractionResult{}, false, err
+	}
 
 	outPath := filepath.Join(outputDir, filepath.Base(filename))
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -264,10 +309,15 @@ func (se *SafeExtractor) skipPadding() error {
 // ciphertext) is parsed sequentially since block boundaries can only be found by
 // reading in order; the CPU-bound AES-256-GCM Open call for each block is what gets
 // parallelised.
-func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket archive.SizeBucket) ([]byte, error) {
+// CodecZstd payloads are decoded on the same worker right after decryption.
+func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket archive.SizeBucket, codec archive.Codec, dec *archive.BlockDecompressor) ([]byte, error) {
 	em, err := crypto.NewEncryptionManager(fileKey)
 	if err != nil {
 		return nil, fatal(ErrCodeAuthFailed, "init block decryptor", err)
+	}
+	var opener blockOpener = em
+	if codec == archive.CodecZstd {
+		opener = decompressingOpener{em: em, dec: dec}
 	}
 
 	var readErr error
@@ -293,6 +343,10 @@ func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket 
 		if blockSize == 0 {
 			return nonce, nil, false, nil
 		}
+		if blockSize > maxBlockCiphertext {
+			readErr = recoverable(ErrCodeIntegrityFail, "block size exceeds maximum", nil)
+			return nonce, nil, false, readErr
+		}
 
 		ct := make([]byte, blockSize)
 		if _, err := io.ReadFull(se.r, ct); err != nil {
@@ -308,61 +362,104 @@ func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket 
 			workers = w
 		}
 	}
-	plaintext, err := decryptBlocksParallel(em, workers, next)
+	plaintext, err := decryptBlocksParallel(opener, workers, next)
 	if err != nil {
 		if readErr != nil {
 			return nil, readErr
+		}
+		if errors.Is(err, errDecompress) {
+			return nil, recoverable(ErrCodeIntegrityFail, "decompress block", err)
 		}
 		return nil, recoverable(ErrCodeAuthFailed, "decrypt block", err)
 	}
 	return plaintext, nil
 }
 
-func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plaintext []byte) ([crypto.HMACSize]byte, error) {
-	// Skip random trailer padding.
+// skipDataBlocks consumes a file's data blocks through the sentinel without decrypting
+// them and returns the total encoded payload size (ciphertext minus GCM tags).
+func (se *SafeExtractor) skipDataBlocks() (int64, error) {
+	var stored int64
+	header := make([]byte, crypto.NonceSize+4)
+	for {
+		if _, err := io.ReadFull(se.r, header); err != nil {
+			return 0, recoverable(ErrCodeTruncated, "read block header", err)
+		}
+		blockSize := binary.LittleEndian.Uint32(header[crypto.NonceSize:])
+		if blockSize == 0 {
+			return stored, nil
+		}
+		if blockSize > maxBlockCiphertext || blockSize < crypto.GCMTagSize {
+			return 0, recoverable(ErrCodeIntegrityFail, "block size out of range", nil)
+		}
+		if _, err := io.CopyN(io.Discard, se.r, int64(blockSize)); err != nil {
+			return 0, recoverable(ErrCodeTruncated, "skip block ciphertext", err)
+		}
+		stored += int64(blockSize) - crypto.GCMTagSize
+	}
+}
+
+// readTrailer consumes a file trailer and opens its sealed payload without verifying
+// it against any plaintext. Version2+ payloads also carry the plaintext size.
+func (se *SafeExtractor) readTrailer(fileKey [crypto.KeySize]byte, version uint16) (trailerInfo, error) {
 	if err := se.skipPadding(); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "skip trailer padding", err)
+		return trailerInfo{}, recoverable(ErrCodeTruncated, "skip trailer padding", err)
 	}
 
-	var hmacNonce [crypto.NonceSize]byte
-	if _, err := io.ReadFull(se.r, hmacNonce[:]); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read HMAC nonce", err)
+	var sealedNonce [crypto.NonceSize]byte
+	if _, err := io.ReadFull(se.r, sealedNonce[:]); err != nil {
+		return trailerInfo{}, recoverable(ErrCodeTruncated, "read HMAC nonce", err)
 	}
 	sizeBuf := make([]byte, 4)
 	if _, err := io.ReadFull(se.r, sizeBuf); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read HMAC sealed size", err)
+		return trailerInfo{}, recoverable(ErrCodeTruncated, "read HMAC sealed size", err)
 	}
-	sealed := make([]byte, binary.LittleEndian.Uint32(sizeBuf))
+	sealedSize := binary.LittleEndian.Uint32(sizeBuf)
+	if sealedSize > archive.TrailerPayloadSize+crypto.GCMTagSize {
+		return trailerInfo{}, recoverable(ErrCodeIntegrityFail, "sealed trailer too large", nil)
+	}
+	sealed := make([]byte, sealedSize)
 	if _, err := io.ReadFull(se.r, sealed); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read HMAC sealed", err)
+		return trailerInfo{}, recoverable(ErrCodeTruncated, "read HMAC sealed", err)
 	}
 
 	// Consume the entry checksum (8 bytes, boundary detection only) before any
 	// verification so a failed check still leaves the reader at the next entry.
 	if _, err := io.ReadFull(se.r, make([]byte, 8)); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read entry checksum", err)
+		return trailerInfo{}, recoverable(ErrCodeTruncated, "read entry checksum", err)
 	}
 
 	em, err := crypto.NewEncryptionManager(fileKey)
 	if err != nil {
-		return [crypto.HMACSize]byte{}, fatal(ErrCodeAuthFailed, "init HMAC decryptor", err)
+		return trailerInfo{}, fatal(ErrCodeAuthFailed, "init HMAC decryptor", err)
 	}
-	rawHMAC, err := em.DecryptBlock(crypto.EncryptedBlock{Nonce: hmacNonce, Ciphertext: sealed})
+	payload, err := em.DecryptBlock(crypto.EncryptedBlock{Nonce: sealedNonce, Ciphertext: sealed})
 	if err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeAuthFailed, "decrypt HMAC", err)
-	}
-	if len(rawHMAC) != crypto.HMACSize {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeIntegrityFail, "HMAC length mismatch", nil)
+		return trailerInfo{}, recoverable(ErrCodeAuthFailed, "decrypt HMAC", err)
 	}
 
-	var expected [crypto.HMACSize]byte
-	copy(expected[:], rawHMAC)
-
-	if err := crypto.VerifyHMAC(fileKey, plaintext, expected); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeIntegrityFail, "plaintext HMAC mismatch", err)
+	var info trailerInfo
+	switch {
+	case version == archive.Version1 && len(payload) == crypto.HMACSize:
+	case version != archive.Version1 && len(payload) == archive.TrailerPayloadSize:
+		info.plaintextSize = binary.LittleEndian.Uint64(payload[crypto.HMACSize:])
+		info.hasSize = true
+	default:
+		return trailerInfo{}, recoverable(ErrCodeIntegrityFail, "HMAC length mismatch", nil)
 	}
+	copy(info.hmac[:], payload[:crypto.HMACSize])
+	return info, nil
+}
 
-	return expected, nil
+// verifyPlaintext checks the decoded plaintext against the trailer's HMAC and, when
+// present, its recorded size.
+func verifyPlaintext(fileKey [crypto.KeySize]byte, plaintext []byte, trailer trailerInfo) error {
+	if err := crypto.VerifyHMAC(fileKey, plaintext, trailer.hmac); err != nil {
+		return recoverable(ErrCodeIntegrityFail, "plaintext HMAC mismatch", err)
+	}
+	if trailer.hasSize && trailer.plaintextSize != uint64(len(plaintext)) {
+		return recoverable(ErrCodeIntegrityFail, "plaintext size mismatch", nil)
+	}
+	return nil
 }
 
 // List decrypts metadata for every entry and returns a ListResult per file.
@@ -383,7 +480,7 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 			break
 		}
 		if err != nil {
-			results = append(results, ListResult{Filename: "<decrypt error>", SizeBucket: "?"})
+			results = append(results, ListResult{Filename: "<decrypt error>", SizeBucket: "?", Codec: "?", Err: err})
 			continue
 		}
 		results = append(results, result)
@@ -427,21 +524,30 @@ func (se *SafeExtractor) listNext(keys *archive.KeySchedule) (ListResult, bool, 
 		return ListResult{}, false, recoverable(ErrCodeAuthFailed, "decrypt filename", err)
 	}
 
-	// Skip remaining entry bytes (inter-block pad, data blocks, trailer) by re-using Extract path.
+	// Data blocks are skipped by their length prefixes, never decrypted: list needs only
+	// metadata and the trailer's recorded size.
 	if err := se.skipPadding(); err != nil {
 		return ListResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
-	if _, err := se.decryptDataBlocks(fileKey, pm.SizeBucket); err != nil {
+	stored, err := se.skipDataBlocks()
+	if err != nil {
 		return ListResult{}, false, err
 	}
-	if _, err := se.readAndVerifyTrailer(fileKey, nil); err != nil {
-		// Ignore HMAC mismatch on list; we only need metadata.
-		_ = err
+	trailer, err := se.readTrailer(fileKey, keys.Version())
+	if err != nil {
+		return ListResult{}, false, err
+	}
+	original := stored // Version1 entries are never compressed
+	if trailer.hasSize {
+		original = int64(trailer.plaintextSize)
 	}
 
 	return ListResult{
-		Filename:   filename,
-		SizeBucket: bucketName(pm.SizeBucket),
+		Filename:      filename,
+		SizeBucket:    bucketName(pm.SizeBucket),
+		Codec:         pm.Codec.String(),
+		OriginalBytes: original,
+		StoredBytes:   stored,
 	}, false, nil
 }
 

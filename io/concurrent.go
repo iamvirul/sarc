@@ -35,17 +35,23 @@ type fileResult struct {
 // ConcurrentArchiver encrypts files in parallel using N worker goroutines
 // and writes entries to the archive in original submission order.
 type ConcurrentArchiver struct {
-	w        *archive.ArchiveWriter
-	workers  int
-	progress ProgressTracker
-	start    time.Time
+	w           *archive.ArchiveWriter
+	compression *compressionPolicy
+	workers     int
+	progress    ProgressTracker
+	start       time.Time
 }
 
 // NewConcurrentArchiver returns a ConcurrentArchiver writing to w.
-// workers <= 0 defaults to runtime.NumCPU().
-func NewConcurrentArchiver(w io.Writer, password string, workers int, progress ProgressTracker) (*ConcurrentArchiver, error) {
+// workers <= 0 defaults to runtime.NumCPU(). Compression defaults to CompressionAuto
+// at level 3; override with WithCompression.
+func NewConcurrentArchiver(w io.Writer, password string, workers int, progress ProgressTracker, opts ...ArchiverOption) (*ConcurrentArchiver, error) {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
+	}
+	compression, err := newArchiverConfig(opts)
+	if err != nil {
+		return nil, err
 	}
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
@@ -66,7 +72,7 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 	if progress == nil {
 		progress = NopProgressTracker{}
 	}
-	return &ConcurrentArchiver{w: aw, workers: workers, progress: progress, start: time.Now()}, nil
+	return &ConcurrentArchiver{w: aw, compression: compression, workers: workers, progress: progress, start: time.Now()}, nil
 }
 
 // Archive encrypts all paths concurrently and writes them to the archive in order.
@@ -79,7 +85,7 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 func (ca *ConcurrentArchiver) Archive(paths []string) error {
 	if len(paths) == 1 {
 		var size int64
-		if err := addFileStreaming(ca.w, paths[0], ca.workers, ca.progress); err != nil {
+		if err := addFileStreaming(ca.w, ca.compression, paths[0], ca.workers, ca.progress); err != nil {
 			ae, ok := err.(*ArchiveError)
 			if !ok || ae.IsFatal() {
 				return err
@@ -154,7 +160,7 @@ func (ca *ConcurrentArchiver) Archive(paths []string) error {
 
 func (ca *ConcurrentArchiver) runWorker(jobs <-chan fileJob, results chan<- fileResult) {
 	for job := range jobs {
-		entry, name, size, err := encryptFile(job.path, ca.w, ca.progress)
+		entry, name, size, err := encryptFile(job.path, ca.w, ca.compression, ca.progress)
 		results <- fileResult{
 			index: job.index,
 			path:  job.path,
@@ -166,8 +172,8 @@ func (ca *ConcurrentArchiver) runWorker(jobs <-chan fileJob, results chan<- file
 	}
 }
 
-// encryptFile opens path, encrypts it, and returns a complete FileEntry.
-func encryptFile(path string, aw *archive.ArchiveWriter, progress ProgressTracker) (archive.FileEntry, string, int64, error) {
+// encryptFile opens path, compresses and encrypts it per compression, and returns a complete FileEntry.
+func encryptFile(path string, aw *archive.ArchiveWriter, compression *compressionPolicy, progress ProgressTracker) (archive.FileEntry, string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return archive.FileEntry{}, path, 0, recoverable(ErrCodeReadFailed, "open file", err)
@@ -196,8 +202,9 @@ func encryptFile(path string, aw *archive.ArchiveWriter, progress ProgressTracke
 	}
 
 	plaintextHMAC := crypto.ComputeHMAC(fileKey, plaintext)
+	codec := compression.codecFor(info.Name(), plaintext[:min(len(plaintext), compressionProbeSize)])
 
-	fb, err := archive.NewFrameBuilder(fileKey)
+	fb, err := compression.newFrameBuilder(fileKey, codec)
 	if err != nil {
 		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "init frame builder", err)
 	}
@@ -219,6 +226,7 @@ func encryptFile(path string, aw *archive.ArchiveWriter, progress ProgressTracke
 		SizeBucket:        archive.BucketizeSize(info.Size()),
 		TimestampHash:     archive.HashTimestamp(salt, info.ModTime()),
 		Permissions:       uint32(info.Mode().Perm()),
+		Codec:             codec,
 	}
 	metaBlock, err := mm.Seal(pm)
 	if err != nil {
@@ -232,7 +240,7 @@ func encryptFile(path string, aw *archive.ArchiveWriter, progress ProgressTracke
 	if err != nil {
 		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "encrypt stream", err)
 	}
-	trailer, err := fb.BuildTrailer(plaintextHMAC)
+	trailer, err := fb.BuildTrailer(plaintextHMAC, uint64(len(plaintext)))
 	if err != nil {
 		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "build trailer", err)
 	}

@@ -60,11 +60,13 @@ type MetadataBlock struct {
 }
 
 // PlaintextMetadata is the in-memory form of file metadata before sealing.
+// Codec is absent from Version1 metadata and decodes as CodecNone there.
 type PlaintextMetadata struct {
 	EncryptedFilename []byte
 	SizeBucket        SizeBucket
 	TimestampHash     [32]byte
 	Permissions       uint32
+	Codec             Codec
 }
 
 // DataBlock is one variable-length encrypted chunk of file content.

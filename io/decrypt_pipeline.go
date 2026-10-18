@@ -14,6 +14,12 @@ import (
 // decrypt side, mirroring parallelPipelineDepth on the encrypt side.
 const decryptPipelineDepth = 4
 
+// blockOpener authenticates, decrypts, and decodes one data block. Implementations
+// must be safe for concurrent use. *crypto.EncryptionManager satisfies it.
+type blockOpener interface {
+	DecryptBlock(block crypto.EncryptedBlock) ([]byte, error)
+}
+
 // blockReader supplies one (nonce, ciphertext) pair per call. ok is false once the
 // data-block sentinel is reached; err is set on a truncated or malformed stream.
 type blockReader func() (nonce [crypto.NonceSize]byte, ciphertext []byte, ok bool, err error)
@@ -36,7 +42,7 @@ type decryptResult struct {
 // to one of `workers` goroutines sharing em, which is safe for concurrent decrypt calls.
 //
 // Falls back to sequential decryption when workers < 2.
-func decryptBlocksParallel(em *crypto.EncryptionManager, workers int, next blockReader) ([]byte, error) {
+func decryptBlocksParallel(em blockOpener, workers int, next blockReader) ([]byte, error) {
 	if workers < 2 {
 		return decryptBlocksSequential(em, next)
 	}
@@ -99,7 +105,7 @@ func decryptBlocksParallel(em *crypto.EncryptionManager, workers int, next block
 }
 
 // decryptBlocksSequential decrypts blocks one at a time on the calling goroutine.
-func decryptBlocksSequential(em *crypto.EncryptionManager, next blockReader) ([]byte, error) {
+func decryptBlocksSequential(em blockOpener, next blockReader) ([]byte, error) {
 	var out bytes.Buffer
 	for {
 		nonce, ct, ok, err := next()
