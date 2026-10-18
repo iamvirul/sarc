@@ -5,6 +5,7 @@ package io
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -48,16 +49,18 @@ func NewSafeExtractor(r io.Reader, password string, progress ProgressTracker) *S
 // Each entry is authenticated before any bytes are written to disk.
 // Returns one ExtractionResult per file entry.
 func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
-	hdr, kd, err := se.readHeader()
+	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
 	}
-	_ = kd
 
 	var results []ExtractionResult
 	for {
-		result, done, err := se.extractNext(hdr, kd, outputDir)
+		result, done, err := se.extractNext(keys, outputDir)
 		if done {
+			if err != nil {
+				return results, err
+			}
 			break
 		}
 		if err != nil {
@@ -71,55 +74,99 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 	return results, nil
 }
 
-func (se *SafeExtractor) readHeader() (archive.ArchiveHeader, *crypto.KeyDeriver, error) {
+// readHeader parses the archive header and returns the KeySchedule matching its
+// format version. For Version2 archives this runs the archive's single PBKDF2.
+func (se *SafeExtractor) readHeader() (*archive.KeySchedule, error) {
 	var magic [4]byte
 	if _, err := io.ReadFull(se.r, magic[:]); err != nil {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeTruncated, "read magic", err)
+		return nil, fatal(ErrCodeTruncated, "read magic", err)
 	}
 	if magic != archive.Magic {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeBadMagic, "invalid magic bytes", nil)
+		return nil, fatal(ErrCodeBadMagic, "invalid magic bytes", nil)
 	}
 
 	var version [2]byte
 	if _, err := io.ReadFull(se.r, version[:]); err != nil {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeTruncated, "read version", err)
+		return nil, fatal(ErrCodeTruncated, "read version", err)
 	}
 	v := binary.LittleEndian.Uint16(version[:])
-	if v != archive.Version {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeBadVersion, fmt.Sprintf("unsupported version %d", v), nil)
-	}
 
 	var hdr archive.ArchiveHeader
-	hdr.Magic = magic
-	hdr.Version = v
-
 	if _, err := io.ReadFull(se.r, hdr.ArchiveSalt[:]); err != nil {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeTruncated, "read archive salt", err)
+		return nil, fatal(ErrCodeTruncated, "read archive salt", err)
 	}
 	if _, err := io.ReadFull(se.r, hdr.FileCountEncrypted[:]); err != nil {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeTruncated, "read file count", err)
+		return nil, fatal(ErrCodeTruncated, "read file count", err)
 	}
 	if _, err := io.ReadFull(se.r, hdr.Reserved[:]); err != nil {
-		return archive.ArchiveHeader{}, nil, fatal(ErrCodeTruncated, "read header reserved", err)
+		return nil, fatal(ErrCodeTruncated, "read header reserved", err)
 	}
 
-	kd := crypto.NewKeyDeriver(se.password)
-	return hdr, kd, nil
-}
-
-func (se *SafeExtractor) extractNext(hdr archive.ArchiveHeader, kd *crypto.KeyDeriver, outputDir string) (ExtractionResult, bool, error) {
-	entryTypeBuf := make([]byte, 1)
-	_, err := io.ReadFull(se.r, entryTypeBuf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return ExtractionResult{}, true, nil
+	keys, err := archive.NewKeySchedule(se.password, v, hdr.ArchiveSalt)
+	if errors.Is(err, archive.ErrUnsupportedVersion) {
+		return nil, fatal(ErrCodeBadVersion, fmt.Sprintf("unsupported version %d", v), err)
 	}
 	if err != nil {
-		return ExtractionResult{}, true, fatal(ErrCodeTruncated, "read entry type", err)
+		return nil, fatal(ErrCodeAuthFailed, "init key schedule", err)
 	}
+	if v != archive.Version1 {
+		if err := openFileCount(keys, hdr.FileCountEncrypted); err != nil {
+			return nil, fatal(ErrCodeAuthFailed, "wrong password or corrupted header", err)
+		}
+	}
+	return keys, nil
+}
 
-	// Detect footer (entry type byte is not 0x01).
-	if entryTypeBuf[0] != archive.EntryTypeFile {
-		return ExtractionResult{}, true, nil
+// openFileCount authenticates the sealed header file count with the header key,
+// rejecting a wrong password before any entry is parsed. Version1 archives seal it
+// with a separate PBKDF2 key, so they skip this check to avoid an extra PBKDF2 run.
+func openFileCount(keys *archive.KeySchedule, sealed [8 + crypto.NonceSize + crypto.GCMTagSize]byte) error {
+	headerKey, err := keys.HeaderKey()
+	if err != nil {
+		return err
+	}
+	em, err := crypto.NewEncryptionManager(headerKey)
+	if err != nil {
+		return err
+	}
+	var nonce [crypto.NonceSize]byte
+	copy(nonce[:], sealed[:crypto.NonceSize])
+	_, err = em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: sealed[crypto.NonceSize:]})
+	return err
+}
+
+// nextEntryType reads the next entry type byte and reports whether a file entry follows.
+// Version2+ archives end with EntryTypeEnd; EOF or any other byte is fatal. Version1
+// archives have no end marker, so EOF or any byte other than EntryTypeFile ends them.
+func (se *SafeExtractor) nextEntryType(version uint16) (bool, error) {
+	var b [1]byte
+	_, err := io.ReadFull(se.r, b[:])
+	if version == archive.Version1 {
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, fatal(ErrCodeTruncated, "read entry type", err)
+		}
+		return b[0] == archive.EntryTypeFile, nil
+	}
+	if err != nil {
+		return false, fatal(ErrCodeTruncated, "read entry type", err)
+	}
+	switch b[0] {
+	case archive.EntryTypeFile:
+		return true, nil
+	case archive.EntryTypeEnd:
+		return false, nil
+	default:
+		return false, fatal(ErrCodeIntegrityFail, fmt.Sprintf("unexpected entry type 0x%02x", b[0]), nil)
+	}
+}
+
+func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, outputDir string) (ExtractionResult, bool, error) {
+	more, err := se.nextEntryType(keys.Version())
+	if err != nil || !more {
+		return ExtractionResult{}, true, err
 	}
 
 	var salt [crypto.SaltSize]byte
@@ -127,7 +174,10 @@ func (se *SafeExtractor) extractNext(hdr archive.ArchiveHeader, kd *crypto.KeyDe
 		return ExtractionResult{}, false, recoverable(ErrCodeTruncated, "read entry salt", err)
 	}
 
-	fileKey := kd.DeriveKey(salt)
+	fileKey, err := keys.FileKey(salt)
+	if err != nil {
+		return ExtractionResult{}, false, fatal(ErrCodeAuthFailed, "derive file key", err)
+	}
 
 	var frameHdr [32]byte
 	if _, err := io.ReadFull(se.r, frameHdr[:]); err != nil {
@@ -287,6 +337,12 @@ func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plai
 		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read HMAC sealed", err)
 	}
 
+	// Consume the entry checksum (8 bytes, boundary detection only) before any
+	// verification so a failed check still leaves the reader at the next entry.
+	if _, err := io.ReadFull(se.r, make([]byte, 8)); err != nil {
+		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read entry checksum", err)
+	}
+
 	em, err := crypto.NewEncryptionManager(fileKey)
 	if err != nil {
 		return [crypto.HMACSize]byte{}, fatal(ErrCodeAuthFailed, "init HMAC decryptor", err)
@@ -306,27 +362,24 @@ func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plai
 		return [crypto.HMACSize]byte{}, recoverable(ErrCodeIntegrityFail, "plaintext HMAC mismatch", err)
 	}
 
-	// Consume entry checksum (8 bytes, used for boundary detection only).
-	if _, err := io.ReadFull(se.r, make([]byte, 8)); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read entry checksum", err)
-	}
-
 	return expected, nil
 }
 
 // List decrypts metadata for every entry and returns a ListResult per file.
 // No file content is decrypted or written to disk.
 func (se *SafeExtractor) List() ([]ListResult, error) {
-	hdr, kd, err := se.readHeader()
+	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
 	}
-	_ = hdr
 
 	var results []ListResult
 	for {
-		result, done, err := se.listNext(kd)
+		result, done, err := se.listNext(keys)
 		if done {
+			if err != nil {
+				return results, err
+			}
 			break
 		}
 		if err != nil {
@@ -338,24 +391,20 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 	return results, nil
 }
 
-func (se *SafeExtractor) listNext(kd *crypto.KeyDeriver) (ListResult, bool, error) {
-	entryTypeBuf := make([]byte, 1)
-	_, err := io.ReadFull(se.r, entryTypeBuf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return ListResult{}, true, nil
-	}
-	if err != nil {
-		return ListResult{}, true, fatal(ErrCodeTruncated, "read entry type", err)
-	}
-	if entryTypeBuf[0] != archive.EntryTypeFile {
-		return ListResult{}, true, nil
+func (se *SafeExtractor) listNext(keys *archive.KeySchedule) (ListResult, bool, error) {
+	more, err := se.nextEntryType(keys.Version())
+	if err != nil || !more {
+		return ListResult{}, true, err
 	}
 
 	var salt [crypto.SaltSize]byte
 	if _, err := io.ReadFull(se.r, salt[:]); err != nil {
 		return ListResult{}, false, recoverable(ErrCodeTruncated, "read entry salt", err)
 	}
-	fileKey := kd.DeriveKey(salt)
+	fileKey, err := keys.FileKey(salt)
+	if err != nil {
+		return ListResult{}, false, fatal(ErrCodeAuthFailed, "derive file key", err)
+	}
 
 	if _, err := io.ReadFull(se.r, make([]byte, 32)); err != nil {
 		return ListResult{}, false, recoverable(ErrCodeTruncated, "read frame header", err)

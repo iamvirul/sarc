@@ -18,11 +18,11 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
 ## On-disk format
 
 ```
-[ARCHIVE HEADER]        magic(4) version(2) salt(32) file_count_encrypted(36) reserved(32)
+[ARCHIVE HEADER]        magic(4) version(2) archive_salt(32) file_count_encrypted(36) reserved(32)
 
 [FILE ENTRY]  (repeated)
   entry_type(1)         0x01 = file
-  entry_salt(32)        unique per file, used for PBKDF2 key derivation
+  entry_salt(32)        unique per file, input to the per-file key derivation
   frame_header(32)      random bytes, no semantic content
   metadata_nonce(12)
   metadata_size(4)
@@ -41,23 +41,52 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
   hmac_sealed           AES-256-GCM sealed HMAC-SHA256(plaintext), verified after decryption
   entry_checksum(8)     random, used for boundary detection only
 
+[END MARKER]            entry_type=0x00(1), version 2+ only
+
 [ARCHIVE FOOTER]
-  archive_hmac(32)      SHA-256 of all bytes preceding the footer
+  archive_hmac(32)      SHA-256 of all bytes preceding the footer, end marker included
   reserved(32)
 ```
 
+The reader loops on `entry_type`: `0x01` starts a file entry and, in version 2, `0x00`
+ends the entry list. Any other byte, or EOF before the end marker, is a fatal error.
+Version 1 archives have no end marker, so the reader treats EOF or any byte other than
+`0x01` as the end. That heuristic misreads roughly 1 in 256 version 1 archives, whose
+footer HMAC happens to start with `0x01`, as having one extra (failing) entry.
+
 ## Key derivation
 
-Every file gets its own independent AES-256 key:
+The `version` header field selects the key schedule (`archive.KeySchedule`). New archives
+are always written as version 2; the extractor accepts versions 1 and 2.
+
+### Version 2 (current)
+
+The password is stretched once per archive, then every file gets its own AES-256 key
+via HKDF-SHA256:
 
 ```
-file_key = PBKDF2(master_password, entry_salt, 100_000, 32, SHA-256)
+master_key = PBKDF2(password, archive_salt, 100_000, 32, SHA-256)       // once per archive
+file_key   = HKDF-Expand(master_key, "sarc file key" || entry_salt, 32)  // per file entry
+header_key = HKDF-Expand(master_key, "sarc header key", 32)              // seals file count
 ```
 
-The archive salt in the header is used to derive the master key for sealing the file count:
+`master_key` is already uniformly random, so HKDF-Extract is skipped (RFC 5869 section 3.3).
+The extractor opens `file_count_encrypted` with `header_key` before parsing any entry, so a
+wrong password fails immediately with `AUTH_FAILED` and nothing is written to disk.
+Each entry still has a unique key because every `entry_salt` is unique, and file keys are
+one-way outputs of `master_key`: recovering a file key does not reveal `master_key` or other
+file keys. The master key itself is never used directly as an encryption key.
+
+Archiving or extracting N files costs one PBKDF2 run plus N HKDF expansions (microseconds
+each), instead of N PBKDF2 runs.
+
+### Version 1 (read-only)
+
+Archives written before v2.0.0 derive each file key with its own PBKDF2 run:
 
 ```
-master_key = PBKDF2(master_password, archive_salt, 100_000, 32, SHA-256)
+file_key   = PBKDF2(password, entry_salt, 100_000, 32, SHA-256)
+master_key = PBKDF2(password, archive_salt, 100_000, 32, SHA-256)  // sealed file count
 ```
 
 ## Anti-deduplication layers

@@ -34,7 +34,7 @@ sarc list --password "StrongPass123" --archive backup.sarc
 | Property | Mechanism |
 |---|---|
 | Confidentiality | AES-256-GCM per block |
-| Key isolation | PBKDF2-SHA256, 100k iterations, unique 32-byte salt per file |
+| Key isolation | PBKDF2-SHA256 (100k iterations) once per archive, then a unique HKDF-SHA256 key per file from a unique 32-byte salt |
 | Integrity | GCM auth tag per block + HMAC-SHA256 over full plaintext |
 | Deduplication resistance | Random padding (1-4 KB header, 512-2048 B trailer), variable chunk sizes (64 KB +/- 8 KB), unique nonce per block |
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |

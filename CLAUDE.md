@@ -47,8 +47,9 @@ examples/     Standalone Go programs showing archive/extract API usage.
 
 ### On-disk format
 
-Each file entry in the `.sarc` container has its own independently derived AES-256 key:
-`file_key = PBKDF2(password, entry_salt, 100_000 iterations, SHA-256)`.
+Each file entry in the `.sarc` container has its own AES-256 key. Format version 2 (current) stretches the password once per archive, then expands per-file keys with HKDF:
+`master_key = PBKDF2(password, archive_salt, 100_000 iterations, SHA-256)`, `file_key = HKDF-SHA256-Expand(master_key, "sarc file key" || entry_salt)`.
+Version 1 archives (one PBKDF2 per file entry) remain extractable; `archive.KeySchedule` selects the derivation from the header version. `tests/testdata/v1_multi.sarc` is the v1 compatibility fixture.
 
 Data is split into variable-length blocks (~64 KB ± 8 KB), each with a unique 12-byte `crypto/rand` nonce. A sealed HMAC-SHA256 of the plaintext is stored encrypted at the end of each file entry and verified with `crypto/subtle.ConstantTimeCompare` after decryption — before writing any output to disk.
 
