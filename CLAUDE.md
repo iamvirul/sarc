@@ -53,6 +53,8 @@ Version 1 archives (one PBKDF2 per file entry) remain extractable; `archive.KeyS
 
 Version 2 can zstd-compress each file before encryption (`archive/codec.go`, policy in `io/compression.go`). The codec is per file, stored in sealed metadata; each block of a zstd entry is an independent frame, so `FrameBuilder` compresses inside its chunk-encrypt methods and the pipelines are codec-agnostic. The HMAC and the trailer's plaintext size cover the original plaintext.
 
+Opt-in solid mode (`--solid`, `io/solid.go`, record format in `archive/solid.go`) packs files up to 1 MiB into solid group entries (`EntryTypeSolid`, up to 8 MiB uncompressed) compressed as one zstd stream. Groups reuse the file-entry framing, so skip/resync logic is shared; extraction verifies the group HMAC before writing any member.
+
 Data is split into variable-length blocks (~64 KB ± 8 KB), each with a unique 12-byte `crypto/rand` nonce. A sealed HMAC-SHA256 of the plaintext is stored encrypted at the end of each file entry and verified with `crypto/subtle.ConstantTimeCompare` after decryption — before writing any output to disk.
 
 ### Anti-deduplication

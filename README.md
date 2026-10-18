@@ -26,6 +26,10 @@ sarc archive --password "StrongPass123" --output backup.sarc --compress file.log
 sarc archive --password "StrongPass123" --output backup.sarc --no-compress file.log   # never
 sarc archive --password "StrongPass123" --output backup.sarc --compress-level 19 a b  # 1-22, default 3
 
+# Solid mode: pack files up to 1 MiB into shared groups (up to 8 MiB each) compressed as one
+# stream. Much smaller archives of many small files, such as source trees.
+sarc archive --password "StrongPass123" --output src.sarc --solid --compress-level 19 src/*
+
 # Extract
 sarc extract --password "StrongPass123" --archive backup.sarc --output ./restored/
 
@@ -39,6 +43,17 @@ sarc list --password "StrongPass123" --archive backup.sarc
 `--compress-level` takes zstd's 1-22 scale; the pure-Go encoder maps it onto four speed
 tiers (fastest, default, better, best), so neighbouring levels can produce identical output.
 
+Archive size compared with zip, on Go source trees (zip with default settings):
+
+| Tree | zip | sarc per-file (auto) | sarc `--solid` | sarc `--solid --compress-level 19` |
+|---|---|---|---|---|
+| `net/http` (113 files) | 616K | 888K | 557K (-10%) | 474K (-23%) |
+| `runtime` (1088 files) | 4358K | 6721K | 3453K (-21%) | 2979K (-32%) |
+| `cmd/go` (1496 files) | 1883K | 4933K | 1244K (-34%) | 1062K (-44%) |
+
+Per-file mode stays larger than zip on small-file trees because every entry carries about
+2.2 KB of random anti-deduplication padding; solid mode pays that once per group.
+
 ## Security model
 
 | Property | Mechanism |
@@ -49,11 +64,17 @@ tiers (fastest, default, better, best), so neighbouring levels can produce ident
 | Deduplication resistance | Random padding (1-4 KB header, 512-2048 B trailer), variable chunk sizes (64 KB +/- 8 KB), unique nonce per block |
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |
 | Compression | Optional zstd before encryption, per file; the codec is recorded inside the encrypted metadata |
+| Solid groups (`--solid`) | Small files share one entry: one key, one padding set, one HMAC per group of up to 8 MiB |
 
 Compression trade-off: compressing before encrypting makes ciphertext size depend on how
 compressible each file is, which weakly hints at file type and content to anyone who can
 see the archive. Use `--no-compress` when archive sizes must reveal nothing beyond the
 padded plaintext size.
+
+Solid trade-off: every file in a solid group is encrypted under the group's key, so key
+isolation is per group rather than per file, and the archive reveals which small files
+were packed together (the entry type byte marks solid groups). Member names, sizes, and
+permissions are inside the encrypted stream. Solid mode is off unless `--solid` is given.
 | Container integrity | HMAC-SHA256 over entire archive body, verified by `sarc verify` without decryption |
 
 ## Benchmark
