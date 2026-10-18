@@ -41,10 +41,18 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
   hmac_sealed           AES-256-GCM sealed HMAC-SHA256(plaintext), verified after decryption
   entry_checksum(8)     random, used for boundary detection only
 
+[END MARKER]            entry_type=0x00(1), version 2+ only
+
 [ARCHIVE FOOTER]
-  archive_hmac(32)      SHA-256 of all bytes preceding the footer
+  archive_hmac(32)      SHA-256 of all bytes preceding the footer, end marker included
   reserved(32)
 ```
+
+The reader loops on `entry_type`: `0x01` starts a file entry and, in version 2, `0x00`
+ends the entry list. Any other byte, or EOF before the end marker, is a fatal error.
+Version 1 archives have no end marker, so the reader treats EOF or any byte other than
+`0x01` as the end. That heuristic misreads roughly 1 in 256 version 1 archives, whose
+footer HMAC happens to start with `0x01`, as having one extra (failing) entry.
 
 ## Key derivation
 
@@ -63,6 +71,8 @@ header_key = HKDF-Expand(master_key, "sarc header key", 32)              // seal
 ```
 
 `master_key` is already uniformly random, so HKDF-Extract is skipped (RFC 5869 section 3.3).
+The extractor opens `file_count_encrypted` with `header_key` before parsing any entry, so a
+wrong password fails immediately with `AUTH_FAILED` and nothing is written to disk.
 Each entry still has a unique key because every `entry_salt` is unique, and file keys are
 one-way outputs of `master_key`: recovering a file key does not reveal `master_key` or other
 file keys. The master key itself is never used directly as an encryption key.
