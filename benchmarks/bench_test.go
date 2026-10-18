@@ -365,3 +365,47 @@ func BenchmarkExtractCompressedText(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkArchiveSmallFilesSolid archives 300 small source-like files per file and in
+// solid groups, reporting archive size relative to input ("ratio"). Per-entry padding
+// dominates the per-file case; solid groups amortise it and share one compression window.
+func BenchmarkArchiveSmallFilesSolid(b *testing.B) {
+	dir := b.TempDir()
+	paths := make([]string, 300)
+	var inputBytes int64
+	for i := range paths {
+		var src bytes.Buffer
+		for line := 0; src.Len() < 2000+(i%7)*900; line++ {
+			fmt.Fprintf(&src, "func handler%d_%d(w http.ResponseWriter, r *http.Request) error { return render(w, %d) }\n", i, line, line)
+		}
+		paths[i] = fmt.Sprintf("%s/file-%03d.go", dir, i)
+		if err := os.WriteFile(paths[i], src.Bytes(), 0o644); err != nil {
+			b.Fatal(err)
+		}
+		inputBytes += int64(src.Len())
+	}
+	for _, solid := range []bool{false, true} {
+		name := "per-file"
+		if solid {
+			name = "solid"
+		}
+		b.Run(name, func(b *testing.B) {
+			opts := sarcio.WithCompression(sarcio.CompressionOptions{Mode: sarcio.CompressionAuto, Level: 3, Solid: solid})
+			var archived int
+			b.SetBytes(inputBytes)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var out bytes.Buffer
+				ca, err := sarcio.NewConcurrentArchiver(&out, benchPassword, 0, nil, opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := ca.Archive(paths); err != nil {
+					b.Fatal(err)
+				}
+				archived = out.Len()
+			}
+			b.ReportMetric(float64(archived)/float64(inputBytes), "ratio")
+		})
+	}
+}
