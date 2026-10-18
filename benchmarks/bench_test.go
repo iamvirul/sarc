@@ -222,3 +222,66 @@ func BenchmarkArchiveSizeTargets(b *testing.B) {
 		})
 	}
 }
+
+// manySmallFilesCount is the file count for the many-small-files benchmarks (issue #18).
+const manySmallFilesCount = 100
+
+// writeManySmallFiles creates manySmallFilesCount 4 KB files in a temp dir and returns their paths.
+func writeManySmallFiles(b *testing.B) []string {
+	b.Helper()
+	dir := b.TempDir()
+	content := bytes.Repeat([]byte("many-small-files"), 256)
+	paths := make([]string, manySmallFilesCount)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("%s/small-%03d.bin", dir, i)
+		if err := os.WriteFile(paths[i], content, 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return paths
+}
+
+// BenchmarkArchiveManySmallFiles archives 100 small files. Run time is dominated by
+// key derivation, so it tracks whether PBKDF2 runs once per archive or once per file.
+func BenchmarkArchiveManySmallFiles(b *testing.B) {
+	paths := writeManySmallFiles(b)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var out bytes.Buffer
+		ca, err := sarcio.NewConcurrentArchiver(&out, benchPassword, 0, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := ca.Archive(paths); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkExtractManySmallFiles extracts a 100-file archive, the decrypt-side
+// counterpart of BenchmarkArchiveManySmallFiles.
+func BenchmarkExtractManySmallFiles(b *testing.B) {
+	paths := writeManySmallFiles(b)
+	var archived bytes.Buffer
+	ca, err := sarcio.NewConcurrentArchiver(&archived, benchPassword, 0, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := ca.Archive(paths); err != nil {
+		b.Fatal(err)
+	}
+	outDir := b.TempDir()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ex := sarcio.NewSafeExtractor(bytes.NewReader(archived.Bytes()), benchPassword, nil)
+		results, err := ex.Extract(outDir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(results) != manySmallFilesCount {
+			b.Fatalf("extracted %d entries, want %d", len(results), manySmallFilesCount)
+		}
+	}
+}
