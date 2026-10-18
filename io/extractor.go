@@ -27,10 +27,13 @@ type ExtractionResult struct {
 // ListResult holds decrypted metadata for one archive entry, used by the list command.
 // OriginalBytes is the plaintext size; StoredBytes is the encoded payload size before
 // encryption (equal to OriginalBytes for uncompressed entries).
+// Solid members share one compressed stream, so their StoredBytes is their
+// proportional share of the group's stored size.
 type ListResult struct {
 	Filename      string
 	SizeBucket    string
 	Codec         string
+	Solid         bool
 	OriginalBytes int64
 	StoredBytes   int64
 	Err           error
@@ -72,6 +75,40 @@ func (o decompressingOpener) DecryptBlock(block crypto.EncryptedBlock) ([]byte, 
 	return pt, nil
 }
 
+// entryHead is the opened prefix of a file or solid entry: everything up to and
+// including its sealed metadata.
+type entryHead struct {
+	fileKey [crypto.KeySize]byte
+	pm      archive.PlaintextMetadata
+}
+
+// entryDecoders holds the zstd decoders one Extract or List call needs. The solid
+// decoder is created on first use, since most archives have no solid groups.
+type entryDecoders struct {
+	block *archive.BlockDecompressor
+	solid *archive.BlockDecompressor
+}
+
+func (d *entryDecoders) solidDecoder() (*archive.BlockDecompressor, error) {
+	if d.solid == nil {
+		dec, err := archive.NewSolidDecompressor()
+		if err != nil {
+			return nil, err
+		}
+		d.solid = dec
+	}
+	return d.solid, nil
+}
+
+func (d *entryDecoders) close() {
+	if d.block != nil {
+		d.block.Close()
+	}
+	if d.solid != nil {
+		d.solid.Close()
+	}
+}
+
 // trailerInfo is the opened sealed trailer of one file entry.
 type trailerInfo struct {
 	hmac          [crypto.HMACSize]byte
@@ -94,29 +131,32 @@ func NewSafeExtractor(r io.Reader, password string, progress ProgressTracker) *S
 	return &SafeExtractor{r: r, password: password, progress: progress}
 }
 
-// Extract decrypts every file entry in the archive and writes them under outputDir.
+// Extract decrypts every entry in the archive and writes its files under outputDir.
 // Each entry is authenticated before any bytes are written to disk.
-// Returns one ExtractionResult per file entry.
+// Returns one ExtractionResult per file, including each member of a solid group, or
+// one failed result for an entry that could not be opened.
 func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
 	}
-	dec, err := archive.NewBlockDecompressor()
+	block, err := archive.NewBlockDecompressor()
 	if err != nil {
 		return nil, fatal(ErrCodeReadFailed, "init decompressor", err)
 	}
-	defer dec.Close()
+	decs := &entryDecoders{block: block}
+	defer decs.close()
 
 	var results []ExtractionResult
 	for {
-		result, done, err := se.extractNext(keys, dec, outputDir)
-		if done {
-			if err != nil {
-				return results, err
-			}
-			break
+		entryType, more, err := se.nextEntryType(keys.Version())
+		if err != nil {
+			return results, err
 		}
+		if !more {
+			return results, nil
+		}
+		entryResults, err := se.extractEntry(keys, entryType, decs, outputDir)
 		if err != nil {
 			if isFatal(err) {
 				return results, err
@@ -126,9 +166,8 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 			se.progress.FileError("unknown", err)
 			continue
 		}
-		results = append(results, result)
+		results = append(results, entryResults...)
 	}
-	return results, nil
 }
 
 // readHeader parses the archive header and returns the KeySchedule matching its
@@ -192,106 +231,121 @@ func openFileCount(keys *archive.KeySchedule, sealed [8 + crypto.NonceSize + cry
 	return err
 }
 
-// nextEntryType reads the next entry type byte and reports whether a file entry follows.
-// Version2+ archives end with EntryTypeEnd; EOF or any other byte is fatal. Version1
-// archives have no end marker, so EOF or any byte other than EntryTypeFile ends them.
-func (se *SafeExtractor) nextEntryType(version uint16) (bool, error) {
+// nextEntryType reads the next entry type byte and reports whether an entry follows.
+// Version2+ archives hold file and solid entries and end with EntryTypeEnd; EOF or any
+// other byte is fatal. Version1 archives hold only file entries and have no end marker,
+// so EOF or any byte other than EntryTypeFile ends them.
+func (se *SafeExtractor) nextEntryType(version uint16) (byte, bool, error) {
 	var b [1]byte
 	_, err := io.ReadFull(se.r, b[:])
 	if version == archive.Version1 {
 		if err == io.EOF {
-			return false, nil
+			return 0, false, nil
 		}
 		if err != nil {
-			return false, fatal(ErrCodeTruncated, "read entry type", err)
+			return 0, false, fatal(ErrCodeTruncated, "read entry type", err)
 		}
-		return b[0] == archive.EntryTypeFile, nil
+		return b[0], b[0] == archive.EntryTypeFile, nil
 	}
 	if err != nil {
-		return false, fatal(ErrCodeTruncated, "read entry type", err)
+		return 0, false, fatal(ErrCodeTruncated, "read entry type", err)
 	}
 	switch b[0] {
-	case archive.EntryTypeFile:
-		return true, nil
+	case archive.EntryTypeFile, archive.EntryTypeSolid:
+		return b[0], true, nil
 	case archive.EntryTypeEnd:
-		return false, nil
+		return b[0], false, nil
 	default:
-		return false, fatal(ErrCodeIntegrityFail, fmt.Sprintf("unexpected entry type 0x%02x", b[0]), nil)
+		return 0, false, fatal(ErrCodeIntegrityFail, fmt.Sprintf("unexpected entry type 0x%02x", b[0]), nil)
 	}
 }
 
-func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, dec *archive.BlockDecompressor, outputDir string) (ExtractionResult, bool, error) {
-	more, err := se.nextEntryType(keys.Version())
-	if err != nil || !more {
-		return ExtractionResult{}, true, err
-	}
-
+// readEntryHead reads an entry's salt, frame header, and sealed metadata, and opens the
+// metadata. If the metadata fails to open, the rest of the entry is skipped so the
+// reader stays aligned on the next one.
+func (se *SafeExtractor) readEntryHead(keys *archive.KeySchedule) (entryHead, error) {
 	var salt [crypto.SaltSize]byte
 	if _, err := io.ReadFull(se.r, salt[:]); err != nil {
-		return ExtractionResult{}, false, recoverable(ErrCodeTruncated, "read entry salt", err)
+		return entryHead{}, recoverable(ErrCodeTruncated, "read entry salt", err)
 	}
-
 	fileKey, err := keys.FileKey(salt)
 	if err != nil {
-		return ExtractionResult{}, false, fatal(ErrCodeAuthFailed, "derive file key", err)
+		return entryHead{}, fatal(ErrCodeAuthFailed, "derive file key", err)
 	}
-
-	var frameHdr [32]byte
-	if _, err := io.ReadFull(se.r, frameHdr[:]); err != nil {
-		return ExtractionResult{}, false, recoverable(ErrCodeTruncated, "read frame header", err)
+	if _, err := io.ReadFull(se.r, make([]byte, len(archive.FrameHeader{}))); err != nil {
+		return entryHead{}, recoverable(ErrCodeTruncated, "read frame header", err)
 	}
-
 	metaBlock, err := se.readMetadataBlock()
 	if err != nil {
-		return ExtractionResult{}, false, err
+		return entryHead{}, err
 	}
-
 	mm, err := archive.NewMetadataManager(fileKey)
 	if err != nil {
-		return ExtractionResult{}, false, fatal(ErrCodeAuthFailed, "init metadata manager", err)
+		return entryHead{}, fatal(ErrCodeAuthFailed, "init metadata manager", err)
 	}
 	pm, err := mm.Open(metaBlock)
 	if err != nil {
-		return ExtractionResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt metadata", err))
+		return entryHead{}, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt metadata", err))
 	}
+	return entryHead{fileKey: fileKey, pm: pm}, nil
+}
 
+// extractEntry extracts the entry whose type byte was just read.
+func (se *SafeExtractor) extractEntry(keys *archive.KeySchedule, entryType byte, decs *entryDecoders, outputDir string) ([]ExtractionResult, error) {
+	head, err := se.readEntryHead(keys)
+	if err != nil {
+		return nil, err
+	}
+	if entryType == archive.EntryTypeSolid {
+		return se.extractSolidBody(keys, head, decs, outputDir)
+	}
+	result, err := se.extractFileBody(keys, head, decs.block, outputDir)
+	if err != nil {
+		return nil, err
+	}
+	return []ExtractionResult{result}, nil
+}
+
+// extractFileBody extracts the rest of a file entry after its head.
+func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHead, dec *archive.BlockDecompressor, outputDir string) (ExtractionResult, error) {
+	fileKey, pm := head.fileKey, head.pm
 	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
 	if err != nil {
-		return ExtractionResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
+		return ExtractionResult{}, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
 	}
 
 	if err := se.skipPadding(); err != nil {
-		return ExtractionResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
+		return ExtractionResult{}, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
 
 	plaintext, err := se.decryptDataBlocks(fileKey, pm.SizeBucket, pm.Codec, dec)
 	if err != nil {
 		if isFatal(err) {
-			return ExtractionResult{}, false, err
+			return ExtractionResult{}, err
 		}
 		// Block framing is intact (decryptDataBlocks drains to the sentinel), so skip
 		// the trailer and leave the reader at the next entry.
-		return ExtractionResult{}, false, se.skipTrailer(err)
+		return ExtractionResult{}, se.skipTrailer(err)
 	}
 
 	trailer, err := se.readTrailer(fileKey, keys.Version())
 	if err != nil {
-		return ExtractionResult{}, false, err
+		return ExtractionResult{}, err
 	}
 	if err := verifyPlaintext(fileKey, plaintext, trailer); err != nil {
-		return ExtractionResult{}, false, err
+		return ExtractionResult{}, err
 	}
 
 	outPath := filepath.Join(outputDir, filepath.Base(filename))
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return ExtractionResult{}, false, fatal(ErrCodeWriteFailed, "create output dir", err)
+		return ExtractionResult{}, fatal(ErrCodeWriteFailed, "create output dir", err)
 	}
 	if err := os.WriteFile(outPath, plaintext, os.FileMode(pm.Permissions)); err != nil {
-		return ExtractionResult{}, false, recoverable(ErrCodeWriteFailed, "write file", err)
+		return ExtractionResult{}, recoverable(ErrCodeWriteFailed, "write file", err)
 	}
 
 	se.progress.FileFinished(filename)
-	return ExtractionResult{Filename: filename, Size: int64(len(plaintext)), OK: true}, false, nil
+	return ExtractionResult{Filename: filename, Size: int64(len(plaintext)), OK: true}, nil
 }
 
 func (se *SafeExtractor) readMetadataBlock() (archive.MetadataBlock, error) {
@@ -518,23 +572,28 @@ func verifyPlaintext(fileKey [crypto.KeySize]byte, plaintext []byte, trailer tra
 	return nil
 }
 
-// List decrypts metadata for every entry and returns a ListResult per file.
-// No file content is decrypted or written to disk.
+// List decrypts metadata for every entry and returns a ListResult per file, including
+// each member of a solid group. Data blocks of file entries are never decrypted; solid
+// groups are decrypted in memory to read their member records. Nothing is written to disk.
 func (se *SafeExtractor) List() ([]ListResult, error) {
 	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
 	}
 
+	decs := &entryDecoders{}
+	defer decs.close()
+
 	var results []ListResult
 	for {
-		result, done, err := se.listNext(keys)
-		if done {
-			if err != nil {
-				return results, err
-			}
-			break
+		entryType, more, err := se.nextEntryType(keys.Version())
+		if err != nil {
+			return results, err
 		}
+		if !more {
+			return results, nil
+		}
+		entryResults, err := se.listEntry(keys, entryType, decs)
 		if err != nil {
 			if isFatal(err) {
 				return results, err
@@ -542,59 +601,47 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 			results = append(results, ListResult{Filename: "<decrypt error>", SizeBucket: "?", Codec: "?", Err: err})
 			continue
 		}
-		results = append(results, result)
+		results = append(results, entryResults...)
 	}
-	return results, nil
 }
 
-func (se *SafeExtractor) listNext(keys *archive.KeySchedule) (ListResult, bool, error) {
-	more, err := se.nextEntryType(keys.Version())
-	if err != nil || !more {
-		return ListResult{}, true, err
+// listEntry lists the entry whose type byte was just read.
+func (se *SafeExtractor) listEntry(keys *archive.KeySchedule, entryType byte, decs *entryDecoders) ([]ListResult, error) {
+	head, err := se.readEntryHead(keys)
+	if err != nil {
+		return nil, err
 	}
+	if entryType == archive.EntryTypeSolid {
+		return se.listSolidBody(keys, head, decs)
+	}
+	result, err := se.listFileBody(keys, head)
+	if err != nil {
+		return nil, err
+	}
+	return []ListResult{result}, nil
+}
 
-	var salt [crypto.SaltSize]byte
-	if _, err := io.ReadFull(se.r, salt[:]); err != nil {
-		return ListResult{}, false, recoverable(ErrCodeTruncated, "read entry salt", err)
-	}
-	fileKey, err := keys.FileKey(salt)
-	if err != nil {
-		return ListResult{}, false, fatal(ErrCodeAuthFailed, "derive file key", err)
-	}
-
-	if _, err := io.ReadFull(se.r, make([]byte, 32)); err != nil {
-		return ListResult{}, false, recoverable(ErrCodeTruncated, "read frame header", err)
-	}
-
-	metaBlock, err := se.readMetadataBlock()
-	if err != nil {
-		return ListResult{}, false, err
-	}
-	mm, err := archive.NewMetadataManager(fileKey)
-	if err != nil {
-		return ListResult{}, false, fatal(ErrCodeAuthFailed, "init metadata manager", err)
-	}
-	pm, err := mm.Open(metaBlock)
-	if err != nil {
-		return ListResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt metadata", err))
-	}
+// listFileBody reads the rest of a file entry after its head without decrypting its
+// data blocks.
+func (se *SafeExtractor) listFileBody(keys *archive.KeySchedule, head entryHead) (ListResult, error) {
+	fileKey, pm := head.fileKey, head.pm
 	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
 	if err != nil {
-		return ListResult{}, false, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
+		return ListResult{}, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
 	}
 
 	// Data blocks are skipped by their length prefixes, never decrypted: list needs only
 	// metadata and the trailer's recorded size.
 	if err := se.skipPadding(); err != nil {
-		return ListResult{}, false, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
+		return ListResult{}, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
 	stored, err := se.skipDataBlocks()
 	if err != nil {
-		return ListResult{}, false, err
+		return ListResult{}, err
 	}
 	trailer, err := se.readTrailer(fileKey, keys.Version())
 	if err != nil {
-		return ListResult{}, false, err
+		return ListResult{}, err
 	}
 	original := stored // Version1 entries are never compressed
 	if trailer.hasSize {
@@ -607,7 +654,7 @@ func (se *SafeExtractor) listNext(keys *archive.KeySchedule) (ListResult, bool, 
 		Codec:         pm.Codec.String(),
 		OriginalBytes: original,
 		StoredBytes:   stored,
-	}, false, nil
+	}, nil
 }
 
 func bucketName(b archive.SizeBucket) string {

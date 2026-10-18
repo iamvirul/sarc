@@ -49,8 +49,8 @@ const (
 	// incompressible MaxChunkSize input (checksums are disabled; GCM authenticates).
 	zstdMaxOverhead = 256
 	// bestTierMaxEncoders caps concurrent encoders at the best-compression tier, where
-	// each encoder holds roughly 35 MB of state. Uncapped, GOMAXPROCS of them push peak
-	// memory past several hundred MB.
+	// each encoder holds roughly 35 MB (block window) to 50 MB (solid window) of state.
+	// Uncapped, GOMAXPROCS of them push peak memory past several hundred MB.
 	bestTierMaxEncoders = 2
 )
 
@@ -60,17 +60,29 @@ const MaxPayloadSize = MaxChunkSize + zstdMaxOverhead
 // ErrInvalidCompressionLevel is returned for a level outside [MinCompressionLevel, MaxCompressionLevel].
 var ErrInvalidCompressionLevel = errors.New("archive: invalid compression level")
 
-// ErrBlockTooLarge is returned when a block decodes to more than MaxChunkSize bytes.
+// ErrBlockTooLarge is returned when a payload decodes past its decompressor's limit
+// (MaxChunkSize for blocks, MaxSolidStreamSize for solid groups).
 var ErrBlockTooLarge = errors.New("archive: decoded block exceeds maximum chunk size")
 
-// BlockCompressor zstd-encodes data-block plaintext. Safe for concurrent use.
+// BlockCompressor zstd-encodes data-block plaintext or a solid group stream.
+// Safe for concurrent use.
 type BlockCompressor struct {
 	enc *zstd.Encoder
 }
 
-// NewBlockCompressor returns a BlockCompressor for a zstd level in [1, 22]. The level is
-// mapped to the nearest encoder tier supported by the pure-Go implementation.
+// NewBlockCompressor returns a BlockCompressor for per-block frames at a zstd level in
+// [1, 22]. The level is mapped to the nearest encoder tier of the pure-Go implementation.
 func NewBlockCompressor(level int) (*BlockCompressor, error) {
+	return newCompressor(level, zstdWindowSize)
+}
+
+// NewSolidCompressor returns a BlockCompressor for whole solid group streams; its window
+// spans MaxSolidStreamSize so members can reference each other across the group.
+func NewSolidCompressor(level int) (*BlockCompressor, error) {
+	return newCompressor(level, MaxSolidStreamSize)
+}
+
+func newCompressor(level, window int) (*BlockCompressor, error) {
 	if level < MinCompressionLevel || level > MaxCompressionLevel {
 		return nil, fmt.Errorf("%w: %d (want %d-%d)", ErrInvalidCompressionLevel, level, MinCompressionLevel, MaxCompressionLevel)
 	}
@@ -79,7 +91,7 @@ func NewBlockCompressor(level int) (*BlockCompressor, error) {
 		zstd.WithEncoderLevel(encLevel),
 		zstd.WithEncoderConcurrency(encoderConcurrency(encLevel)),
 		zstd.WithEncoderCRC(false),
-		zstd.WithWindowSize(zstdWindowSize),
+		zstd.WithWindowSize(window),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("archive/codec: new zstd encoder: %w", err)
@@ -103,27 +115,39 @@ func (bc *BlockCompressor) Compress(dst, src []byte) []byte {
 	return bc.enc.EncodeAll(src, dst)
 }
 
-// BlockDecompressor decodes zstd block payloads. Safe for concurrent use.
-// Close must be called to release decoder resources.
+// BlockDecompressor decodes zstd payloads up to a fixed decoded-size limit.
+// Safe for concurrent use. Close must be called to release decoder resources.
 type BlockDecompressor struct {
-	dec *zstd.Decoder
+	dec   *zstd.Decoder
+	limit int
 }
 
-// NewBlockDecompressor returns a BlockDecompressor that rejects any frame decoding
-// to more than MaxChunkSize bytes, bounding memory against hostile payloads.
+// NewBlockDecompressor returns a BlockDecompressor for per-block frames that rejects any
+// frame decoding to more than MaxChunkSize bytes, bounding memory against hostile payloads.
 func NewBlockDecompressor() (*BlockDecompressor, error) {
+	return newDecompressor(MaxChunkSize, zstdWindowSize)
+}
+
+// NewSolidDecompressor returns a BlockDecompressor for solid group streams that rejects
+// any frame decoding to more than MaxSolidStreamSize bytes.
+func NewSolidDecompressor() (*BlockDecompressor, error) {
+	return newDecompressor(MaxSolidStreamSize, MaxSolidStreamSize)
+}
+
+func newDecompressor(limit, window int) (*BlockDecompressor, error) {
 	dec, err := zstd.NewReader(nil,
 		zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)),
-		zstd.WithDecoderMaxMemory(MaxChunkSize),
-		zstd.WithDecoderMaxWindow(zstdWindowSize),
+		zstd.WithDecoderMaxMemory(uint64(limit)),
+		zstd.WithDecoderMaxWindow(uint64(window)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("archive/codec: new zstd decoder: %w", err)
 	}
-	return &BlockDecompressor{dec: dec}, nil
+	return &BlockDecompressor{dec: dec, limit: limit}, nil
 }
 
-// Decompress decodes one block payload produced by BlockCompressor.Compress.
+// Decompress decodes one payload produced by the matching BlockCompressor.
+// It returns ErrBlockTooLarge when the decoded size would exceed the decoder's limit.
 func (bd *BlockDecompressor) Decompress(src []byte) ([]byte, error) {
 	out, err := bd.dec.DecodeAll(src, nil)
 	if err != nil {
@@ -133,7 +157,7 @@ func (bd *BlockDecompressor) Decompress(src []byte) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("archive/codec: zstd decode: %w", err)
 	}
-	if len(out) > MaxChunkSize {
+	if len(out) > bd.limit {
 		return nil, ErrBlockTooLarge
 	}
 	return out, nil

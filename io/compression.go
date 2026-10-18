@@ -58,9 +58,13 @@ var incompressibleExtensions = map[string]struct{}{
 }
 
 // CompressionOptions configures compression for an archiver.
+// Solid packs files up to archive.SolidMemberMaxSize into shared solid group entries,
+// compressing each group as one stream; it trades per-file key isolation for
+// per-group isolation, so it is off by default.
 type CompressionOptions struct {
 	Mode  CompressionMode
 	Level int // zstd level, archive.MinCompressionLevel..archive.MaxCompressionLevel
+	Solid bool
 }
 
 // DefaultCompressionOptions returns CompressionAuto at archive.DefaultCompressionLevel.
@@ -80,28 +84,35 @@ func WithCompression(opts CompressionOptions) ArchiverOption {
 	return func(c *archiverConfig) { c.compression = opts }
 }
 
-// compressionPolicy decides the codec for each file. Safe for concurrent use.
+// compressionPolicy decides the codec for each file and solid group. Safe for concurrent use.
 type compressionPolicy struct {
-	mode       CompressionMode
-	compressor *archive.BlockCompressor // nil when mode is CompressionNever
+	mode            CompressionMode
+	solid           bool
+	compressor      *archive.BlockCompressor // nil when mode is CompressionNever
+	solidCompressor *archive.BlockCompressor // nil unless solid and mode is not CompressionNever
 	// probeCompressor runs CompressionAuto's test compression at the fastest level: the
 	// probe only estimates compressibility, and a high-level encoder would cost tens of MB.
 	probeCompressor *archive.BlockCompressor // nil unless mode is CompressionAuto
 }
 
-// newCompressionPolicy validates opts and builds the shared compressor.
+// newCompressionPolicy validates opts and builds the shared compressors.
 func newCompressionPolicy(opts CompressionOptions) (*compressionPolicy, error) {
 	switch opts.Mode {
 	case CompressionNever:
-		return &compressionPolicy{mode: opts.Mode}, nil
+		return &compressionPolicy{mode: opts.Mode, solid: opts.Solid}, nil
 	case CompressionAuto, CompressionAlways:
 		bc, err := archive.NewBlockCompressor(opts.Level)
 		if err != nil {
 			return nil, err
 		}
-		p := &compressionPolicy{mode: opts.Mode, compressor: bc}
+		p := &compressionPolicy{mode: opts.Mode, solid: opts.Solid, compressor: bc}
 		if opts.Mode == CompressionAuto {
 			if p.probeCompressor, err = archive.NewBlockCompressor(archive.MinCompressionLevel); err != nil {
+				return nil, err
+			}
+		}
+		if opts.Solid {
+			if p.solidCompressor, err = archive.NewSolidCompressor(opts.Level); err != nil {
 				return nil, err
 			}
 		}

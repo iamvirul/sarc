@@ -141,12 +141,14 @@ func TestDecompressionBombBlockIsRejected(t *testing.T) {
 	requireEntryError(t, data, sarcio.ErrCodeIntegrityFail)
 }
 
-// firstBlockSizeOffset returns the offset of the first data block's 4-byte size field
-// in a single-entry archive.
+// archiveHeaderSize is the fixed archive header length; the first entry type byte follows it.
+const archiveHeaderSize = 4 + 2 + crypto.SaltSize + 8 + crypto.NonceSize + crypto.GCMTagSize + archive.ReservedSize
+
+// firstBlockSizeOffset returns the offset of the first entry's first data block 4-byte
+// size field. File and solid entries share this framing.
 func firstBlockSizeOffset(t *testing.T, data []byte) int {
 	t.Helper()
-	const headerSize = 4 + 2 + crypto.SaltSize + 8 + crypto.NonceSize + crypto.GCMTagSize + archive.ReservedSize
-	off := headerSize + 1 + crypto.SaltSize + 32 + crypto.NonceSize
+	off := archiveHeaderSize + 1 + crypto.SaltSize + 32 + crypto.NonceSize
 	off += 4 + int(binary.LittleEndian.Uint32(data[off:])) // metadata size + ciphertext
 	off += 4 + int(binary.LittleEndian.Uint32(data[off:])) // inter-block padding
 	return off + crypto.NonceSize

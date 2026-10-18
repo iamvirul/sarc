@@ -21,11 +21,15 @@ const minParallelFileSize = 4 * 1024 * 1024
 
 // StreamingArchiver archives files one at a time without loading entire files into memory.
 // Maximum memory footprint is approximately one chunk (~64 KB) per file at any point.
+// In solid mode, small files are buffered by path and written as solid groups when the
+// next one would overflow a group, and at Finalize.
 type StreamingArchiver struct {
 	w           *archive.ArchiveWriter
 	compression *compressionPolicy
 	progress    ProgressTracker
 	start       time.Time
+	pending     []string // solid group members not yet written
+	pendingSize int      // estimated record stream size of pending
 }
 
 // NewStreamingArchiver returns a StreamingArchiver writing to w with the given password.
@@ -63,8 +67,52 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 // large enough to benefit (see minParallelFileSize), so a single large file saturates
 // all available cores instead of just one. Memory footprint stays a small, fixed
 // multiple of archive.MaxChunkSize regardless of file size.
+//
+// In solid mode, a small file is only queued here; read errors for queued files are
+// reported through the ProgressTracker when its group is written.
 func (sa *StreamingArchiver) AddFile(path string) error {
+	if sa.compression.solid {
+		if record, ok := solidCandidate(path); ok {
+			if sa.pendingSize+record > archive.MaxSolidStreamSize {
+				if err := sa.flushSolid(); err != nil {
+					return err
+				}
+			}
+			sa.pending = append(sa.pending, path)
+			sa.pendingSize += record
+			return nil
+		}
+	}
 	return addFileStreaming(sa.w, sa.compression, path, runtime.GOMAXPROCS(0), sa.progress)
+}
+
+// flushSolid writes the queued solid members: as one solid group, or as an individual
+// entry when only one is queued.
+func (sa *StreamingArchiver) flushSolid() error {
+	pending := sa.pending
+	sa.pending, sa.pendingSize = nil, 0
+	switch len(pending) {
+	case 0:
+		return nil
+	case 1:
+		err := addFileStreaming(sa.w, sa.compression, pending[0], runtime.GOMAXPROCS(0), sa.progress)
+		if err != nil && !isFatal(err) {
+			sa.progress.FileError(pending[0], err)
+			return nil
+		}
+		return err
+	}
+	entry, members, err := buildSolidEntry(sa.w, sa.compression, pending, sa.progress)
+	if err != nil {
+		return err
+	}
+	if entry != nil {
+		if err := sa.w.WriteFileEntry(*entry); err != nil {
+			return fatal(ErrCodeWriteFailed, "write solid entry", err)
+		}
+	}
+	reportSolidMembers(members, sa.progress)
+	return nil
 }
 
 // addFileStreaming streams path into aw as one file entry, encrypting chunks across
@@ -190,8 +238,12 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 	return nil
 }
 
-// Finalize writes the archive footer. Must be called after all AddFile calls.
+// Finalize writes any queued solid group and the archive footer. Must be called after
+// all AddFile calls.
 func (sa *StreamingArchiver) Finalize(totalFiles int, totalBytes int64) error {
+	if err := sa.flushSolid(); err != nil {
+		return err
+	}
 	if err := sa.w.WriteFooter(); err != nil {
 		return fatal(ErrCodeWriteFailed, "write footer", err)
 	}
