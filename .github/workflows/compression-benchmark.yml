@@ -1,0 +1,103 @@
+name: Compression benchmark
+
+# Compares archive size and speed of sarc's compression modes (none, auto, solid,
+# solid at level 19) against zip on Go source trees, logs, JSON, and random data.
+# Every extraction is verified byte for byte; any mismatch fails the job.
+# Results go to the job summary, an artifact, and one PR comment updated on each run.
+# Peak disk usage is roughly 3x the generated data (~2 GB at the defaults below).
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - "archive/**"
+      - "crypto/**"
+      - "io/**"
+      - "cmd/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/compression-benchmark.py"
+      - ".github/workflows/compression-benchmark.yml"
+
+permissions:
+  contents: read
+  pull-requests: write  # post or update the results comment
+
+concurrency:
+  group: compression-benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  LOG_MB: 256
+  JSON_MB: 128
+  RANDOM_MB: 256
+
+jobs:
+  benchmark:
+    name: "sarc compression vs zip"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build sarc
+        run: go build -o ./sarc-bin ./cmd/sarc
+
+      - name: Run compression benchmark
+        run: |
+          mkdir -p "$RUNNER_TEMP/compression-bench"
+          python3 -I scripts/compression-benchmark.py \
+            --sarc ./sarc-bin \
+            --work "$RUNNER_TEMP/compression-bench" \
+            --markdown compression-benchmark.md \
+            --json compression-benchmark.json
+
+      - name: Go compression micro-benchmarks
+        run: |
+          {
+            echo ""
+            echo "<details><summary>Go micro-benchmarks (BenchmarkArchiveCompression, BenchmarkArchiveSmallFilesSolid)</summary>"
+            echo ""
+            echo '```'
+            go test -run='^$' -bench='ArchiveCompression|ExtractCompressedText|SmallFilesSolid' -benchtime=3x ./benchmarks/ | grep -E '^(Benchmark|ok)'
+            echo '```'
+            echo "</details>"
+          } >> compression-benchmark.md
+
+      - name: Publish job summary
+        run: cat compression-benchmark.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: compression-benchmark
+          path: |
+            compression-benchmark.md
+            compression-benchmark.json
+
+      # Fork PRs get a read-only token, so only same-repo PRs get the comment; the job
+      # summary and artifact are always available.
+      - name: Post or update PR comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- sarc-compression-benchmark -->";
+            const body = fs.readFileSync("compression-benchmark.md", "utf8");
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user.type === "Bot" && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
