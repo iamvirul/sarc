@@ -19,9 +19,13 @@ const (
 )
 
 const (
+	// EntryTypeFile introduces a file entry.
 	EntryTypeFile byte = 0x01
-	ReservedSize       = 32
-	HMACSize           = crypto.HMACSize
+	// EntryTypeEnd follows the last file entry and precedes the footer (Version2+).
+	// Version1 archives have no end marker; readers infer the end from the first footer byte.
+	EntryTypeEnd byte = 0x00
+	ReservedSize      = 32
+	HMACSize          = crypto.HMACSize
 )
 
 // SizeBucket is a coarse file-size class stored in metadata instead of the exact byte count.

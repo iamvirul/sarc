@@ -58,6 +58,9 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 	for {
 		result, done, err := se.extractNext(keys, outputDir)
 		if done {
+			if err != nil {
+				return results, err
+			}
 			break
 		}
 		if err != nil {
@@ -132,19 +135,38 @@ func openFileCount(keys *archive.KeySchedule, sealed [8 + crypto.NonceSize + cry
 	return err
 }
 
-func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, outputDir string) (ExtractionResult, bool, error) {
-	entryTypeBuf := make([]byte, 1)
-	_, err := io.ReadFull(se.r, entryTypeBuf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return ExtractionResult{}, true, nil
+// nextEntryType reads the next entry type byte and reports whether a file entry follows.
+// Version2+ archives end with EntryTypeEnd; EOF or any other byte is fatal. Version1
+// archives have no end marker, so EOF or any byte other than EntryTypeFile ends them.
+func (se *SafeExtractor) nextEntryType(version uint16) (bool, error) {
+	var b [1]byte
+	_, err := io.ReadFull(se.r, b[:])
+	if version == archive.Version1 {
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, fatal(ErrCodeTruncated, "read entry type", err)
+		}
+		return b[0] == archive.EntryTypeFile, nil
 	}
 	if err != nil {
-		return ExtractionResult{}, true, fatal(ErrCodeTruncated, "read entry type", err)
+		return false, fatal(ErrCodeTruncated, "read entry type", err)
 	}
+	switch b[0] {
+	case archive.EntryTypeFile:
+		return true, nil
+	case archive.EntryTypeEnd:
+		return false, nil
+	default:
+		return false, fatal(ErrCodeIntegrityFail, fmt.Sprintf("unexpected entry type 0x%02x", b[0]), nil)
+	}
+}
 
-	// Detect footer (entry type byte is not 0x01).
-	if entryTypeBuf[0] != archive.EntryTypeFile {
-		return ExtractionResult{}, true, nil
+func (se *SafeExtractor) extractNext(keys *archive.KeySchedule, outputDir string) (ExtractionResult, bool, error) {
+	more, err := se.nextEntryType(keys.Version())
+	if err != nil || !more {
+		return ExtractionResult{}, true, err
 	}
 
 	var salt [crypto.SaltSize]byte
@@ -355,6 +377,9 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 	for {
 		result, done, err := se.listNext(keys)
 		if done {
+			if err != nil {
+				return results, err
+			}
 			break
 		}
 		if err != nil {
@@ -367,16 +392,9 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 }
 
 func (se *SafeExtractor) listNext(keys *archive.KeySchedule) (ListResult, bool, error) {
-	entryTypeBuf := make([]byte, 1)
-	_, err := io.ReadFull(se.r, entryTypeBuf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return ListResult{}, true, nil
-	}
-	if err != nil {
-		return ListResult{}, true, fatal(ErrCodeTruncated, "read entry type", err)
-	}
-	if entryTypeBuf[0] != archive.EntryTypeFile {
-		return ListResult{}, true, nil
+	more, err := se.nextEntryType(keys.Version())
+	if err != nil || !more {
+		return ListResult{}, true, err
 	}
 
 	var salt [crypto.SaltSize]byte

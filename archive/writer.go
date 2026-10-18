@@ -137,9 +137,13 @@ func (aw *ArchiveWriter) EndFileEntry(trailer FileTrailer) error {
 	return aw.writeTrailer(trailer)
 }
 
-// WriteFooter computes the archive HMAC, writes the footer, and flushes the buffer.
+// WriteFooter writes the EntryTypeEnd marker, computes the archive HMAC over everything
+// up to and including the marker, writes the footer, and flushes the buffer.
 // No further writes must occur after this call.
 func (aw *ArchiveWriter) WriteFooter() error {
+	if err := writeByte(aw.tee, EntryTypeEnd); err != nil {
+		return fmt.Errorf("archive/writer: end marker: %w", err)
+	}
 	var footer ArchiveFooter
 	copy(footer.ArchiveHMAC[:], aw.hasher.Sum(nil))
 	// Footer bytes go to aw.w (bufio), not aw.tee — footer must not feed the hasher.
