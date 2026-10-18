@@ -185,7 +185,10 @@ func encryptFile(path string, aw *archive.ArchiveWriter, progress ProgressTracke
 	if err != nil {
 		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "generate salt", err)
 	}
-	fileKey := aw.DeriveFileKey(salt)
+	fileKey, err := aw.DeriveFileKey(salt)
+	if err != nil {
+		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "derive file key", err)
+	}
 
 	plaintext, err := io.ReadAll(&progressReader{r: f, progress: progress})
 	if err != nil {

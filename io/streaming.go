@@ -82,7 +82,10 @@ func addFileStreaming(aw *archive.ArchiveWriter, path string, workers int, progr
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "generate file salt", err)
 	}
-	fileKey := aw.DeriveFileKey(salt)
+	fileKey, err := aw.DeriveFileKey(salt)
+	if err != nil {
+		return fatal(ErrCodeWriteFailed, "derive file key", err)
+	}
 
 	fb, err := archive.NewFrameBuilder(fileKey)
 	if err != nil {

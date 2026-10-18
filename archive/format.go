@@ -7,11 +7,21 @@ import "github.com/iamvirul/sarc/crypto"
 
 var Magic = [4]byte{'S', 'A', 'R', 'C'}
 
+// Archive format versions. Version is what this build writes; extraction accepts
+// every version listed here.
 const (
-	Version       uint16 = 1
-	EntryTypeFile byte   = 0x01
-	ReservedSize         = 32
-	HMACSize             = crypto.HMACSize
+	// Version1 derives every file key with its own PBKDF2 run.
+	Version1 uint16 = 1
+	// Version2 runs PBKDF2 once per archive and derives file keys with HKDF.
+	Version2 uint16 = 2
+	// Version is the format version written by ArchiveWriter.
+	Version = Version2
+)
+
+const (
+	EntryTypeFile byte = 0x01
+	ReservedSize       = 32
+	HMACSize           = crypto.HMACSize
 )
 
 // SizeBucket is a coarse file-size class stored in metadata instead of the exact byte count.
@@ -26,7 +36,7 @@ const (
 )
 
 // ArchiveHeader is the fixed preamble written once at the start of the archive.
-// FileCountEncrypted holds file count sealed with the master key.
+// FileCountEncrypted holds the file count sealed with the header key (see KeySchedule).
 type ArchiveHeader struct {
 	Magic              [4]byte
 	Version            uint16

@@ -23,35 +23,45 @@ const writeBufferSize = 4 * 1024 * 1024
 // Writes are buffered through a 4 MB bufio.Writer to batch OS syscalls.
 // A MultiWriter tees every buffered write into a running SHA-256 for the footer HMAC.
 type ArchiveWriter struct {
-	w         io.Writer     // points to bw; footer writes bypass tee but still go here
-	bw        *bufio.Writer // flushed once in WriteFooter
-	hasher    hash.Hash
-	tee       io.Writer // MultiWriter(bw, hasher) — all archive content goes through this
-	kd        *crypto.KeyDeriver
-	masterKey [crypto.KeySize]byte
+	w      io.Writer     // points to bw; footer writes bypass tee but still go here
+	bw     *bufio.Writer // flushed once in WriteFooter
+	hasher hash.Hash
+	tee    io.Writer // MultiWriter(bw, hasher) — all archive content goes through this
+	keys   *KeySchedule
 }
 
-// NewArchiveWriter returns an ArchiveWriter that writes to w.
+// NewArchiveWriter returns an ArchiveWriter that writes a Version archive to w.
 // archiveSalt must be generated before calling this and embedded in the header.
+// The password is stretched with PBKDF2 exactly once here; per-file keys are then
+// derived from the resulting master key with HKDF.
 func NewArchiveWriter(w io.Writer, password string, archiveSalt [crypto.SaltSize]byte) (*ArchiveWriter, error) {
+	keys, err := NewKeySchedule(password, Version, archiveSalt)
+	if err != nil {
+		return nil, fmt.Errorf("archive/writer: key schedule: %w", err)
+	}
 	bw := bufio.NewWriterSize(w, writeBufferSize)
-	kd := crypto.NewKeyDeriver(password)
-	masterKey := kd.DeriveKey(archiveSalt)
 	hasher := sha256.New()
 	return &ArchiveWriter{
-		w:         bw,
-		bw:        bw,
-		hasher:    hasher,
-		tee:       io.MultiWriter(bw, hasher),
-		kd:        kd,
-		masterKey: masterKey,
+		w:      bw,
+		bw:     bw,
+		hasher: hasher,
+		tee:    io.MultiWriter(bw, hasher),
+		keys:   keys,
 	}, nil
 }
 
 // WriteHeader serialises and writes the ArchiveHeader.
-// fileCount is sealed with the master key before embedding.
+// hdr.Version must equal Version. fileCount is sealed with the header key before embedding.
 func (aw *ArchiveWriter) WriteHeader(hdr ArchiveHeader, fileCount uint64) error {
-	em, err := crypto.NewEncryptionManager(aw.masterKey)
+	if hdr.Version != aw.keys.Version() {
+		return fmt.Errorf("archive/writer: header version %d does not match writer version %d: %w",
+			hdr.Version, aw.keys.Version(), ErrUnsupportedVersion)
+	}
+	headerKey, err := aw.keys.HeaderKey()
+	if err != nil {
+		return fmt.Errorf("archive/writer: header key: %w", err)
+	}
+	em, err := crypto.NewEncryptionManager(headerKey)
 	if err != nil {
 		return fmt.Errorf("archive/writer: header encryption: %w", err)
 	}
@@ -143,9 +153,10 @@ func (aw *ArchiveWriter) WriteFooter() error {
 	return aw.bw.Flush()
 }
 
-// DeriveFileKey derives the per-file AES-256 key from the master password and salt.
-func (aw *ArchiveWriter) DeriveFileKey(salt [crypto.SaltSize]byte) [crypto.KeySize]byte {
-	return aw.kd.DeriveKey(salt)
+// DeriveFileKey derives the per-file AES-256 key for salt from the archive master key.
+// Safe for concurrent use.
+func (aw *ArchiveWriter) DeriveFileKey(salt [crypto.SaltSize]byte) ([crypto.KeySize]byte, error) {
+	return aw.keys.FileKey(salt)
 }
 
 func (aw *ArchiveWriter) writeHeader(hdr ArchiveHeader) error {
