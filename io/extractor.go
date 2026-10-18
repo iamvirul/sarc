@@ -292,6 +292,12 @@ func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plai
 		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read HMAC sealed", err)
 	}
 
+	// Consume the entry checksum (8 bytes, boundary detection only) before any
+	// verification so a failed check still leaves the reader at the next entry.
+	if _, err := io.ReadFull(se.r, make([]byte, 8)); err != nil {
+		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read entry checksum", err)
+	}
+
 	em, err := crypto.NewEncryptionManager(fileKey)
 	if err != nil {
 		return [crypto.HMACSize]byte{}, fatal(ErrCodeAuthFailed, "init HMAC decryptor", err)
@@ -309,11 +315,6 @@ func (se *SafeExtractor) readAndVerifyTrailer(fileKey [crypto.KeySize]byte, plai
 
 	if err := crypto.VerifyHMAC(fileKey, plaintext, expected); err != nil {
 		return [crypto.HMACSize]byte{}, recoverable(ErrCodeIntegrityFail, "plaintext HMAC mismatch", err)
-	}
-
-	// Consume entry checksum (8 bytes, used for boundary detection only).
-	if _, err := io.ReadFull(se.r, make([]byte, 8)); err != nil {
-		return [crypto.HMACSize]byte{}, recoverable(ErrCodeTruncated, "read entry checksum", err)
 	}
 
 	return expected, nil

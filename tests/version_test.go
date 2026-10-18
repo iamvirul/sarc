@@ -86,6 +86,23 @@ func TestExtractVersion1ArchiveStillWorks(t *testing.T) {
 	}
 }
 
+func TestListVersion1ArchiveStillWorks(t *testing.T) {
+	data := readV1Fixture(t)
+
+	results, err := sarcio.NewSafeExtractor(bytes.NewReader(data), v1FixturePassword, nil).List()
+	if err != nil {
+		t.Fatalf("list v1 archive: %v", err)
+	}
+	if len(results) != len(v1FixtureFiles) {
+		t.Fatalf("got %d results, want %d", len(results), len(v1FixtureFiles))
+	}
+	for _, r := range results {
+		if _, ok := v1FixtureFiles[r.Filename]; !ok {
+			t.Fatalf("unexpected or undecryptable entry %q", r.Filename)
+		}
+	}
+}
+
 func TestExtractVersion1ArchiveWrongPasswordFails(t *testing.T) {
 	data := readV1Fixture(t)
 
@@ -193,6 +210,43 @@ func TestMultiFileVersion2Roundtrip(t *testing.T) {
 		}
 		if !bytes.Equal(got, want[r.Filename]) {
 			t.Fatalf("%s: content mismatch", r.Filename)
+		}
+	}
+}
+
+// TestListMultiFileArchiveReturnsEveryEntry guards against the list path desynchronising
+// on the trailer: List skips HMAC verification, and the entry checksum after the sealed
+// HMAC must still be consumed so the next entry is parsed from the right offset.
+func TestListMultiFileArchiveReturnsEveryEntry(t *testing.T) {
+	dir := t.TempDir()
+	names := []string{"one.txt", "two.txt", "three.txt"}
+	paths := make([]string, len(names))
+	for i, name := range names {
+		paths[i] = filepath.Join(dir, name)
+		if err := os.WriteFile(paths[i], bytes.Repeat([]byte(name), 100), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var buf bytes.Buffer
+	ca, err := sarcio.NewConcurrentArchiver(&buf, "list-multi-pass", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ca.Archive(paths); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := sarcio.NewSafeExtractor(bytes.NewReader(buf.Bytes()), "list-multi-pass", nil).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != len(names) {
+		t.Fatalf("got %d entries, want %d", len(results), len(names))
+	}
+	for i, r := range results {
+		if r.Filename != names[i] {
+			t.Fatalf("entry %d: got %q, want %q", i, r.Filename, names[i])
 		}
 	}
 }
