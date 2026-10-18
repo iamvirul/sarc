@@ -38,11 +38,26 @@ func runList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("%-40s  %s\n", "FILENAME", "SIZE BUCKET")
-	fmt.Printf("%-40s  %s\n", "--------", "-----------")
+	fmt.Printf("%-40s  %-12s  %-6s  %s\n", "FILENAME", "SIZE BUCKET", "CODEC", "RATIO")
+	fmt.Printf("%-40s  %-12s  %-6s  %s\n", "--------", "-----------", "-----", "-----")
 	for _, r := range results {
-		fmt.Printf("%-40s  %s\n", r.Filename, r.SizeBucket)
+		fmt.Printf("%-40s  %-12s  %-6s  %s\n", r.Filename, r.SizeBucket, r.Codec, formatRatio(r))
 	}
 	fmt.Printf("\n%d file(s)\n", len(results))
 	return nil
+}
+
+// minDisplayedRatio is the smallest ratio formatRatio prints exactly; below it "<0.1%".
+const minDisplayedRatio = 0.1
+
+// formatRatio renders stored size as a percentage of original size, e.g. "31.4%".
+func formatRatio(r sarcio.ListResult) string {
+	if r.Err != nil || r.OriginalBytes <= 0 {
+		return "-"
+	}
+	ratio := float64(r.StoredBytes) * 100 / float64(r.OriginalBytes)
+	if ratio < minDisplayedRatio {
+		return fmt.Sprintf("<%.1f%%", minDisplayedRatio)
+	}
+	return fmt.Sprintf("%.1f%%", ratio)
 }
