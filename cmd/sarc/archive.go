@@ -29,6 +29,8 @@ func init() {
 	archiveCmd.Flags().BoolVar(&flagNoCompress, "no-compress", false, "store every file uncompressed")
 	archiveCmd.Flags().IntVar(&flagCompressLevel, "compress-level", archive.DefaultCompressionLevel,
 		fmt.Sprintf("zstd compression level %d-%d", archive.MinCompressionLevel, archive.MaxCompressionLevel))
+	archiveCmd.Flags().BoolVar(&flagSolid, "solid", false,
+		"pack files up to 1 MiB into shared solid groups compressed as one stream (smaller archives of many small files; one key per group instead of per file)")
 	archiveCmd.MarkFlagsMutuallyExclusive("compress", "no-compress")
 	_ = archiveCmd.MarkFlagRequired("password")
 	_ = archiveCmd.MarkFlagRequired("output")
@@ -44,7 +46,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level)
+	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level, "solid", compression.Solid)
 
 	f, err := os.Create(flagOutput)
 	if err != nil {
@@ -96,7 +98,7 @@ func compressionOptions(cmd *cobra.Command) (sarcio.CompressionOptions, error) {
 	if flagNoCompress && cmd.Flags().Changed("compress-level") {
 		return sarcio.CompressionOptions{}, fmt.Errorf("--compress-level cannot be used with --no-compress")
 	}
-	opts := sarcio.CompressionOptions{Mode: sarcio.CompressionAuto, Level: flagCompressLevel}
+	opts := sarcio.CompressionOptions{Mode: sarcio.CompressionAuto, Level: flagCompressLevel, Solid: flagSolid}
 	switch {
 	case flagCompress:
 		opts.Mode = sarcio.CompressionAlways

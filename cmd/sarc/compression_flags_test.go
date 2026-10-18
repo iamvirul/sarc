@@ -16,8 +16,9 @@ import (
 // flag variables and returns the resulting compression options.
 func parseArchiveFlags(t *testing.T, args ...string) (sarcio.CompressionOptions, error) {
 	t.Helper()
-	flagCompress, flagNoCompress, flagCompressLevel = false, false, 0
+	flagCompress, flagNoCompress, flagCompressLevel, flagSolid = false, false, 0, false
 	cmd := &cobra.Command{Use: "archive"}
+	cmd.Flags().BoolVar(&flagSolid, "solid", false, "")
 	cmd.Flags().BoolVar(&flagCompress, "compress", false, "")
 	cmd.Flags().BoolVar(&flagNoCompress, "no-compress", false, "")
 	cmd.Flags().IntVar(&flagCompressLevel, "compress-level", 3, "")
@@ -32,20 +33,23 @@ func TestCompressionOptionsFromFlags(t *testing.T) {
 		args      []string
 		wantMode  sarcio.CompressionMode
 		wantLevel int
+		wantSolid bool
 	}{
-		{nil, sarcio.CompressionAuto, 3},
-		{[]string{"--compress"}, sarcio.CompressionAlways, 3},
-		{[]string{"--compress", "--compress-level", "19"}, sarcio.CompressionAlways, 19},
-		{[]string{"--compress-level", "1"}, sarcio.CompressionAuto, 1},
-		{[]string{"--no-compress"}, sarcio.CompressionNever, 3},
+		{nil, sarcio.CompressionAuto, 3, false},
+		{[]string{"--compress"}, sarcio.CompressionAlways, 3, false},
+		{[]string{"--compress", "--compress-level", "19"}, sarcio.CompressionAlways, 19, false},
+		{[]string{"--compress-level", "1"}, sarcio.CompressionAuto, 1, false},
+		{[]string{"--no-compress"}, sarcio.CompressionNever, 3, false},
+		{[]string{"--solid"}, sarcio.CompressionAuto, 3, true},
+		{[]string{"--solid", "--compress-level", "19"}, sarcio.CompressionAuto, 19, true},
 	}
 	for _, tc := range cases {
 		got, err := parseArchiveFlags(t, tc.args...)
 		if err != nil {
 			t.Fatalf("%v: %v", tc.args, err)
 		}
-		if got.Mode != tc.wantMode || got.Level != tc.wantLevel {
-			t.Fatalf("%v: got %v level %d, want %v level %d", tc.args, got.Mode, got.Level, tc.wantMode, tc.wantLevel)
+		if got.Mode != tc.wantMode || got.Level != tc.wantLevel || got.Solid != tc.wantSolid {
+			t.Fatalf("%v: got %+v, want mode %v level %d solid %v", tc.args, got, tc.wantMode, tc.wantLevel, tc.wantSolid)
 		}
 	}
 }
@@ -77,5 +81,14 @@ func TestFormatRatio(t *testing.T) {
 		if got := formatRatio(tc.r); got != tc.want {
 			t.Fatalf("formatRatio(%+v) = %q, want %q", tc.r, got, tc.want)
 		}
+	}
+}
+
+func TestFormatCodec(t *testing.T) {
+	if got := formatCodec(sarcio.ListResult{Codec: "zstd", Solid: true}); got != "zstd+solid" {
+		t.Fatalf("got %q, want zstd+solid", got)
+	}
+	if got := formatCodec(sarcio.ListResult{Codec: "none"}); got != "none" {
+		t.Fatalf("got %q, want none", got)
 	}
 }
