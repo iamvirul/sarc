@@ -26,19 +26,21 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
   frame_header(32)      random bytes, no semantic content
   metadata_nonce(12)
   metadata_size(4)
-  metadata_ciphertext   AES-256-GCM sealed: encrypted_filename | size_bucket | ts_hash | perms
+  metadata_ciphertext   AES-256-GCM sealed: encrypted_filename | size_bucket | ts_hash | perms | codec (v2+)
   interblock_pad_size(4)
   interblock_pad        random(256-1024 bytes)
   [DATA BLOCKS]  (repeated)
     nonce(12)
     size(4)
-    ciphertext          AES-256-GCM block, variable length ~64 KB +/- 8 KB
+    ciphertext          AES-256-GCM block over the payload: the plaintext chunk (~256 KB +/- 32 KB)
+                        for codec none, or one independent zstd frame of it for codec zstd
   [SENTINEL]            nonce=0(12) size=0(4), marks end of data blocks
   trailer_pad_size(4)
   trailer_pad           random(256-512 bytes)
   hmac_nonce(12)
   hmac_sealed_size(4)
-  hmac_sealed           AES-256-GCM sealed HMAC-SHA256(plaintext), verified after decryption
+  hmac_sealed           AES-256-GCM sealed HMAC-SHA256(plaintext) | plaintext_size(8, v2+),
+                        verified after decryption and decompression
   entry_checksum(8)     random, used for boundary detection only
 
 [END MARKER]            entry_type=0x00(1), version 2+ only
@@ -88,6 +90,35 @@ Archives written before v2.0.0 derive each file key with its own PBKDF2 run:
 file_key   = PBKDF2(password, entry_salt, 100_000, 32, SHA-256)
 master_key = PBKDF2(password, archive_salt, 100_000, 32, SHA-256)  // sealed file count
 ```
+
+## Compression
+
+Format version 2 can zstd-compress a file before encryption:
+
+```
+plaintext chunk -> [zstd frame, if codec = zstd] -> AES-256-GCM -> data block
+```
+
+- The codec is chosen per file and stored in the sealed metadata, so it is encrypted and
+  authenticated. Every block of a zstd entry is an independent frame, which keeps the
+  parallel encrypt and decrypt pipelines unchanged.
+- Modes: `auto` (default) test-compresses the first 64 KB and compresses only if it shrinks
+  by at least 5%, skipping known compressed extensions without a probe; `always`; `never`.
+- The HMAC covers the original plaintext, and the trailer records its exact size, so the
+  extractor verifies the decompressed output, not the compressed payload.
+- Decoding is bounded: a block may not decode to more than one maximum chunk (288 KB), and
+  data block, metadata, and sealed trailer lengths are checked before allocation.
+- `sarc list` reads the stored size from block length prefixes and the original size from
+  the trailer, so it never decrypts data blocks.
+
+Version 1 entries have no codec byte and decode as uncompressed.
+
+## Error recovery
+
+A failure inside one entry (authentication, decompression, integrity) is recoverable: the
+extractor skips the rest of that entry using its length prefixes and continues with the
+next one. A corrupt length prefix, an unexpected entry type, or truncation loses the
+framing, so it is fatal and extraction stops.
 
 ## Anti-deduplication layers
 

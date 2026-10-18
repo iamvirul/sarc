@@ -19,15 +19,25 @@ sarc archive --password "StrongPass123" --output backup.sarc file1.txt file2.bin
 # Parallel archive (defaults to NumCPU workers)
 sarc archive --password "StrongPass123" --output backup.sarc --parallel 4 file1.txt
 
+# Compression (zstd, before encryption). Default is auto: each file is compressed only
+# if a probe of its first 64 KB shrinks by at least 5%, and known compressed formats
+# (jpg, png, mp4, zip, gz, docx, ...) are skipped.
+sarc archive --password "StrongPass123" --output backup.sarc --compress file.log      # always
+sarc archive --password "StrongPass123" --output backup.sarc --no-compress file.log   # never
+sarc archive --password "StrongPass123" --output backup.sarc --compress-level 19 a b  # 1-22, default 3
+
 # Extract
 sarc extract --password "StrongPass123" --archive backup.sarc --output ./restored/
 
 # Verify archive integrity (no password required)
 sarc verify --archive backup.sarc
 
-# List contents (password required to decrypt filenames)
+# List contents with codec and compression ratio (password required to decrypt filenames)
 sarc list --password "StrongPass123" --archive backup.sarc
 ```
+
+`--compress-level` takes zstd's 1-22 scale; the pure-Go encoder maps it onto four speed
+tiers (fastest, default, better, best), so neighbouring levels can produce identical output.
 
 ## Security model
 
@@ -38,6 +48,12 @@ sarc list --password "StrongPass123" --archive backup.sarc
 | Integrity | GCM auth tag per block + HMAC-SHA256 over full plaintext |
 | Deduplication resistance | Random padding (1-4 KB header, 512-2048 B trailer), variable chunk sizes (64 KB +/- 8 KB), unique nonce per block |
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |
+| Compression | Optional zstd before encryption, per file; the codec is recorded inside the encrypted metadata |
+
+Compression trade-off: compressing before encrypting makes ciphertext size depend on how
+compressible each file is, which weakly hints at file type and content to anyone who can
+see the archive. Use `--no-compress` when archive sizes must reveal nothing beyond the
+padded plaintext size.
 | Container integrity | HMAC-SHA256 over entire archive body, verified by `sarc verify` without decryption |
 
 ## Benchmark
