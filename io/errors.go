@@ -53,4 +53,5 @@ const (
 	ErrCodeWriteFailed   = "WRITE_FAILED"
 	ErrCodeReadFailed    = "READ_FAILED"
 	ErrCodeWorkerPanic   = "WORKER_PANIC"
+	ErrCodeInvalidOption = "INVALID_OPTION"
 )

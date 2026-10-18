@@ -5,6 +5,7 @@ package benchmarks_test
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"runtime"
@@ -283,5 +284,128 @@ func BenchmarkExtractManySmallFiles(b *testing.B) {
 		if len(results) != manySmallFilesCount {
 			b.Fatalf("extracted %d entries, want %d", len(results), manySmallFilesCount)
 		}
+	}
+}
+
+// compressionBenchSize is the input size for the compression benchmarks.
+const compressionBenchSize = 16 * 1024 * 1024
+
+// compressionBenchInputs returns log-like text (compressible) and random bytes
+// (incompressible, like JPEG/MP4 payloads) of compressionBenchSize each.
+func compressionBenchInputs(b *testing.B) map[string][]byte {
+	b.Helper()
+	var text bytes.Buffer
+	for i := 0; text.Len() < compressionBenchSize; i++ {
+		fmt.Fprintf(&text, "2026-10-18T12:%02d:%02dZ level=info service=api msg=\"request completed\" status=%d duration_ms=%d\n",
+			i%60, (i/60)%60, 200+(i%7)*50, i%977)
+	}
+	random := make([]byte, compressionBenchSize)
+	if _, err := rand.Read(random); err != nil {
+		b.Fatal(err)
+	}
+	return map[string][]byte{"text": text.Bytes()[:compressionBenchSize], "random": random}
+}
+
+// BenchmarkArchiveCompression archives compressible and incompressible inputs with
+// compression auto and off, reporting throughput and stored/original ratio. The random
+// input with auto vs never shows the cost of the auto-mode probe on data it skips.
+func BenchmarkArchiveCompression(b *testing.B) {
+	modes := map[string]sarcio.CompressionMode{"auto": sarcio.CompressionAuto, "never": sarcio.CompressionNever}
+	for inputName, content := range compressionBenchInputs(b) {
+		path := fmt.Sprintf("%s/%s.dat", b.TempDir(), inputName)
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			b.Fatal(err)
+		}
+		for modeName, mode := range modes {
+			b.Run(inputName+"/"+modeName, func(b *testing.B) {
+				opts := sarcio.WithCompression(sarcio.CompressionOptions{Mode: mode, Level: 3})
+				var archived int
+				b.SetBytes(int64(len(content)))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					var out bytes.Buffer
+					ca, err := sarcio.NewConcurrentArchiver(&out, benchPassword, 0, nil, opts)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := ca.Archive([]string{path}); err != nil {
+						b.Fatal(err)
+					}
+					archived = out.Len()
+				}
+				b.ReportMetric(float64(archived)/float64(len(content)), "ratio")
+			})
+		}
+	}
+}
+
+// BenchmarkExtractCompressedText extracts a zstd-compressed 16 MB text archive.
+func BenchmarkExtractCompressedText(b *testing.B) {
+	content := compressionBenchInputs(b)["text"]
+	path := fmt.Sprintf("%s/text.dat", b.TempDir())
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		b.Fatal(err)
+	}
+	var archived bytes.Buffer
+	ca, err := sarcio.NewConcurrentArchiver(&archived, benchPassword, 0, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := ca.Archive([]string{path}); err != nil {
+		b.Fatal(err)
+	}
+	outDir := b.TempDir()
+
+	b.SetBytes(int64(len(content)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		results, err := sarcio.NewSafeExtractor(bytes.NewReader(archived.Bytes()), benchPassword, nil).Extract(outDir)
+		if err != nil || len(results) != 1 || !results[0].OK {
+			b.Fatalf("extract failed: %v %+v", err, results)
+		}
+	}
+}
+
+// BenchmarkArchiveSmallFilesSolid archives 300 small source-like files per file and in
+// solid groups, reporting archive size relative to input ("ratio"). Per-entry padding
+// dominates the per-file case; solid groups amortise it and share one compression window.
+func BenchmarkArchiveSmallFilesSolid(b *testing.B) {
+	dir := b.TempDir()
+	paths := make([]string, 300)
+	var inputBytes int64
+	for i := range paths {
+		var src bytes.Buffer
+		for line := 0; src.Len() < 2000+(i%7)*900; line++ {
+			fmt.Fprintf(&src, "func handler%d_%d(w http.ResponseWriter, r *http.Request) error { return render(w, %d) }\n", i, line, line)
+		}
+		paths[i] = fmt.Sprintf("%s/file-%03d.go", dir, i)
+		if err := os.WriteFile(paths[i], src.Bytes(), 0o644); err != nil {
+			b.Fatal(err)
+		}
+		inputBytes += int64(src.Len())
+	}
+	for _, solid := range []bool{false, true} {
+		name := "per-file"
+		if solid {
+			name = "solid"
+		}
+		b.Run(name, func(b *testing.B) {
+			opts := sarcio.WithCompression(sarcio.CompressionOptions{Mode: sarcio.CompressionAuto, Level: 3, Solid: solid})
+			var archived int
+			b.SetBytes(inputBytes)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var out bytes.Buffer
+				ca, err := sarcio.NewConcurrentArchiver(&out, benchPassword, 0, nil, opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := ca.Archive(paths); err != nil {
+					b.Fatal(err)
+				}
+				archived = out.Len()
+			}
+			b.ReportMetric(float64(archived)/float64(inputBytes), "ratio")
+		})
 	}
 }

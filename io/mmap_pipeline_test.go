@@ -208,7 +208,7 @@ func decryptBlocksForTest(t *testing.T, em *crypto.EncryptionManager, blocks []a
 // TestAddFileStreamingRoundtripAboveThreshold forces addFileStreaming through the mmap
 // path end to end (archive then extract via SafeExtractor) and checks a byte-perfect
 // round trip, exercising the exact path StreamingArchiver.AddFile and
-// ConcurrentArchiver's single-file fast path use.
+// ConcurrentArchiver's single-file fast path use, both uncompressed and zstd-compressed.
 func TestAddFileStreamingRoundtripAboveThreshold(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping mmap end-to-end roundtrip in -short mode")
@@ -221,45 +221,54 @@ func TestAddFileStreamingRoundtripAboveThreshold(t *testing.T) {
 	}
 	wantSum := sha256.Sum256(want)
 
-	var archiveBuf bytes.Buffer
-	salt, err := crypto.GenerateSalt()
-	if err != nil {
-		t.Fatal(err)
-	}
-	aw, err := archive.NewArchiveWriter(&archiveBuf, "mmap-roundtrip-pass", salt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := aw.WriteHeader(archive.ArchiveHeader{Magic: archive.Magic, Version: archive.Version, ArchiveSalt: salt}, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := addFileStreaming(aw, f.Name(), 4, NopProgressTracker{}); err != nil {
-		t.Fatalf("addFileStreaming: %v", err)
-	}
-	if err := aw.WriteFooter(); err != nil {
-		t.Fatal(err)
-	}
+	for _, mode := range []CompressionMode{CompressionNever, CompressionAlways} {
+		t.Run(mode.String(), func(t *testing.T) {
+			policy, err := newCompressionPolicy(CompressionOptions{Mode: mode, Level: archive.DefaultCompressionLevel})
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	outDir := t.TempDir()
-	ex := NewSafeExtractor(bytes.NewReader(archiveBuf.Bytes()), "mmap-roundtrip-pass", nil)
-	results, err := ex.Extract(outDir)
-	if err != nil {
-		t.Fatalf("extract: %v", err)
-	}
-	if len(results) != 1 || !results[0].OK {
-		var extractErr error
-		if len(results) == 1 {
-			extractErr = results[0].Err
-		}
-		t.Fatalf("extraction failed: %v", extractErr)
-	}
+			var archiveBuf bytes.Buffer
+			salt, err := crypto.GenerateSalt()
+			if err != nil {
+				t.Fatal(err)
+			}
+			aw, err := archive.NewArchiveWriter(&archiveBuf, "mmap-roundtrip-pass", salt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := aw.WriteHeader(archive.ArchiveHeader{Magic: archive.Magic, Version: archive.Version, ArchiveSalt: salt}, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := addFileStreaming(aw, policy, f.Name(), 4, NopProgressTracker{}); err != nil {
+				t.Fatalf("addFileStreaming: %v", err)
+			}
+			if err := aw.WriteFooter(); err != nil {
+				t.Fatal(err)
+			}
 
-	extracted, err := os.ReadFile(filepath.Join(outDir, results[0].Filename))
-	if err != nil {
-		t.Fatal(err)
-	}
-	gotSum := sha256.Sum256(extracted)
-	if gotSum != wantSum {
-		t.Fatal("SHA-256 mismatch after mmap-path archive/extract roundtrip")
+			outDir := t.TempDir()
+			ex := NewSafeExtractor(bytes.NewReader(archiveBuf.Bytes()), "mmap-roundtrip-pass", nil)
+			results, err := ex.Extract(outDir)
+			if err != nil {
+				t.Fatalf("extract: %v", err)
+			}
+			if len(results) != 1 || !results[0].OK {
+				var extractErr error
+				if len(results) == 1 {
+					extractErr = results[0].Err
+				}
+				t.Fatalf("extraction failed: %v", extractErr)
+			}
+
+			extracted, err := os.ReadFile(filepath.Join(outDir, results[0].Filename))
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotSum := sha256.Sum256(extracted)
+			if gotSum != wantSum {
+				t.Fatal("SHA-256 mismatch after mmap-path archive/extract roundtrip")
+			}
+		})
 	}
 }

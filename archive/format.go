@@ -21,6 +21,9 @@ const (
 const (
 	// EntryTypeFile introduces a file entry.
 	EntryTypeFile byte = 0x01
+	// EntryTypeSolid introduces a solid group entry (Version2+): many small files packed
+	// into one record stream that is compressed and sealed as a unit (see solid.go).
+	EntryTypeSolid byte = 0x02
 	// EntryTypeEnd follows the last file entry and precedes the footer (Version2+).
 	// Version1 archives have no end marker; readers infer the end from the first footer byte.
 	EntryTypeEnd byte = 0x00
@@ -60,11 +63,13 @@ type MetadataBlock struct {
 }
 
 // PlaintextMetadata is the in-memory form of file metadata before sealing.
+// Codec is absent from Version1 metadata and decodes as CodecNone there.
 type PlaintextMetadata struct {
 	EncryptedFilename []byte
 	SizeBucket        SizeBucket
 	TimestampHash     [32]byte
 	Permissions       uint32
+	Codec             Codec
 }
 
 // DataBlock is one variable-length encrypted chunk of file content.

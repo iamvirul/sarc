@@ -4,6 +4,7 @@
 package archive
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -17,16 +18,21 @@ const (
 	BlockVariance = 32 * 1024
 	// MaxChunkSize is the largest plaintext chunk the pipeline reader needs to buffer.
 	MaxChunkSize = crypto.BaseBlockSize + BlockVariance
+	// TrailerPayloadSize is the sealed trailer plaintext: HMAC | plaintext size (uint64 LE).
+	// Version1 trailers seal the HMAC alone.
+	TrailerPayloadSize = HMACSize + 8
 )
 
 // FrameBuilder assembles the on-disk layout for a single file entry.
 // A single BufferedRand is seeded once from crypto/rand and supplies all
 // randomness needed for nonces, variance, padding, and structural fields.
+// When compressor is set, every data-block method zstd-encodes the chunk before sealing.
 type FrameBuilder struct {
-	em      *crypto.EncryptionManager
-	padding *crypto.PaddingManager
-	varGen  crypto.VarianceGenerator
-	br      *crypto.BufferedRand
+	em         *crypto.EncryptionManager
+	padding    *crypto.PaddingManager
+	varGen     crypto.VarianceGenerator
+	br         *crypto.BufferedRand
+	compressor *BlockCompressor
 }
 
 // NewFrameBuilder returns a FrameBuilder for a specific file key.
@@ -49,6 +55,39 @@ func NewFrameBuilder(key [crypto.KeySize]byte) (*FrameBuilder, error) {
 	}, nil
 }
 
+// NewCompressingFrameBuilder returns a FrameBuilder for a CodecZstd entry: each data
+// chunk is encoded as an independent zstd frame by bc, then sealed. bc may be shared
+// across FrameBuilders and goroutines.
+func NewCompressingFrameBuilder(key [crypto.KeySize]byte, bc *BlockCompressor) (*FrameBuilder, error) {
+	if bc == nil {
+		return nil, fmt.Errorf("archive/frames: nil block compressor")
+	}
+	fb, err := NewFrameBuilder(key)
+	if err != nil {
+		return nil, err
+	}
+	fb.compressor = bc
+	return fb, nil
+}
+
+// Codec returns the codec this FrameBuilder applies to data blocks.
+func (fb *FrameBuilder) Codec() Codec {
+	if fb.compressor != nil {
+		return CodecZstd
+	}
+	return CodecNone
+}
+
+// encodeInto returns the payload to seal for plaintext. For CodecNone it is plaintext
+// itself; for CodecZstd it is a zstd frame written at the start of dst, so sealing it
+// into dst afterwards is an exact in-place alias that AES-GCM permits.
+func (fb *FrameBuilder) encodeInto(plaintext, dst []byte) []byte {
+	if fb.compressor == nil {
+		return plaintext
+	}
+	return fb.compressor.Compress(dst[:0], plaintext)
+}
+
 // NextChunkSize returns the byte count the pipeline reader should fill for the next block.
 // Draws from the per-file variance generator; must be called on the same goroutine that
 // will call EncryptChunk so that the shared BufferedRand is not accessed concurrently.
@@ -60,9 +99,12 @@ func (fb *FrameBuilder) NextChunkSize() int {
 	return size
 }
 
-// EncryptChunk encrypts a single plaintext chunk and returns a DataBlock.
+// EncryptChunk encodes and encrypts a single plaintext chunk and returns a DataBlock.
 // Intended for the pipeline path; the caller manages chunking via NextChunkSize.
 func (fb *FrameBuilder) EncryptChunk(plaintext []byte) (DataBlock, error) {
+	if fb.compressor != nil {
+		return fb.EncryptChunkInto(plaintext, make([]byte, 0, len(plaintext)+zstdMaxOverhead+crypto.GCMTagSize))
+	}
 	b, err := fb.em.EncryptBlock(plaintext)
 	if err != nil {
 		return DataBlock{}, fmt.Errorf("archive/frames: encrypt chunk: %w", err)
@@ -70,12 +112,17 @@ func (fb *FrameBuilder) EncryptChunk(plaintext []byte) (DataBlock, error) {
 	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}, nil
 }
 
-// EncryptChunkInto encrypts plaintext into dst without allocating.
-// dst must have cap >= len(plaintext)+crypto.GCMTagSize. DataBlock.Ciphertext
-// is a sub-slice of dst; callers must not return dst to a pool until after
-// the DataBlock has been written to the archive.
+// EncryptChunkInto encodes and encrypts plaintext into dst without allocating.
+// dst must not overlap plaintext and must have cap >= len(plaintext)+crypto.GCMTagSize,
+// or >= len(plaintext)+(MaxPayloadSize-MaxChunkSize)+crypto.GCMTagSize when compressing.
+// DataBlock.Ciphertext is a sub-slice of dst; callers must not return dst to a pool
+// until after the DataBlock has been written to the archive.
 func (fb *FrameBuilder) EncryptChunkInto(plaintext, dst []byte) (DataBlock, error) {
-	b, err := fb.em.EncryptBlockInto(plaintext, dst)
+	payload := fb.encodeInto(plaintext, dst)
+	if fb.compressor != nil {
+		dst = payload
+	}
+	b, err := fb.em.EncryptBlockInto(payload, dst)
 	if err != nil {
 		return DataBlock{}, fmt.Errorf("archive/frames: encrypt chunk: %w", err)
 	}
@@ -94,11 +141,16 @@ func (fb *FrameBuilder) NextNonce() ([crypto.NonceSize]byte, error) {
 	return nonce, nil
 }
 
-// EncryptChunkWithNonceInto encrypts plaintext under a nonce obtained from NextNonce,
-// writing into dst without allocating. Safe to call concurrently from multiple goroutines
-// sharing this FrameBuilder, since it touches no FrameBuilder-owned mutable state.
+// EncryptChunkWithNonceInto encodes and encrypts plaintext under a nonce obtained from
+// NextNonce, writing into dst without allocating (same dst rules as EncryptChunkInto).
+// Safe to call concurrently from multiple goroutines sharing this FrameBuilder, since it
+// touches no FrameBuilder-owned mutable state and BlockCompressor is concurrency-safe.
 func (fb *FrameBuilder) EncryptChunkWithNonceInto(nonce [crypto.NonceSize]byte, plaintext, dst []byte) DataBlock {
-	b := fb.em.EncryptBlockWithNonceInto(nonce, plaintext, dst)
+	payload := fb.encodeInto(plaintext, dst)
+	if fb.compressor != nil {
+		dst = payload
+	}
+	b := fb.em.EncryptBlockWithNonceInto(nonce, payload, dst)
 	return DataBlock{Nonce: b.Nonce, Ciphertext: b.Ciphertext}
 }
 
@@ -120,8 +172,11 @@ func (fb *FrameBuilder) InterBlockPadding() ([]byte, error) {
 	return pad, nil
 }
 
-// EncryptStream reads r in variable-length chunks and returns encrypted DataBlocks.
+// EncryptStream reads r in variable-length chunks and returns encoded, encrypted DataBlocks.
 func (fb *FrameBuilder) EncryptStream(r io.Reader) ([]DataBlock, error) {
+	if fb.compressor != nil {
+		return fb.encryptStreamCompressed(r)
+	}
 	blocks, err := fb.em.EncryptStream(r, fb.varGen)
 	if err != nil {
 		return nil, fmt.Errorf("archive/frames: encrypt stream: %w", err)
@@ -133,13 +188,38 @@ func (fb *FrameBuilder) EncryptStream(r io.Reader) ([]DataBlock, error) {
 	return result, nil
 }
 
-// BuildTrailer constructs the FileTrailer, sealing plaintextHMAC with the file key.
-func (fb *FrameBuilder) BuildTrailer(plaintextHMAC [crypto.HMACSize]byte) (FileTrailer, error) {
+func (fb *FrameBuilder) encryptStreamCompressed(r io.Reader) ([]DataBlock, error) {
+	var blocks []DataBlock
+	buf := make([]byte, MaxChunkSize)
+	for {
+		n, err := io.ReadFull(r, buf[:fb.NextChunkSize()])
+		if n > 0 {
+			db, encErr := fb.EncryptChunk(buf[:n])
+			if encErr != nil {
+				return nil, encErr
+			}
+			blocks = append(blocks, db)
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return blocks, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("archive/frames: read stream: %w", err)
+		}
+	}
+}
+
+// BuildTrailer constructs the FileTrailer, sealing plaintextHMAC and the total
+// plaintext byte count with the file key (see TrailerPayloadSize).
+func (fb *FrameBuilder) BuildTrailer(plaintextHMAC [crypto.HMACSize]byte, plaintextSize uint64) (FileTrailer, error) {
 	pad, err := fb.padding.Trailer()
 	if err != nil {
 		return FileTrailer{}, fmt.Errorf("archive/frames: trailer padding: %w", err)
 	}
-	sealed, err := fb.em.EncryptBlock(plaintextHMAC[:])
+	var payload [TrailerPayloadSize]byte
+	copy(payload[:HMACSize], plaintextHMAC[:])
+	binary.LittleEndian.PutUint64(payload[HMACSize:], plaintextSize)
+	sealed, err := fb.em.EncryptBlock(payload[:])
 	if err != nil {
 		return FileTrailer{}, fmt.Errorf("archive/frames: seal HMAC: %w", err)
 	}

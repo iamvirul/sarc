@@ -84,13 +84,17 @@ func HashTimestamp(salt [crypto.SaltSize]byte, t time.Time) [32]byte {
 	return out
 }
 
-// Wire layout: [2] filename len | [N] filename | [1] bucket | [32] ts hash | [4] perms
+// Wire layout: [2] filename len | [N] filename | [1] bucket | [32] ts hash | [4] perms | [1] codec
+// The trailing codec byte is Version2+; Version1 metadata ends after perms.
 func marshalMetadata(pm PlaintextMetadata) ([]byte, error) {
 	fnLen := len(pm.EncryptedFilename)
 	if fnLen > 0xFFFF {
 		return nil, fmt.Errorf("archive/metadata: filename too long (%d bytes)", fnLen)
 	}
-	buf := make([]byte, 2+fnLen+1+32+4)
+	if !knownCodec(pm.Codec) {
+		return nil, fmt.Errorf("archive/metadata: unknown codec %d", pm.Codec)
+	}
+	buf := make([]byte, 2+fnLen+1+32+4+1)
 	binary.LittleEndian.PutUint16(buf[0:2], uint16(fnLen))
 	copy(buf[2:], pm.EncryptedFilename)
 	off := 2 + fnLen
@@ -99,6 +103,8 @@ func marshalMetadata(pm PlaintextMetadata) ([]byte, error) {
 	copy(buf[off:off+32], pm.TimestampHash[:])
 	off += 32
 	binary.LittleEndian.PutUint32(buf[off:off+4], pm.Permissions)
+	off += 4
+	buf[off] = byte(pm.Codec)
 	return buf, nil
 }
 
@@ -120,5 +126,16 @@ func unmarshalMetadata(b []byte) (PlaintextMetadata, error) {
 	copy(pm.TimestampHash[:], b[off:off+32])
 	off += 32
 	pm.Permissions = binary.LittleEndian.Uint32(b[off : off+4])
+	off += 4
+	if len(b) > off {
+		pm.Codec = Codec(b[off])
+		if !knownCodec(pm.Codec) {
+			return PlaintextMetadata{}, fmt.Errorf("archive/metadata: unknown codec %d", pm.Codec)
+		}
+	}
 	return pm, nil
+}
+
+func knownCodec(c Codec) bool {
+	return c == CodecNone || c == CodecZstd
 }

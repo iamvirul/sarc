@@ -26,20 +26,25 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
   frame_header(32)      random bytes, no semantic content
   metadata_nonce(12)
   metadata_size(4)
-  metadata_ciphertext   AES-256-GCM sealed: encrypted_filename | size_bucket | ts_hash | perms
+  metadata_ciphertext   AES-256-GCM sealed: encrypted_filename | size_bucket | ts_hash | perms | codec (v2+)
   interblock_pad_size(4)
   interblock_pad        random(256-1024 bytes)
   [DATA BLOCKS]  (repeated)
     nonce(12)
     size(4)
-    ciphertext          AES-256-GCM block, variable length ~64 KB +/- 8 KB
+    ciphertext          AES-256-GCM block over the payload: the plaintext chunk (~256 KB +/- 32 KB)
+                        for codec none, or one independent zstd frame of it for codec zstd
   [SENTINEL]            nonce=0(12) size=0(4), marks end of data blocks
   trailer_pad_size(4)
   trailer_pad           random(256-512 bytes)
   hmac_nonce(12)
   hmac_sealed_size(4)
-  hmac_sealed           AES-256-GCM sealed HMAC-SHA256(plaintext), verified after decryption
+  hmac_sealed           AES-256-GCM sealed HMAC-SHA256(plaintext) | plaintext_size(8, v2+),
+                        verified after decryption and decompression
   entry_checksum(8)     random, used for boundary detection only
+
+[SOLID GROUP ENTRY]     entry_type=0x02, version 2+ only; same framing as a file entry,
+                        but the plaintext is a record stream (see Solid groups)
 
 [END MARKER]            entry_type=0x00(1), version 2+ only
 
@@ -48,8 +53,8 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
   reserved(32)
 ```
 
-The reader loops on `entry_type`: `0x01` starts a file entry and, in version 2, `0x00`
-ends the entry list. Any other byte, or EOF before the end marker, is a fatal error.
+The reader loops on `entry_type`: `0x01` starts a file entry and, in version 2, `0x02`
+starts a solid group and `0x00` ends the entry list. Any other byte, or EOF before the end marker, is a fatal error.
 Version 1 archives have no end marker, so the reader treats EOF or any byte other than
 `0x01` as the end. That heuristic misreads roughly 1 in 256 version 1 archives, whose
 footer HMAC happens to start with `0x01`, as having one extra (failing) entry.
@@ -88,6 +93,61 @@ Archives written before v2.0.0 derive each file key with its own PBKDF2 run:
 file_key   = PBKDF2(password, entry_salt, 100_000, 32, SHA-256)
 master_key = PBKDF2(password, archive_salt, 100_000, 32, SHA-256)  // sealed file count
 ```
+
+## Compression
+
+Format version 2 can zstd-compress a file before encryption:
+
+```
+plaintext chunk -> [zstd frame, if codec = zstd] -> AES-256-GCM -> data block
+```
+
+- The codec is chosen per file and stored in the sealed metadata, so it is encrypted and
+  authenticated. Every block of a zstd entry is an independent frame, which keeps the
+  parallel encrypt and decrypt pipelines unchanged.
+- Modes: `auto` (default) test-compresses the first 64 KB and compresses only if it shrinks
+  by at least 5%, skipping known compressed extensions without a probe; `always`; `never`.
+- The HMAC covers the original plaintext, and the trailer records its exact size, so the
+  extractor verifies the decompressed output, not the compressed payload.
+- Decoding is bounded: a block may not decode to more than one maximum chunk (288 KB), and
+  data block, metadata, and sealed trailer lengths are checked before allocation.
+- `sarc list` reads the stored size from block length prefixes and the original size from
+  the trailer, so it never decrypts data blocks.
+
+Version 1 entries have no codec byte and decode as uncompressed.
+
+## Solid groups
+
+With `--solid`, regular files of at most 1 MiB are packed into groups. Each group is one
+entry with one salt, one key, one padding set, and one trailer, which amortises the
+~2.2 KB of per-entry padding and lets zstd match across files.
+
+```
+stream := record*
+record := name_len(2) | name | permissions(4) | data_len(8) | data
+```
+
+- Grouping: candidates are ordered by extension (similar content shares the compression
+  window) and packed until the stream would exceed 8 MiB. A lone candidate is stored as a
+  normal file entry. Larger files are always normal entries.
+- The whole stream is compressed as one zstd frame (window 8 MiB, the group maximum), the
+  result is split into data blocks, and each block is sealed like any other. The codec
+  in the sealed metadata applies to the whole stream.
+- The trailer HMAC and size cover the uncompressed stream and are verified before any
+  member is written. Decoding is bounded at 8 MiB, and member names must be non-empty
+  base names without `/` or NUL and not `.` or `..`; any violation rejects the group.
+- `sarc list` decrypts solid groups in memory to read member records; each member is
+  reported with its group's compression ratio.
+- Memory: the archiver holds at most one stream and payload (8 MiB each) per worker. The
+  best-compression tier is limited to two concurrent zstd encoders (each holds 35-50 MB),
+  and auto mode probes with a separate fastest-level encoder.
+
+## Error recovery
+
+A failure inside one entry (authentication, decompression, integrity) is recoverable: the
+extractor skips the rest of that entry using its length prefixes and continues with the
+next one. A corrupt length prefix, an unexpected entry type, or truncation loses the
+framing, so it is fatal and extraction stops.
 
 ## Anti-deduplication layers
 

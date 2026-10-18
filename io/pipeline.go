@@ -16,13 +16,14 @@ import (
 
 // pipelineDepth is the number of DataBlocks buffered between the encrypt and write stages.
 // Four blocks in flight keeps the writer busy without materially growing memory use
-// (4 * bufSize ~ 1.1 MB at default block sizes).
+// (4 * bufSize ~ 2.3 MB at default block sizes).
 const pipelineDepth = 4
 
 // bufSize is the per-buffer capacity in the pool.
-// Layout: [plaintext 0..n][ciphertext n..n+n+GCMTagSize].
-// A single allocation covers both regions, eliminating the per-block ciphertext malloc.
-const bufSize = archive.MaxChunkSize + crypto.GCMTagSize
+// Layout: [plaintext 0..n][ciphertext n..n+payload+GCMTagSize], where payload is n bytes
+// uncompressed or at most archive.MaxPayloadSize zstd-encoded. A single allocation covers
+// both regions, eliminating the per-block ciphertext malloc.
+const bufSize = archive.MaxChunkSize + archive.MaxPayloadSize + crypto.GCMTagSize
 
 type encResult struct {
 	block archive.DataBlock
@@ -41,7 +42,7 @@ type macResult struct {
 //	Stage 2 (caller):    receive DataBlock -> write via send() -> return buffer to pool
 //
 // The combined plaintext+ciphertext buffer is pooled so steady-state allocation
-// on the hot path is zero. Peak in-flight memory is pipelineDepth*bufSize (≈ 1.1 MB).
+// on the hot path is zero. Peak in-flight memory is pipelineDepth*bufSize (≈ 2.3 MB).
 //
 // FrameBuilder fb is owned exclusively by the goroutine. Returns the HMAC-SHA256
 // of the full plaintext.

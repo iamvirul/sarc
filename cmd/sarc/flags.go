@@ -14,6 +14,11 @@ var (
 	flagArchive  string
 	flagParallel int
 	flagDebug    bool
+
+	flagCompress      bool
+	flagNoCompress    bool
+	flagCompressLevel int
+	flagSolid         bool
 )
 
 // initLogger configures the global structured logger.
