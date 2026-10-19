@@ -161,7 +161,12 @@ example_verify_stdin() {
   "$SARC" archive -p "$PASS" -o v.sarc in/* >/dev/null
   "$SARC" verify -a - <v.sarc | grep -q PASSED
   cp v.sarc corrupt.sarc
-  printf '\xff' | dd of=corrupt.sarc bs=1 seek=5000 conv=notrunc 2>/dev/null
+  # Flip every bit of one byte; overwriting with a fixed value is a no-op 1 time in 256.
+  local byte
+  byte="$(od -An -tu1 -j 5000 -N 1 v.sarc | tr -d ' ')"
+  # shellcheck disable=SC2059
+  printf "\\$(printf '%03o' $((byte ^ 255)))" | dd of=corrupt.sarc bs=1 seek=5000 conv=notrunc 2>/dev/null
+  cmp -s v.sarc corrupt.sarc && { echo "corruption did not change the archive"; return 1; }
   if "$SARC" verify -a - <corrupt.sarc >/dev/null 2>&1; then
     echo "verify accepted a corrupted stream"; return 1
   fi
