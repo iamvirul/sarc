@@ -150,3 +150,40 @@ func TestAgeWrapRequiresRecipients(t *testing.T) {
 		t.Fatal("wrapped for zero recipients")
 	}
 }
+
+// failingIdentity stands in for an SSH key with a wrong passphrase or a plugin whose
+// token is missing: it fails with an error other than age.ErrIncorrectIdentity.
+type failingIdentity struct{ err error }
+
+func (f failingIdentity) Unwrap([]*age.Stanza) ([]byte, error) { return nil, f.err }
+
+func TestAgeUnwrapReportsIdentityFailures(t *testing.T) {
+	blob, err := crypto.WrapCEKForAge(mustCEK(t), []age.Recipient{mustIdentity(t).Recipient()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("token not present")
+	_, err = crypto.UnwrapCEKWithAge(blob, []age.Identity{failingIdentity{err: cause}})
+	var identityErr *crypto.IdentityError
+	if !errors.As(err, &identityErr) || !errors.Is(err, cause) {
+		t.Fatalf("want IdentityError wrapping the cause, got %v", err)
+	}
+	if errors.Is(err, crypto.ErrWrongCredential) {
+		t.Fatal("identity failure reported as a wrong credential")
+	}
+}
+
+func TestAgeUnwrapTriesNativeIdentitiesBeforeFailingOnes(t *testing.T) {
+	cek, id := mustCEK(t), mustIdentity(t)
+	blob, err := crypto.WrapCEKForAge(cek, []age.Recipient{id.Recipient()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := crypto.UnwrapCEKWithAge(blob, []age.Identity{failingIdentity{err: errors.New("cancelled")}, id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != cek {
+		t.Fatal("unwrapped CEK differs")
+	}
+}

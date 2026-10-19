@@ -9,11 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"filippo.io/age"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+
+	"filippo.io/age"
 
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
@@ -123,12 +124,14 @@ type trailerInfo struct {
 type SafeExtractor struct {
 	r          io.Reader
 	password   string
+	keyFiles   [][]byte
 	identities []age.Identity
 	progress   ProgressTracker
 }
 
 // NewSafeExtractor returns a SafeExtractor reading from r that unlocks the archive with
-// password (empty for none) or any identity added with WithIdentities. Version1
+// password (empty for none), any key file added with WithKeyFiles, or any identity
+// added with WithIdentities. Version1
 // archives can only be opened with a password.
 func NewSafeExtractor(r io.Reader, password string, progress ProgressTracker, opts ...ExtractorOption) *SafeExtractor {
 	if progress == nil {
@@ -242,9 +245,17 @@ func (se *SafeExtractor) readVersion2Header() (*archive.KeySchedule, error) {
 		return nil, fatal(ErrCodeTruncated, "read header reserved", err)
 	}
 
-	cek, err := archive.OpenRecipientBlock(block, archive.Unlockers{Password: se.password, Identities: se.identities})
-	if errors.Is(err, archive.ErrNoMatchingCredential) {
-		return nil, fatal(ErrCodeAuthFailed, "no matching password or identity", err)
+	cek, err := archive.OpenRecipientBlock(block, archive.Unlockers{
+		Password: se.password, KeyFiles: se.keyFiles, Identities: se.identities,
+	})
+	var noMatch *archive.NoMatchingCredentialError
+	if errors.As(err, &noMatch) {
+		return nil, fatal(ErrCodeAuthFailed,
+			"no matching credential; this archive accepts: "+strings.Join(noMatch.Accepts, ", "), err)
+	}
+	var identityErr *crypto.IdentityError
+	if errors.As(err, &identityErr) {
+		return nil, fatal(ErrCodeAuthFailed, "identity could not be used: "+identityErr.Err.Error(), err)
 	}
 	if err != nil {
 		return nil, fatal(ErrCodeIntegrityFail, "malformed recipient block", err)

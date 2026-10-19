@@ -33,6 +33,16 @@ const (
 // ErrWrongCredential is returned when a password or identity does not unwrap a CEK.
 var ErrWrongCredential = errors.New("crypto/cek: credential does not match")
 
+// IdentityError reports an identity that failed for a reason other than not matching,
+// such as a wrong SSH key passphrase or a missing or cancelled age plugin.
+type IdentityError struct {
+	Err error
+}
+
+func (e *IdentityError) Error() string { return "crypto/cek: identity failed: " + e.Err.Error() }
+
+func (e *IdentityError) Unwrap() error { return e.Err }
+
 // PasswordWrap is a CEK sealed with AES-256-GCM under PBKDF2-SHA256(password, Salt, Iterations).
 type PasswordWrap struct {
 	Iterations uint32
@@ -54,11 +64,8 @@ func GenerateCEK() ([KeySize]byte, error) {
 // and nonce, at MinPasswordIterations.
 func WrapCEKWithPassword(cek [KeySize]byte, password string) (PasswordWrap, error) {
 	w := PasswordWrap{Iterations: MinPasswordIterations}
-	if _, err := rand.Read(w.Salt[:]); err != nil {
-		return PasswordWrap{}, fmt.Errorf("crypto/cek: generate salt: %w", err)
-	}
-	if _, err := rand.Read(w.Nonce[:]); err != nil {
-		return PasswordWrap{}, fmt.Errorf("crypto/cek: generate nonce: %w", err)
+	if err := randomSaltAndNonce(&w.Salt, &w.Nonce); err != nil {
+		return PasswordWrap{}, err
 	}
 	aead, err := passwordAEAD(password, w.Salt, w.Iterations)
 	if err != nil {
@@ -86,8 +93,27 @@ func UnwrapCEKWithPassword(w PasswordWrap, password string) ([KeySize]byte, erro
 	return cek, nil
 }
 
+func randomSaltAndNonce(salt *[SaltSize]byte, nonce *[NonceSize]byte) error {
+	if _, err := rand.Read(salt[:]); err != nil {
+		return fmt.Errorf("crypto/cek: generate salt: %w", err)
+	}
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("crypto/cek: generate nonce: %w", err)
+	}
+	return nil
+}
+
 func passwordAEAD(password string, salt [SaltSize]byte, iterations uint32) (cipher.AEAD, error) {
-	kek := pbkdf2.Key([]byte(password), salt[:], int(iterations), KeySize, sha256.New)
+	return newWrapAEAD(stretchPassword(password, salt, iterations))
+}
+
+// stretchPassword returns PBKDF2-SHA256(password, salt, iterations).
+func stretchPassword(password string, salt [SaltSize]byte, iterations uint32) []byte {
+	return pbkdf2.Key([]byte(password), salt[:], int(iterations), KeySize, sha256.New)
+}
+
+// newWrapAEAD returns AES-256-GCM keyed with a key-encryption key.
+func newWrapAEAD(kek []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(kek)
 	if err != nil {
 		return nil, fmt.Errorf("crypto/cek: new cipher: %w", err)
@@ -121,17 +147,22 @@ func WrapCEKForAge(cek [KeySize]byte, recipients []age.Recipient) ([]byte, error
 }
 
 // UnwrapCEKWithAge decrypts an age file produced by WrapCEKForAge. It returns
-// ErrWrongCredential when none of identities matches a recipient.
+// ErrWrongCredential when none of identities matches a recipient, and an
+// *IdentityError when an identity itself fails.
 func UnwrapCEKWithAge(blob []byte, identities []age.Identity) ([KeySize]byte, error) {
 	var cek [KeySize]byte
 	if len(identities) == 0 {
 		return cek, ErrWrongCredential
 	}
-	r, err := age.Decrypt(bytes.NewReader(blob), identities...)
+	var identityErr error
+	r, err := age.Decrypt(bytes.NewReader(blob), recordIdentityFailures(identities, &identityErr)...)
 	if err != nil {
 		var noMatch *age.NoIdentityMatchError
-		if errors.As(err, &noMatch) {
+		switch {
+		case errors.As(err, &noMatch):
 			return cek, ErrWrongCredential
+		case identityErr != nil:
+			return cek, &IdentityError{Err: identityErr}
 		}
 		return cek, fmt.Errorf("crypto/cek: age decrypt: %w", err)
 	}
@@ -145,4 +176,33 @@ func UnwrapCEKWithAge(blob []byte, identities []age.Identity) ([KeySize]byte, er
 	}
 	copy(cek[:], plain)
 	return cek, nil
+}
+
+// recordIdentityFailures wraps each non-native identity (SSH keys, plugins) so that a
+// failure other than ErrIncorrectIdentity is stored in *failure. Native identities fail
+// only on malformed stanzas and stay unwrapped, which also keeps age trying them first.
+func recordIdentityFailures(identities []age.Identity, failure *error) []age.Identity {
+	wrapped := make([]age.Identity, len(identities))
+	for i, id := range identities {
+		switch id.(type) {
+		case *age.X25519Identity, *age.HybridIdentity, *age.ScryptIdentity:
+			wrapped[i] = id
+		default:
+			wrapped[i] = recordingIdentity{Identity: id, failure: failure}
+		}
+	}
+	return wrapped
+}
+
+type recordingIdentity struct {
+	age.Identity
+	failure *error
+}
+
+func (r recordingIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	fileKey, err := r.Identity.Unwrap(stanzas)
+	if err != nil && !errors.Is(err, age.ErrIncorrectIdentity) {
+		*r.failure = err
+	}
+	return fileKey, err
 }

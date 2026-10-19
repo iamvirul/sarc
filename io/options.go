@@ -17,6 +17,7 @@ type ArchiverOption func(*archiverConfig)
 type archiverConfig struct {
 	compression   CompressionOptions
 	ageRecipients []age.Recipient
+	keyFiles      []archive.KeyFile
 }
 
 // WithCompression overrides the default compression options (CompressionAuto, level 3).
@@ -31,9 +32,15 @@ func WithAgeRecipients(recipients ...age.Recipient) ArchiverOption {
 	return func(c *archiverConfig) { c.ageRecipients = append(c.ageRecipients, recipients...) }
 }
 
+// WithKeyFileRecipients adds key file credentials. Each opens the archive on its own, or
+// together with its password when one is set, independently of every other credential.
+func WithKeyFileRecipients(keyFiles ...archive.KeyFile) ArchiverOption {
+	return func(c *archiverConfig) { c.keyFiles = append(c.keyFiles, keyFiles...) }
+}
+
 // openArchiveWriter applies opts, builds the compression policy, and writes the archive
-// header for password (empty for none) plus any age recipients. At least one credential
-// is required.
+// header for password (empty for none) plus any key file and age recipients. At least
+// one credential is required.
 func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, error) {
 	cfg := archiverConfig{compression: DefaultCompressionOptions()}
 	for _, opt := range opts {
@@ -43,10 +50,10 @@ func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*ar
 	if err != nil {
 		return nil, nil, fatal(ErrCodeInvalidOption, "invalid compression options", err)
 	}
-	if password == "" && len(cfg.ageRecipients) == 0 {
-		return nil, nil, fatal(ErrCodeInvalidOption, "a password or at least one age recipient is required", nil)
+	if password == "" && len(cfg.keyFiles) == 0 && len(cfg.ageRecipients) == 0 {
+		return nil, nil, fatal(ErrCodeInvalidOption, "a password, key file, or age recipient is required", nil)
 	}
-	creds := archive.Credentials{AgeRecipients: cfg.ageRecipients}
+	creds := archive.Credentials{KeyFiles: cfg.keyFiles, AgeRecipients: cfg.ageRecipients}
 	if password != "" {
 		creds.Passwords = []string{password}
 	}
@@ -67,4 +74,10 @@ type ExtractorOption func(*SafeExtractor)
 // try against a Version2 archive's age recipients.
 func WithIdentities(identities ...age.Identity) ExtractorOption {
 	return func(se *SafeExtractor) { se.identities = append(se.identities, identities...) }
+}
+
+// WithKeyFiles adds key file contents to try against a Version2 archive's key file
+// recipients, alone or together with the extractor's password.
+func WithKeyFiles(keys ...[]byte) ExtractorOption {
+	return func(se *SafeExtractor) { se.keyFiles = append(se.keyFiles, keys...) }
 }
