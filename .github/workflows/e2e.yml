@@ -1,0 +1,71 @@
+name: Live examples
+
+# Runs the README's sarc commands for real on Linux and macOS (scripts/e2e.sh): piping
+# archive into extract, curl into extract, multi-recipient archives with the real age
+# CLI, solid mode, verify from stdin, truncated and wrong-password failures, a
+# constant-memory streaming extract, and refusing binary output to a terminal.
+# Any broken example fails the run; results appear in the job summary.
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - "archive/**"
+      - "crypto/**"
+      - "io/**"
+      - "cmd/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/e2e.sh"
+      - ".github/workflows/e2e.yml"
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AGE_VERSION: v1.3.2
+  E2E_BIG_MB: 1024
+  E2E_MAX_RSS_MB: 256
+
+jobs:
+  examples:
+    name: "live examples (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build sarc
+        run: go build -o ./sarc-bin ./cmd/sarc
+
+      - name: Install age CLI (${{ env.AGE_VERSION }})
+        run: GOBIN="$RUNNER_TEMP/age" go install "filippo.io/age/cmd/...@${AGE_VERSION}"
+
+      - name: Ensure GNU time (Linux)
+        if: runner.os == 'Linux'
+        run: test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
+
+      - name: Lint example script
+        if: runner.os == 'Linux'
+        run: shellcheck scripts/e2e.sh
+
+      - name: Run live examples
+        run: bash scripts/e2e.sh ./sarc-bin "$RUNNER_TEMP/age" "$GITHUB_STEP_SUMMARY"
