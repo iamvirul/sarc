@@ -32,28 +32,13 @@ type StreamingArchiver struct {
 	pendingSize int      // estimated record stream size of pending
 }
 
-// NewStreamingArchiver returns a StreamingArchiver writing to w with the given password.
-// Compression defaults to CompressionAuto at level 3; override with WithCompression.
+// NewStreamingArchiver returns a StreamingArchiver writing to w, openable with password
+// (empty for none) and any recipients added with WithAgeRecipients; at least one is
+// required. Compression defaults to CompressionAuto at level 3; override with WithCompression.
 func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker, opts ...ArchiverOption) (*StreamingArchiver, error) {
-	compression, err := newArchiverConfig(opts)
+	aw, compression, err := openArchiveWriter(w, password, opts)
 	if err != nil {
 		return nil, err
-	}
-	salt, err := crypto.GenerateSalt()
-	if err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "generate archive salt", err)
-	}
-	aw, err := archive.NewArchiveWriter(w, password, salt)
-	if err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "init archive writer", err)
-	}
-	hdr := archive.ArchiveHeader{
-		Magic:       archive.Magic,
-		Version:     archive.Version,
-		ArchiveSalt: salt,
-	}
-	if err := aw.WriteHeader(hdr, 0); err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "write header", err)
 	}
 	if progress == nil {
 		progress = NopProgressTracker{}

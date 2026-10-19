@@ -28,35 +28,38 @@ type ArchiveWriter struct {
 	hasher hash.Hash
 	tee    io.Writer // MultiWriter(bw, hasher) — all archive content goes through this
 	keys   *KeySchedule
+	// recipients is the sealed recipient block written into the header.
+	recipients []byte
 }
 
-// NewArchiveWriter returns an ArchiveWriter that writes a Version archive to w.
-// archiveSalt must be generated before calling this and embedded in the header.
-// The password is stretched with PBKDF2 exactly once here; per-file keys are then
-// derived from the resulting master key with HKDF.
-func NewArchiveWriter(w io.Writer, password string, archiveSalt [crypto.SaltSize]byte) (*ArchiveWriter, error) {
-	keys, err := NewKeySchedule(password, Version, archiveSalt)
+// NewArchiveWriter returns an ArchiveWriter that writes a Version archive to w, openable
+// by any one of creds. It generates a random CEK, wraps it for every credential, and
+// derives all file keys from the CEK with HKDF.
+func NewArchiveWriter(w io.Writer, creds Credentials) (*ArchiveWriter, error) {
+	cek, err := crypto.GenerateCEK()
 	if err != nil {
-		return nil, fmt.Errorf("archive/writer: key schedule: %w", err)
+		return nil, fmt.Errorf("archive/writer: %w", err)
+	}
+	recipients, err := SealRecipientBlock(cek, creds)
+	if err != nil {
+		return nil, fmt.Errorf("archive/writer: %w", err)
 	}
 	bw := bufio.NewWriterSize(w, writeBufferSize)
 	hasher := sha256.New()
 	return &ArchiveWriter{
-		w:      bw,
-		bw:     bw,
-		hasher: hasher,
-		tee:    io.MultiWriter(bw, hasher),
-		keys:   keys,
+		w:          bw,
+		bw:         bw,
+		hasher:     hasher,
+		tee:        io.MultiWriter(bw, hasher),
+		keys:       NewVersion2KeySchedule(cek),
+		recipients: recipients,
 	}, nil
 }
 
-// WriteHeader serialises and writes the ArchiveHeader.
-// hdr.Version must equal Version. fileCount is sealed with the header key before embedding.
-func (aw *ArchiveWriter) WriteHeader(hdr ArchiveHeader, fileCount uint64) error {
-	if hdr.Version != aw.keys.Version() {
-		return fmt.Errorf("archive/writer: header version %d does not match writer version %d: %w",
-			hdr.Version, aw.keys.Version(), ErrUnsupportedVersion)
-	}
+// WriteHeader serialises and writes the archive header, sealing fileCount with the
+// header key. It must be called once, before any entry.
+func (aw *ArchiveWriter) WriteHeader(fileCount uint64) error {
+	hdr := ArchiveHeader{Magic: Magic, Version: aw.keys.Version(), RecipientBlock: aw.recipients}
 	headerKey, err := aw.keys.HeaderKey()
 	if err != nil {
 		return fmt.Errorf("archive/writer: header key: %w", err)
@@ -169,7 +172,9 @@ func (aw *ArchiveWriter) writeHeader(hdr ArchiveHeader) error {
 	b := make([]byte, 2)
 	binary.LittleEndian.PutUint16(b, hdr.Version)
 	buf.Write(b)
-	buf.Write(hdr.ArchiveSalt[:])
+	b = binary.LittleEndian.AppendUint32(b[:0], uint32(len(hdr.RecipientBlock)))
+	buf.Write(b)
+	buf.Write(hdr.RecipientBlock)
 	buf.Write(hdr.FileCountEncrypted[:])
 	buf.Write(hdr.Reserved[:])
 	if _, err := aw.tee.Write(buf.Bytes()); err != nil {

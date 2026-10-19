@@ -4,7 +4,6 @@
 package archive_test
 
 import (
-	"bytes"
 	"errors"
 	"testing"
 
@@ -14,38 +13,35 @@ import (
 
 const keysTestPassword = "key-schedule-password"
 
-func TestKeyScheduleVersion2FileKeyIsHKDFOfMasterKey(t *testing.T) {
-	archiveSalt, _ := crypto.GenerateSalt()
+func testCEK(t *testing.T) [crypto.KeySize]byte {
+	t.Helper()
+	cek, err := crypto.GenerateCEK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cek
+}
+
+func TestKeyScheduleVersion2FileKeyIsHKDFOfCEK(t *testing.T) {
+	cek := testCEK(t)
 	entrySalt, _ := crypto.GenerateSalt()
 
-	ks, err := archive.NewKeySchedule(keysTestPassword, archive.Version2, archiveSalt)
+	got, err := archive.NewVersion2KeySchedule(cek).FileKey(entrySalt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := ks.FileKey(entrySalt)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	master := crypto.NewKeyDeriver(keysTestPassword).DeriveKey(archiveSalt)
-	want, err := crypto.DeriveFileSubkey(master, entrySalt)
+	want, err := crypto.DeriveFileSubkey(cek, entrySalt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
-		t.Fatal("version 2 file key is not HKDF-Expand(PBKDF2(password, archive_salt), entry_salt)")
+		t.Fatal("version 2 file key is not HKDF-Expand(CEK, entry_salt)")
 	}
 }
 
 func TestKeyScheduleVersion1FileKeyIsPBKDF2OfEntrySalt(t *testing.T) {
-	archiveSalt, _ := crypto.GenerateSalt()
 	entrySalt, _ := crypto.GenerateSalt()
-
-	ks, err := archive.NewKeySchedule(keysTestPassword, archive.Version1, archiveSalt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := ks.FileKey(entrySalt)
+	got, err := archive.NewVersion1KeySchedule(keysTestPassword).FileKey(entrySalt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,11 +51,7 @@ func TestKeyScheduleVersion1FileKeyIsPBKDF2OfEntrySalt(t *testing.T) {
 }
 
 func TestKeyScheduleVersion2DistinctEntriesGetDistinctKeys(t *testing.T) {
-	archiveSalt, _ := crypto.GenerateSalt()
-	ks, err := archive.NewKeySchedule(keysTestPassword, archive.Version2, archiveSalt)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ks := archive.NewVersion2KeySchedule(testCEK(t))
 	seen := make(map[[crypto.KeySize]byte]bool, 64)
 	for i := 0; i < 64; i++ {
 		salt, _ := crypto.GenerateSalt()
@@ -74,57 +66,49 @@ func TestKeyScheduleVersion2DistinctEntriesGetDistinctKeys(t *testing.T) {
 	}
 }
 
-func TestKeyScheduleRejectsUnknownVersion(t *testing.T) {
+func TestKeyScheduleVersion2DifferentCEKsGiveDifferentKeys(t *testing.T) {
 	salt, _ := crypto.GenerateSalt()
-	for _, v := range []uint16{0, archive.Version + 1, 0xFFFF} {
-		if _, err := archive.NewKeySchedule(keysTestPassword, v, salt); !errors.Is(err, archive.ErrUnsupportedVersion) {
-			t.Fatalf("version %d: want ErrUnsupportedVersion, got %v", v, err)
-		}
+	k1, err := archive.NewVersion2KeySchedule(testCEK(t)).FileKey(salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := archive.NewVersion2KeySchedule(testCEK(t)).FileKey(salt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k1 == k2 {
+		t.Fatal("two archives with different CEKs derived the same file key")
 	}
 }
 
 func TestKeyScheduleVersion1HasNoHeaderKey(t *testing.T) {
-	salt, _ := crypto.GenerateSalt()
-	ks, err := archive.NewKeySchedule(keysTestPassword, archive.Version1, salt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ks.HeaderKey(); !errors.Is(err, archive.ErrUnsupportedVersion) {
+	if _, err := archive.NewVersion1KeySchedule(keysTestPassword).HeaderKey(); !errors.Is(err, archive.ErrUnsupportedVersion) {
 		t.Fatalf("want ErrUnsupportedVersion, got %v", err)
 	}
 }
 
-func TestKeyScheduleVersion2HeaderKeyDiffersFromFileKeys(t *testing.T) {
-	archiveSalt, _ := crypto.GenerateSalt()
-	ks, err := archive.NewKeySchedule(keysTestPassword, archive.Version2, archiveSalt)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestKeyScheduleVersion2HeaderKeyDiffersFromFileKeysAndCEK(t *testing.T) {
+	cek := testCEK(t)
+	ks := archive.NewVersion2KeySchedule(cek)
 	hk, err := ks.HeaderKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	fk, err := ks.FileKey(archiveSalt)
+	salt, _ := crypto.GenerateSalt()
+	fk, err := ks.FileKey(salt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hk == fk {
-		t.Fatal("header key equals file key derived from the same salt")
+	if hk == fk || hk == cek || fk == cek {
+		t.Fatal("header key, file key, and CEK are not domain-separated")
 	}
 }
 
-func TestArchiveWriterRejectsHeaderVersionMismatch(t *testing.T) {
-	var buf bytes.Buffer
-	salt, _ := crypto.GenerateSalt()
-	aw, err := archive.NewArchiveWriter(&buf, keysTestPassword, salt)
-	if err != nil {
-		t.Fatal(err)
+func TestKeyScheduleVersions(t *testing.T) {
+	if v := archive.NewVersion1KeySchedule(keysTestPassword).Version(); v != archive.Version1 {
+		t.Fatalf("v1 schedule reports version %d", v)
 	}
-	hdr := archive.ArchiveHeader{Magic: archive.Magic, Version: archive.Version1, ArchiveSalt: salt}
-	if err := aw.WriteHeader(hdr, 0); !errors.Is(err, archive.ErrUnsupportedVersion) {
-		t.Fatalf("want ErrUnsupportedVersion, got %v", err)
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("rejected header still wrote %d bytes", buf.Len())
+	if v := archive.NewVersion2KeySchedule(testCEK(t)).Version(); v != archive.Version2 {
+		t.Fatalf("v2 schedule reports version %d", v)
 	}
 }

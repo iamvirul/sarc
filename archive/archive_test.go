@@ -107,17 +107,11 @@ func TestHashTimestampDayTruncation(t *testing.T) {
 
 func TestArchiveWriterHeaderMagicAndVersion(t *testing.T) {
 	var buf bytes.Buffer
-	salt, _ := crypto.GenerateSalt()
-	aw, err := archive.NewArchiveWriter(&buf, "password", salt)
+	aw, err := archive.NewArchiveWriter(&buf, archive.Credentials{Passwords: []string{"password"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	hdr := archive.ArchiveHeader{
-		Magic:       archive.Magic,
-		Version:     archive.Version,
-		ArchiveSalt: salt,
-	}
-	if err := aw.WriteHeader(hdr, 3); err != nil {
+	if err := aw.WriteHeader(3); err != nil {
 		t.Fatal(err)
 	}
 	if err := aw.WriteFooter(); err != nil {

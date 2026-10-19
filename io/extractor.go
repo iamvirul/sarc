@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"filippo.io/age"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -118,17 +120,24 @@ type trailerInfo struct {
 
 // SafeExtractor decrypts and verifies files from a SARC archive.
 type SafeExtractor struct {
-	r        io.Reader
-	password string
-	progress ProgressTracker
+	r          io.Reader
+	password   string
+	identities []age.Identity
+	progress   ProgressTracker
 }
 
-// NewSafeExtractor returns a SafeExtractor reading from r.
-func NewSafeExtractor(r io.Reader, password string, progress ProgressTracker) *SafeExtractor {
+// NewSafeExtractor returns a SafeExtractor reading from r that unlocks the archive with
+// password (empty for none) or any identity added with WithIdentities. Version1
+// archives can only be opened with a password.
+func NewSafeExtractor(r io.Reader, password string, progress ProgressTracker, opts ...ExtractorOption) *SafeExtractor {
 	if progress == nil {
 		progress = NopProgressTracker{}
 	}
-	return &SafeExtractor{r: r, password: password, progress: progress}
+	se := &SafeExtractor{r: r, password: password, progress: progress}
+	for _, opt := range opts {
+		opt(se)
+	}
+	return se
 }
 
 // Extract decrypts every entry in the archive and writes its files under outputDir.
@@ -171,7 +180,8 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 }
 
 // readHeader parses the archive header and returns the KeySchedule matching its
-// format version. For Version2 archives this runs the archive's single PBKDF2.
+// format version. For Version2 archives it unwraps the CEK from the recipient block
+// with the extractor's password or identities, then confirms it on the sealed file count.
 func (se *SafeExtractor) readHeader() (*archive.KeySchedule, error) {
 	var magic [4]byte
 	if _, err := io.ReadFull(se.r, magic[:]); err != nil {
@@ -185,12 +195,45 @@ func (se *SafeExtractor) readHeader() (*archive.KeySchedule, error) {
 	if _, err := io.ReadFull(se.r, version[:]); err != nil {
 		return nil, fatal(ErrCodeTruncated, "read version", err)
 	}
-	v := binary.LittleEndian.Uint16(version[:])
-
-	var hdr archive.ArchiveHeader
-	if _, err := io.ReadFull(se.r, hdr.ArchiveSalt[:]); err != nil {
-		return nil, fatal(ErrCodeTruncated, "read archive salt", err)
+	switch v := binary.LittleEndian.Uint16(version[:]); v {
+	case archive.Version1:
+		return se.readVersion1Header()
+	case archive.Version2:
+		return se.readVersion2Header()
+	default:
+		return nil, fatal(ErrCodeBadVersion, fmt.Sprintf("unsupported version %d", v), archive.ErrUnsupportedVersion)
 	}
+}
+
+// readVersion1Header reads the rest of a Version1 header. Version1 seals its file count
+// with a separate PBKDF2 key, so the password is only checked per entry.
+func (se *SafeExtractor) readVersion1Header() (*archive.KeySchedule, error) {
+	rest := make([]byte, crypto.SaltSize+archive.FileCountSealedSize+archive.ReservedSize)
+	if _, err := io.ReadFull(se.r, rest); err != nil {
+		return nil, fatal(ErrCodeTruncated, "read header", err)
+	}
+	if se.password == "" {
+		return nil, fatal(ErrCodeAuthFailed, "version 1 archives require a password", nil)
+	}
+	return archive.NewVersion1KeySchedule(se.password), nil
+}
+
+// readVersion2Header reads the recipient block, unwraps the CEK, and authenticates the
+// sealed file count with the derived header key before any entry is parsed.
+func (se *SafeExtractor) readVersion2Header() (*archive.KeySchedule, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(se.r, lenBuf[:]); err != nil {
+		return nil, fatal(ErrCodeTruncated, "read recipient block length", err)
+	}
+	blockLen := binary.LittleEndian.Uint32(lenBuf[:])
+	if blockLen > archive.MaxRecipientBlockSize {
+		return nil, fatal(ErrCodeIntegrityFail, "recipient block exceeds maximum size", nil)
+	}
+	block := make([]byte, blockLen)
+	if _, err := io.ReadFull(se.r, block); err != nil {
+		return nil, fatal(ErrCodeTruncated, "read recipient block", err)
+	}
+	var hdr archive.ArchiveHeader
 	if _, err := io.ReadFull(se.r, hdr.FileCountEncrypted[:]); err != nil {
 		return nil, fatal(ErrCodeTruncated, "read file count", err)
 	}
@@ -198,25 +241,23 @@ func (se *SafeExtractor) readHeader() (*archive.KeySchedule, error) {
 		return nil, fatal(ErrCodeTruncated, "read header reserved", err)
 	}
 
-	keys, err := archive.NewKeySchedule(se.password, v, hdr.ArchiveSalt)
-	if errors.Is(err, archive.ErrUnsupportedVersion) {
-		return nil, fatal(ErrCodeBadVersion, fmt.Sprintf("unsupported version %d", v), err)
+	cek, err := archive.OpenRecipientBlock(block, archive.Unlockers{Password: se.password, Identities: se.identities})
+	if errors.Is(err, archive.ErrNoMatchingCredential) {
+		return nil, fatal(ErrCodeAuthFailed, "no matching password or identity", err)
 	}
 	if err != nil {
-		return nil, fatal(ErrCodeAuthFailed, "init key schedule", err)
+		return nil, fatal(ErrCodeIntegrityFail, "malformed recipient block", err)
 	}
-	if v != archive.Version1 {
-		if err := openFileCount(keys, hdr.FileCountEncrypted); err != nil {
-			return nil, fatal(ErrCodeAuthFailed, "wrong password or corrupted header", err)
-		}
+	keys := archive.NewVersion2KeySchedule(cek)
+	if err := openFileCount(keys, hdr.FileCountEncrypted); err != nil {
+		return nil, fatal(ErrCodeAuthFailed, "corrupted header", err)
 	}
 	return keys, nil
 }
 
 // openFileCount authenticates the sealed header file count with the header key,
-// rejecting a wrong password before any entry is parsed. Version1 archives seal it
-// with a separate PBKDF2 key, so they skip this check to avoid an extra PBKDF2 run.
-func openFileCount(keys *archive.KeySchedule, sealed [8 + crypto.NonceSize + crypto.GCMTagSize]byte) error {
+// confirming the recovered CEK and the header's integrity.
+func openFileCount(keys *archive.KeySchedule, sealed [archive.FileCountSealedSize]byte) error {
 	headerKey, err := keys.HeaderKey()
 	if err != nil {
 		return err

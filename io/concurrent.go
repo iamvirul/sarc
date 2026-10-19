@@ -47,32 +47,17 @@ type ConcurrentArchiver struct {
 	start       time.Time
 }
 
-// NewConcurrentArchiver returns a ConcurrentArchiver writing to w.
-// workers <= 0 defaults to runtime.NumCPU(). Compression defaults to CompressionAuto
-// at level 3; override with WithCompression.
+// NewConcurrentArchiver returns a ConcurrentArchiver writing to w, openable with password
+// (empty for none) and any recipients added with WithAgeRecipients; at least one is
+// required. workers <= 0 defaults to runtime.NumCPU(). Compression defaults to
+// CompressionAuto at level 3; override with WithCompression.
 func NewConcurrentArchiver(w io.Writer, password string, workers int, progress ProgressTracker, opts ...ArchiverOption) (*ConcurrentArchiver, error) {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	compression, err := newArchiverConfig(opts)
+	aw, compression, err := openArchiveWriter(w, password, opts)
 	if err != nil {
 		return nil, err
-	}
-	salt, err := crypto.GenerateSalt()
-	if err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "generate archive salt", err)
-	}
-	aw, err := archive.NewArchiveWriter(w, password, salt)
-	if err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "init archive writer", err)
-	}
-	hdr := archive.ArchiveHeader{
-		Magic:       archive.Magic,
-		Version:     archive.Version,
-		ArchiveSalt: salt,
-	}
-	if err := aw.WriteHeader(hdr, 0); err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "write header", err)
 	}
 	if progress == nil {
 		progress = NopProgressTracker{}

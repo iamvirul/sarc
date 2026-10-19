@@ -187,8 +187,8 @@ func TestSolidMultipleGroupsRoundtrip(t *testing.T) {
 func TestTamperedSolidGroupFailsAloneAndLaterGroupsExtract(t *testing.T) {
 	paths, contents := writeLargeGroupInputs(t, t.TempDir())
 	data := archiveConcurrent(t, paths, solidOptions(sarcio.CompressionAuto))
-	if data[archiveHeaderSize] != archive.EntryTypeSolid {
-		t.Fatalf("first entry type 0x%02x, want a solid group", data[archiveHeaderSize])
+	if first := data[archiveHeaderSize(data)]; first != archive.EntryTypeSolid {
+		t.Fatalf("first entry type 0x%02x, want a solid group", first)
 	}
 	data[firstBlockSizeOffset(t, data)+4+100] ^= 0xFF
 
@@ -233,12 +233,11 @@ func TestSolidWrongPasswordFailsAtHeader(t *testing.T) {
 func craftSolidArchive(t *testing.T, stream []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	archiveSalt, _ := crypto.GenerateSalt()
-	aw, err := archive.NewArchiveWriter(&buf, compressionTestPassword, archiveSalt)
+	aw, err := archive.NewArchiveWriter(&buf, archive.Credentials{Passwords: []string{compressionTestPassword}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := aw.WriteHeader(archive.ArchiveHeader{Magic: archive.Magic, Version: archive.Version, ArchiveSalt: archiveSalt}, 1); err != nil {
+	if err := aw.WriteHeader(1); err != nil {
 		t.Fatal(err)
 	}
 	entrySalt, _ := crypto.GenerateSalt()

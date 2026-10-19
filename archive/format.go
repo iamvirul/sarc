@@ -42,15 +42,22 @@ const (
 	BucketHuge                     // > 1 MB
 )
 
-// ArchiveHeader is the fixed preamble written once at the start of the archive.
-// FileCountEncrypted holds the file count sealed with the header key (see KeySchedule).
+// ArchiveHeader is the preamble written once at the start of the archive.
+// Version1 layout: magic | version | archive_salt(32) | file_count_encrypted | reserved.
+// Version2 layout: magic | version | recipient_block_len(4) | recipient_block |
+// file_count_encrypted | reserved. FileCountEncrypted holds the file count sealed with
+// the header key (see KeySchedule); opening it confirms the recovered CEK.
 type ArchiveHeader struct {
 	Magic              [4]byte
 	Version            uint16
-	ArchiveSalt        [crypto.SaltSize]byte
-	FileCountEncrypted [8 + crypto.NonceSize + crypto.GCMTagSize]byte
+	ArchiveSalt        [crypto.SaltSize]byte // Version1 only
+	RecipientBlock     []byte                // Version2+ (see recipients.go)
+	FileCountEncrypted [FileCountSealedSize]byte
 	Reserved           [ReservedSize]byte
 }
+
+// FileCountSealedSize is the length of the sealed file count: nonce | ciphertext | tag.
+const FileCountSealedSize = 8 + crypto.NonceSize + crypto.GCMTagSize
 
 // FrameHeader is a 32-byte random blob prepended to each file entry to break boundary patterns.
 type FrameHeader [32]byte

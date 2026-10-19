@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/iamvirul/sarc/archive"
-	"github.com/iamvirul/sarc/crypto"
 )
 
 func writeSizedFile(t *testing.T, dir, name string, size int) string {
@@ -111,11 +110,7 @@ func mustSolidPolicy(t *testing.T) *compressionPolicy {
 
 func newTestArchiveWriter(t *testing.T) *archive.ArchiveWriter {
 	t.Helper()
-	salt, err := crypto.GenerateSalt()
-	if err != nil {
-		t.Fatal(err)
-	}
-	aw, err := archive.NewArchiveWriter(&bytes.Buffer{}, "solid-internal-test", salt)
+	aw, err := archive.NewArchiveWriter(&bytes.Buffer{}, archive.Credentials{Passwords: []string{"solid-internal-test"}})
 	if err != nil {
 		t.Fatal(err)
 	}
