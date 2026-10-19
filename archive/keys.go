@@ -17,26 +17,24 @@ var ErrUnsupportedVersion = errors.New("archive: unsupported format version")
 // its format version. It is immutable after construction and safe for concurrent use.
 //
 // Version1: file_key = PBKDF2(password, entry_salt). Read-only; no header key.
-// Version2: master_key = PBKDF2(password, archive_salt) once, then
-// file_key = HKDF-Expand(master_key, entry_salt) and header_key = HKDF-Expand(master_key).
+// Version2: the master key is the archive's random CEK, recovered from its recipient
+// block (see recipients.go); file_key = HKDF-Expand(CEK, entry_salt) and
+// header_key = HKDF-Expand(CEK).
 type KeySchedule struct {
 	version   uint16
 	legacy    *crypto.KeyDeriver
 	masterKey [crypto.KeySize]byte
 }
 
-// NewKeySchedule returns the KeySchedule for version. For Version2 it runs PBKDF2 once
-// over archiveSalt; for Version1 no work is done until FileKey is called.
-func NewKeySchedule(password string, version uint16, archiveSalt [crypto.SaltSize]byte) (*KeySchedule, error) {
-	kd := crypto.NewKeyDeriver(password)
-	switch version {
-	case Version1:
-		return &KeySchedule{version: version, legacy: kd}, nil
-	case Version2:
-		return &KeySchedule{version: version, masterKey: kd.DeriveKey(archiveSalt)}, nil
-	default:
-		return nil, fmt.Errorf("%w: %d", ErrUnsupportedVersion, version)
-	}
+// NewVersion1KeySchedule returns the read-only KeySchedule for a Version1 archive. No
+// work is done until FileKey is called, which runs PBKDF2 per entry.
+func NewVersion1KeySchedule(password string) *KeySchedule {
+	return &KeySchedule{version: Version1, legacy: crypto.NewKeyDeriver(password)}
+}
+
+// NewVersion2KeySchedule returns the KeySchedule for a Version2 archive keyed by cek.
+func NewVersion2KeySchedule(cek [crypto.KeySize]byte) *KeySchedule {
+	return &KeySchedule{version: Version2, masterKey: cek}
 }
 
 // Version returns the archive format version this schedule derives keys for.

@@ -22,12 +22,11 @@ import (
 func craftZstdEntryArchive(t *testing.T, name string, chunk []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	archiveSalt, _ := crypto.GenerateSalt()
-	aw, err := archive.NewArchiveWriter(&buf, compressionTestPassword, archiveSalt)
+	aw, err := archive.NewArchiveWriter(&buf, archive.Credentials{Passwords: []string{compressionTestPassword}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := aw.WriteHeader(archive.ArchiveHeader{Magic: archive.Magic, Version: archive.Version, ArchiveSalt: archiveSalt}, 1); err != nil {
+	if err := aw.WriteHeader(1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,14 +140,18 @@ func TestDecompressionBombBlockIsRejected(t *testing.T) {
 	requireEntryError(t, data, sarcio.ErrCodeIntegrityFail)
 }
 
-// archiveHeaderSize is the fixed archive header length; the first entry type byte follows it.
-const archiveHeaderSize = 4 + 2 + crypto.SaltSize + 8 + crypto.NonceSize + crypto.GCMTagSize + archive.ReservedSize
+// archiveHeaderSize returns the length of a Version2 archive's header, which varies with
+// its recipient block; the first entry type byte follows it.
+func archiveHeaderSize(data []byte) int {
+	blockLen := int(binary.LittleEndian.Uint32(data[len(archive.Magic)+2:]))
+	return len(archive.Magic) + 2 + 4 + blockLen + archive.FileCountSealedSize + archive.ReservedSize
+}
 
 // firstBlockSizeOffset returns the offset of the first entry's first data block 4-byte
 // size field. File and solid entries share this framing.
 func firstBlockSizeOffset(t *testing.T, data []byte) int {
 	t.Helper()
-	off := archiveHeaderSize + 1 + crypto.SaltSize + 32 + crypto.NonceSize
+	off := archiveHeaderSize(data) + 1 + crypto.SaltSize + 32 + crypto.NonceSize
 	off += 4 + int(binary.LittleEndian.Uint32(data[off:])) // metadata size + ciphertext
 	off += 4 + int(binary.LittleEndian.Uint32(data[off:])) // inter-block padding
 	return off + crypto.NonceSize

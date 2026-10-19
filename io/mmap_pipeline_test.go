@@ -229,15 +229,11 @@ func TestAddFileStreamingRoundtripAboveThreshold(t *testing.T) {
 			}
 
 			var archiveBuf bytes.Buffer
-			salt, err := crypto.GenerateSalt()
+			aw, err := archive.NewArchiveWriter(&archiveBuf, archive.Credentials{Passwords: []string{"mmap-roundtrip-pass"}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			aw, err := archive.NewArchiveWriter(&archiveBuf, "mmap-roundtrip-pass", salt)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := aw.WriteHeader(archive.ArchiveHeader{Magic: archive.Magic, Version: archive.Version, ArchiveSalt: salt}, 0); err != nil {
+			if err := aw.WriteHeader(0); err != nil {
 				t.Fatal(err)
 			}
 			if err := addFileStreaming(aw, policy, f.Name(), 4, NopProgressTracker{}); err != nil {

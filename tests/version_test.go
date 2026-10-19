@@ -150,8 +150,8 @@ func TestExtractRejectsUnknownVersion(t *testing.T) {
 }
 
 // TestVersion1ArchiveRelabelledAsVersion2Fails confirms the version field selects the
-// key schedule: a v1 header cannot be opened with v2 keys, so relabelling the version
-// byte is rejected before any entry is parsed.
+// header layout and key schedule: a v1 header read as v2 has no valid recipient block,
+// so relabelling the version byte is rejected before any entry is parsed.
 func TestVersion1ArchiveRelabelledAsVersion2Fails(t *testing.T) {
 	data := readV1Fixture(t)
 	patched := append([]byte(nil), data...)
@@ -159,8 +159,8 @@ func TestVersion1ArchiveRelabelledAsVersion2Fails(t *testing.T) {
 
 	results, err := sarcio.NewSafeExtractor(bytes.NewReader(patched), v1FixturePassword, nil).Extract(t.TempDir())
 	var ae *sarcio.ArchiveError
-	if !errors.As(err, &ae) || ae.Code != sarcio.ErrCodeAuthFailed || !ae.IsFatal() {
-		t.Fatalf("want fatal %s, got %v", sarcio.ErrCodeAuthFailed, err)
+	if !errors.As(err, &ae) || !ae.IsFatal() || (ae.Code != sarcio.ErrCodeAuthFailed && ae.Code != sarcio.ErrCodeIntegrityFail) {
+		t.Fatalf("want a fatal header error, got %v", err)
 	}
 	if len(results) != 0 {
 		t.Fatalf("got %d results, want none", len(results))

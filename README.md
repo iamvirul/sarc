@@ -33,6 +33,15 @@ sarc archive --password "StrongPass123" --output src.sarc --solid --compress-lev
 # Extract
 sarc extract --password "StrongPass123" --archive backup.sarc --output ./restored/
 
+# Multiple recipients: one archive, each person opens it with their own credential.
+# Recipients are age public keys (inline age1... or a file of them), so age users need no
+# extra tooling; others can create a key pair with sarc keygen.
+sarc keygen --output bob.key                     # prints bob's public key (age1...)
+sarc archive --password "alice-pass-123" --recipient age1... --recipient team.txt \
+  --output shared.sarc report.pdf data.csv
+sarc extract --password "alice-pass-123" --archive shared.sarc --output ./out
+sarc extract --identity bob.key --archive shared.sarc --output ./out
+
 # Verify archive integrity (no password required)
 sarc verify --archive backup.sarc
 
@@ -59,7 +68,8 @@ Per-file mode stays larger than zip on small-file trees because every entry carr
 | Property | Mechanism |
 |---|---|
 | Confidentiality | AES-256-GCM per block |
-| Key isolation | PBKDF2-SHA256 (100k iterations) once per archive, then a unique HKDF-SHA256 key per file from a unique 32-byte salt |
+| Key isolation | Random per-archive content key; a unique HKDF-SHA256 key per file from a unique 32-byte salt |
+| Recipients | Content key wrapped once per password (PBKDF2-SHA256, 100k+ iterations, AES-256-GCM) and once for all age X25519 recipients; recipient public keys are not stored |
 | Integrity | GCM auth tag per block + HMAC-SHA256 over full plaintext |
 | Deduplication resistance | Random padding (1-4 KB header, 512-2048 B trailer), variable chunk sizes (64 KB +/- 8 KB), unique nonce per block |
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |

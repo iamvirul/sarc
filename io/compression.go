@@ -72,18 +72,6 @@ func DefaultCompressionOptions() CompressionOptions {
 	return CompressionOptions{Mode: CompressionAuto, Level: archive.DefaultCompressionLevel}
 }
 
-// ArchiverOption configures a StreamingArchiver or ConcurrentArchiver.
-type ArchiverOption func(*archiverConfig)
-
-type archiverConfig struct {
-	compression CompressionOptions
-}
-
-// WithCompression overrides the default compression options (CompressionAuto, level 3).
-func WithCompression(opts CompressionOptions) ArchiverOption {
-	return func(c *archiverConfig) { c.compression = opts }
-}
-
 // compressionPolicy decides the codec for each file and solid group. Safe for concurrent use.
 type compressionPolicy struct {
 	mode            CompressionMode
@@ -120,19 +108,6 @@ func newCompressionPolicy(opts CompressionOptions) (*compressionPolicy, error) {
 	default:
 		return nil, fmt.Errorf("io/compression: unknown compression mode %d", opts.Mode)
 	}
-}
-
-// newArchiverConfig applies opts over the defaults and builds the compression policy.
-func newArchiverConfig(opts []ArchiverOption) (*compressionPolicy, error) {
-	cfg := archiverConfig{compression: DefaultCompressionOptions()}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	policy, err := newCompressionPolicy(cfg.compression)
-	if err != nil {
-		return nil, fatal(ErrCodeInvalidOption, "invalid compression options", err)
-	}
-	return policy, nil
 }
 
 // codecFor returns the codec for a file named name whose leading bytes are probe

@@ -27,7 +27,7 @@ var rootCmd = &cobra.Command{
 func main() {
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
-	rootCmd.AddCommand(archiveCmd, extractCmd, verifyCmd, listCmd)
+	rootCmd.AddCommand(archiveCmd, extractCmd, verifyCmd, listCmd, keygenCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -18,7 +18,9 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
 ## On-disk format
 
 ```
-[ARCHIVE HEADER]        magic(4) version(2) archive_salt(32) file_count_encrypted(36) reserved(32)
+[ARCHIVE HEADER]        v2: magic(4) version(2) recipient_block_len(4) recipient_block
+                            file_count_encrypted(36) reserved(32)
+                        v1: magic(4) version(2) archive_salt(32) file_count_encrypted(36) reserved(32)
 
 [FILE ENTRY]  (repeated)
   entry_type(1)         0x01 = file
@@ -66,24 +68,48 @@ are always written as version 2; the extractor accepts versions 1 and 2.
 
 ### Version 2 (current)
 
-The password is stretched once per archive, then every file gets its own AES-256 key
-via HKDF-SHA256:
+Every archive has a random 32-byte content-encryption key (CEK) from `crypto/rand`. Each
+file gets its own AES-256 key derived from it with HKDF-SHA256:
 
 ```
-master_key = PBKDF2(password, archive_salt, 100_000, 32, SHA-256)       // once per archive
-file_key   = HKDF-Expand(master_key, "sarc file key" || entry_salt, 32)  // per file entry
-header_key = HKDF-Expand(master_key, "sarc header key", 32)              // seals file count
+cek        = random(32)                                           // once per archive
+file_key   = HKDF-Expand(cek, "sarc file key" || entry_salt, 32)  // per file entry
+header_key = HKDF-Expand(cek, "sarc header key", 32)              // seals file count
 ```
 
-`master_key` is already uniformly random, so HKDF-Extract is skipped (RFC 5869 section 3.3).
-The extractor opens `file_count_encrypted` with `header_key` before parsing any entry, so a
-wrong password fails immediately with `AUTH_FAILED` and nothing is written to disk.
-Each entry still has a unique key because every `entry_salt` is unique, and file keys are
-one-way outputs of `master_key`: recovering a file key does not reveal `master_key` or other
-file keys. The master key itself is never used directly as an encryption key.
+The CEK is uniformly random, so HKDF-Extract is skipped (RFC 5869 section 3.3). Each entry
+has a unique key because every `entry_salt` is unique, and file keys are one-way outputs of
+the CEK. The CEK itself is never used directly as an encryption key.
 
-Archiving or extracting N files costs one PBKDF2 run plus N HKDF expansions (microseconds
-each), instead of N PBKDF2 runs.
+### Recipients
+
+The CEK is never derived from a credential. The header's recipient block holds one
+wrapped copy of it per way to open the archive, and any one of them unlocks everything:
+
+```
+recipient_block := count(2) | stanza*
+stanza          := type(1) | body_len(4) | body
+password (0x01) := iterations(4) | salt(32) | nonce(12) | AES-256-GCM(kek, cek)(48)
+                   kek = PBKDF2-SHA256(password, salt, iterations), iterations >= 100_000
+age (0x02)      := a standard age file whose payload is the CEK
+```
+
+- Public-key recipients use age: the CEK is age-encrypted to every `age1...` recipient, so
+  keys from `age-keygen` (or `sarc keygen`) work unchanged, and any age identity matching
+  one recipient recovers the CEK. age X25519 stanzas contain only an ephemeral share, so
+  the archive does not reveal recipient public keys.
+- Passwords are separate stanzas (age's own scrypt stanza must be the only one in a file).
+  The iteration count is stored so it can be raised later; readers reject counts outside
+  100k-10M before deriving anything. At most 8 password stanzas, one age stanza.
+- What is public: the number of password stanzas, whether there are age recipients, and
+  how many (one age stanza line each). Salts, nonces, and ephemeral shares are fresh per
+  archive, so two archives for the same people share no header bytes.
+- The extractor tries the password against password stanzas and identities against the
+  age stanza, then confirms the CEK by opening `file_count_encrypted` with `header_key`,
+  all before parsing any entry. No match fails with `AUTH_FAILED` and writes nothing.
+
+Archiving or extracting costs one PBKDF2 run per password tried plus one HKDF expansion
+per file (microseconds each).
 
 ### Version 1 (read-only)
 

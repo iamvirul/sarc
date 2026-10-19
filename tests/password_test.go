@@ -67,8 +67,8 @@ func TestVersion2WrongPasswordFailsAtHeader(t *testing.T) {
 
 func TestVersion2TamperedHeaderFileCountFails(t *testing.T) {
 	data := archiveOneFile(t, "one.txt")
-	// Header layout: magic(4) version(2) archive_salt(32) file_count_encrypted(36).
-	data[len(archive.Magic)+2+32+20] ^= 0xFF
+	// The sealed file count sits just before the reserved bytes at the end of the header.
+	data[archiveHeaderSize(data)-archive.ReservedSize-archive.FileCountSealedSize+20] ^= 0xFF
 
 	_, err := sarcio.NewSafeExtractor(bytes.NewReader(data), singleEntryPassword, nil).Extract(t.TempDir())
 	requireFatal(t, err, sarcio.ErrCodeAuthFailed)

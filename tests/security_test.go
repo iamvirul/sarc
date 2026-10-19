@@ -36,10 +36,10 @@ func TestAuthTagTamperingPreventsExtraction(t *testing.T) {
 	}
 
 	corrupted := buf.Bytes()
-	// Flip a byte in the metadata ciphertext region. The archive header is 106 bytes,
-	// followed by entry type (1), salt (32), frame header (32), metadata nonce (12),
-	// metadata size (4). The metadata ciphertext starts at offset 187.
-	corrupted[200] ^= 0xFF
+	// Flip a byte in the metadata ciphertext. After the header come the entry type (1),
+	// salt (32), frame header (32), metadata nonce (12), and metadata size (4).
+	metaStart := archiveHeaderSize(corrupted) + 1 + crypto.SaltSize + 32 + crypto.NonceSize + 4
+	corrupted[metaStart+13] ^= 0xFF
 
 	outDir := filepath.Join(dir, "out")
 	ex := sarcio.NewSafeExtractor(bytes.NewReader(corrupted), "securepassword1", nil)
