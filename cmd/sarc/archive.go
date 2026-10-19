@@ -24,7 +24,7 @@ func init() {
 	archiveCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
 	archiveCmd.Flags().StringArrayVarP(&flagRecipients, "recipient", "r", nil,
 		"age public key (age1...) or recipients file allowed to decrypt (repeatable); any one recipient or the password can open the archive")
-	archiveCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output archive path (required)")
+	archiveCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output archive path, or - for stdout (required)")
 	archiveCmd.Flags().IntVar(&flagParallel, "parallel", 0, "worker count (default: NumCPU)")
 	archiveCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")
 	archiveCmd.Flags().BoolVar(&flagCompress, "compress", false, "zstd-compress every file (default: auto, skips incompressible files)")
@@ -58,11 +58,11 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level, "solid", compression.Solid)
 
-	f, err := os.Create(flagOutput)
+	out, err := createArchiveOutput(flagOutput)
 	if err != nil {
-		return fmt.Errorf("cannot create output file: %w", err)
+		return err
 	}
-	defer f.Close()
+	defer out.Close()
 
 	var totalInputBytes int64
 	for _, path := range args {
@@ -70,15 +70,17 @@ func runArchive(cmd *cobra.Command, args []string) error {
 			totalInputBytes += info.Size()
 		}
 	}
-	if err := sarcio.PreallocateOutput(f, totalInputBytes); err != nil {
-		log.Debug("preallocate output file skipped", "err", err)
+	if out.file != nil {
+		if err := sarcio.PreallocateOutput(out.file, totalInputBytes); err != nil {
+			log.Debug("preallocate output file skipped", "err", err)
+		}
 	}
 
-	progress := sarcio.NewConsoleProgressBar(os.Stdout)
+	progress := sarcio.NewConsoleProgressBar(out.progress)
 
 	if flagParallel != 1 {
 		log.Debug("using concurrent archiver", "workers", flagParallel)
-		ca, err := sarcio.NewConcurrentArchiver(f, flagPassword, flagParallel, progress,
+		ca, err := sarcio.NewConcurrentArchiver(out, flagPassword, flagParallel, progress,
 			sarcio.WithCompression(compression), sarcio.WithAgeRecipients(recipients...))
 		if err != nil {
 			return err
@@ -87,7 +89,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Debug("using streaming archiver")
-	sa, err := sarcio.NewStreamingArchiver(f, flagPassword, progress,
+	sa, err := sarcio.NewStreamingArchiver(out, flagPassword, progress,
 		sarcio.WithCompression(compression), sarcio.WithAgeRecipients(recipients...))
 	if err != nil {
 		return err

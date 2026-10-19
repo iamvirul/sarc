@@ -8,18 +8,29 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
 )
 
+// inlineStreamThreshold is the file size from which ConcurrentArchiver streams a file
+// on the writer goroutine (with block-level parallelism) instead of encrypting it whole
+// in memory on a worker, so per-file memory stays bounded.
+const inlineStreamThreshold = minParallelFileSize
+
+// resultLookahead is how many finished results may wait beyond one per worker. It lets
+// workers run ahead while the writer is busy, and bounds memory to
+// (workers+resultLookahead) in-memory entries regardless of how many files are archived.
+const resultLookahead = 2
+
 // fileJob carries one indexed file path, or a solid group of member paths, to a worker.
+// inline jobs are not sent to workers; the writer streams them itself.
 type fileJob struct {
 	index   int
 	path    string
 	members []string // non-nil for a solid group job
+	inline  bool
 }
 
 // fileResult carries the encrypted entry back from a worker.
@@ -74,132 +85,156 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 // ca.workers goroutines so it still saturates all available cores.
 func (ca *ConcurrentArchiver) Archive(paths []string) error {
 	if len(paths) == 1 {
-		var size int64
-		if err := addFileStreaming(ca.w, ca.compression, paths[0], ca.workers, ca.progress); err != nil {
-			ae, ok := err.(*ArchiveError)
-			if !ok || ae.IsFatal() {
-				return err
-			}
-			ca.progress.FileError(paths[0], err)
-		} else if info, statErr := os.Stat(paths[0]); statErr == nil {
-			size = info.Size()
-		}
-		if err := ca.w.WriteFooter(); err != nil {
-			return fatal(ErrCodeWriteFailed, "write footer", err)
-		}
-		ca.progress.Done(len(paths), size, time.Since(ca.start))
-		return nil
+		return ca.archiveJobs([]fileJob{{index: 0, path: paths[0], inline: true}}, 1)
 	}
+	return ca.archiveJobs(ca.planJobs(paths), len(paths))
+}
 
-	plannedJobs := ca.planJobs(paths)
-	jobs := make(chan fileJob, len(plannedJobs))
-	results := make(chan fileResult, len(plannedJobs))
+// archiveJobs runs jobs through the worker pool and writes their entries in job order
+// as they complete. At most workers+resultLookahead results are held at once, so memory
+// is bounded by the window, not by the archive size. It stops at the first fatal error.
+func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, totalFiles int) error {
+	results := make([]chan fileResult, len(jobs))
+	for i := range results {
+		results[i] = make(chan fileResult, 1)
+	}
+	work := make(chan fileJob)
+	slots := make(chan struct{}, ca.workers+resultLookahead)
+	done := make(chan struct{})
+	defer close(done)
 
-	var wg sync.WaitGroup
-	for i := 0; i < ca.workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ca.runWorker(jobs, results)
-		}()
-	}
-	for _, j := range plannedJobs {
-		jobs <- j
-	}
-	close(jobs)
 	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	ordered := make([]fileResult, len(plannedJobs))
-	for r := range results {
-		if r.index < len(ordered) {
-			ordered[r.index] = r
+		defer close(work)
+		for _, j := range jobs {
+			if j.inline {
+				continue
+			}
+			select {
+			case slots <- struct{}{}:
+			case <-done:
+				return
+			}
+			select {
+			case work <- j:
+			case <-done:
+				return
+			}
 		}
+	}()
+	for i := 0; i < ca.workers; i++ {
+		go func() {
+			for j := range work {
+				results[j.index] <- ca.runJob(j)
+			}
+		}()
 	}
 
 	var totalBytes int64
-	var firstFatal error
-	for _, r := range ordered {
-		if r.err != nil {
-			ae, ok := r.err.(*ArchiveError)
-			if ok && ae.IsFatal() {
-				if firstFatal == nil {
-					firstFatal = r.err
-				}
-				continue
+	for _, j := range jobs {
+		if j.inline {
+			size, err := ca.streamInline(j.path)
+			if err != nil {
+				return err
 			}
-			ca.progress.FileError(r.path, r.err)
+			totalBytes += size
 			continue
 		}
-		if r.members != nil {
-			if !r.noEntry {
-				if err := ca.w.WriteFileEntry(r.entry); err != nil {
-					return fatal(ErrCodeWriteFailed, "write solid entry", err)
-				}
-			}
-			totalBytes += reportSolidMembers(r.members, ca.progress)
-			continue
+		r := <-results[j.index]
+		<-slots
+		size, err := ca.writeResult(r)
+		if err != nil {
+			return err
 		}
-		if err := ca.w.WriteFileEntry(r.entry); err != nil {
-			return fatal(ErrCodeWriteFailed, "write file entry", err)
-		}
-		totalBytes += r.size
-		ca.progress.FileFinished(r.name)
-	}
-	if firstFatal != nil {
-		return firstFatal
+		totalBytes += size
 	}
 	if err := ca.w.WriteFooter(); err != nil {
 		return fatal(ErrCodeWriteFailed, "write footer", err)
 	}
-	ca.progress.Done(len(paths), totalBytes, time.Since(ca.start))
+	ca.progress.Done(totalFiles, totalBytes, time.Since(ca.start))
 	return nil
 }
 
-// planJobs returns one job per path, or, in solid mode, one job per individually stored
-// file followed by one job per solid group.
-func (ca *ConcurrentArchiver) planJobs(paths []string) []fileJob {
-	if !ca.compression.solid {
-		jobs := make([]fileJob, len(paths))
-		for i, p := range paths {
-			jobs[i] = fileJob{index: i, path: p}
+// streamInline writes a large file straight to the archive with addFileStreaming. A
+// recoverable failure is reported to progress and skipped; a fatal one is returned.
+func (ca *ConcurrentArchiver) streamInline(path string) (int64, error) {
+	info, statErr := os.Stat(path)
+	if err := addFileStreaming(ca.w, ca.compression, path, ca.workers, ca.progress); err != nil {
+		if isFatal(err) {
+			return 0, err
 		}
-		return jobs
+		ca.progress.FileError(path, err)
+		return 0, nil
 	}
-	plan := planSolid(paths)
-	jobs := make([]fileJob, 0, len(plan.individual)+len(plan.groups))
-	for _, p := range plan.individual {
-		jobs = append(jobs, fileJob{index: len(jobs), path: p})
+	if statErr != nil {
+		return 0, nil
 	}
-	for _, g := range plan.groups {
+	return info.Size(), nil
+}
+
+// writeResult writes one worker result and returns the plaintext bytes it added. A
+// recoverable failure is reported to progress and skipped; a fatal one is returned.
+func (ca *ConcurrentArchiver) writeResult(r fileResult) (int64, error) {
+	if r.err != nil {
+		if isFatal(r.err) {
+			return 0, r.err
+		}
+		ca.progress.FileError(r.path, r.err)
+		return 0, nil
+	}
+	if r.members != nil {
+		if !r.noEntry {
+			if err := ca.w.WriteFileEntry(r.entry); err != nil {
+				return 0, fatal(ErrCodeWriteFailed, "write solid entry", err)
+			}
+		}
+		return reportSolidMembers(r.members, ca.progress), nil
+	}
+	if err := ca.w.WriteFileEntry(r.entry); err != nil {
+		return 0, fatal(ErrCodeWriteFailed, "write file entry", err)
+	}
+	ca.progress.FileFinished(r.name)
+	return r.size, nil
+}
+
+// planJobs returns one job per path, or, in solid mode, one job per individually stored
+// file followed by one job per solid group. Files of at least inlineStreamThreshold
+// bytes are marked inline.
+func (ca *ConcurrentArchiver) planJobs(paths []string) []fileJob {
+	individual := paths
+	var groups [][]string
+	if ca.compression.solid {
+		plan := planSolid(paths)
+		individual, groups = plan.individual, plan.groups
+	}
+	jobs := make([]fileJob, 0, len(individual)+len(groups))
+	for _, p := range individual {
+		jobs = append(jobs, fileJob{index: len(jobs), path: p, inline: isLargeFile(p)})
+	}
+	for _, g := range groups {
 		jobs = append(jobs, fileJob{index: len(jobs), path: g[0], members: g})
 	}
 	return jobs
 }
 
-func (ca *ConcurrentArchiver) runWorker(jobs <-chan fileJob, results chan<- fileResult) {
-	for job := range jobs {
-		if job.members != nil {
-			entry, members, err := buildSolidEntry(ca.w, ca.compression, job.members, ca.progress)
-			res := fileResult{index: job.index, path: job.path, members: members, err: err, noEntry: entry == nil}
-			if entry != nil {
-				res.entry = *entry
-			}
-			results <- res
-			continue
+// isLargeFile reports whether path is a regular file of at least inlineStreamThreshold
+// bytes. Paths that cannot be stat'ed are not large; their error surfaces when archived.
+func isLargeFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Size() >= inlineStreamThreshold
+}
+
+// runJob encrypts one worker job: a solid group or a whole file in memory.
+func (ca *ConcurrentArchiver) runJob(job fileJob) fileResult {
+	if job.members != nil {
+		entry, members, err := buildSolidEntry(ca.w, ca.compression, job.members, ca.progress)
+		res := fileResult{index: job.index, path: job.path, members: members, err: err, noEntry: entry == nil}
+		if entry != nil {
+			res.entry = *entry
 		}
-		entry, name, size, err := encryptFile(job.path, ca.w, ca.compression, ca.progress)
-		results <- fileResult{
-			index: job.index,
-			path:  job.path,
-			entry: entry,
-			name:  name,
-			size:  size,
-			err:   err,
-		}
+		return res
 	}
+	entry, name, size, err := encryptFile(job.path, ca.w, ca.compression, ca.progress)
+	return fileResult{index: job.index, path: job.path, entry: entry, name: name, size: size, err: err}
 }
 
 // encryptFile opens path, compresses and encrypts it per compression, and returns a complete FileEntry.

@@ -4,7 +4,6 @@
 package io
 
 import (
-	"bytes"
 	"sync"
 
 	"github.com/iamvirul/sarc/crypto"
@@ -35,16 +34,31 @@ type decryptResult struct {
 	err error
 }
 
-// decryptBlocksParallel authenticates and decrypts a file's data blocks, preserving
-// their original order in the returned plaintext. next is called sequentially by an
-// internal dispatcher goroutine (block framing is a variable-length stream, so it must
-// be parsed in order); the CPU-bound AES-256-GCM Open call for each block is handed off
-// to one of `workers` goroutines sharing em, which is safe for concurrent decrypt calls.
+// blockSink receives each decrypted block's plaintext in stream order. The slice is
+// only valid for the duration of the call.
+type blockSink func(plaintext []byte) error
+
+// sinkError wraps an error returned by a blockSink, so callers can tell output failures
+// (for example a full disk) apart from authentication failures.
+type sinkError struct{ err error }
+
+func (e *sinkError) Error() string { return e.err.Error() }
+func (e *sinkError) Unwrap() error { return e.err }
+
+// decryptBlocksParallel authenticates and decrypts a file's data blocks, handing each
+// plaintext block to sink in original order. next is called sequentially by an internal
+// dispatcher goroutine (block framing is a variable-length stream, so it must be parsed
+// in order); the CPU-bound AES-256-GCM Open call for each block is handed off to one of
+// `workers` goroutines sharing em, which is safe for concurrent decrypt calls. At most
+// workers*decryptPipelineDepth blocks are in flight, so memory is bounded regardless of
+// file size.
 //
+// After a decrypt or sink failure it stops calling sink but keeps consuming blocks
+// through the sentinel, so the caller's stream stays aligned on the next field.
 // Falls back to sequential decryption when workers < 2.
-func decryptBlocksParallel(em blockOpener, workers int, next blockReader) ([]byte, error) {
+func decryptBlocksParallel(em blockOpener, workers int, next blockReader, sink blockSink) error {
 	if workers < 2 {
-		return decryptBlocksSequential(em, next)
+		return decryptBlocksSequential(em, next, sink)
 	}
 
 	jobs := make(chan decryptJob, workers*decryptPipelineDepth)
@@ -82,54 +96,50 @@ func decryptBlocksParallel(em blockOpener, workers int, next blockReader) ([]byt
 		readErrCh <- nil
 	}()
 
-	var out bytes.Buffer
-	var decryptErr error
+	var firstErr error
 	for resCh := range ordered {
 		res := <-resCh
-		if decryptErr == nil && res.err != nil {
-			decryptErr = res.err
+		if firstErr != nil {
+			continue
 		}
-		if decryptErr == nil {
-			out.Write(res.pt)
+		if res.err != nil {
+			firstErr = res.err
+			continue
+		}
+		if err := sink(res.pt); err != nil {
+			firstErr = &sinkError{err: err}
 		}
 	}
 	workerWG.Wait()
 
-	if decryptErr != nil {
-		return nil, decryptErr
+	if firstErr != nil {
+		return firstErr
 	}
-	if err := <-readErrCh; err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	return <-readErrCh
 }
 
-// decryptBlocksSequential decrypts blocks one at a time on the calling goroutine.
-// Like the parallel path, it keeps consuming blocks through the sentinel after a
-// decrypt failure so the caller's stream stays aligned on the next field.
-func decryptBlocksSequential(em blockOpener, next blockReader) ([]byte, error) {
-	var out bytes.Buffer
-	var decryptErr error
+// decryptBlocksSequential decrypts blocks one at a time on the calling goroutine, with
+// the same ordering, failure, and draining behaviour as decryptBlocksParallel.
+func decryptBlocksSequential(em blockOpener, next blockReader, sink blockSink) error {
+	var firstErr error
 	for {
 		nonce, ct, ok, err := next()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !ok {
-			break
+			return firstErr
 		}
-		if decryptErr != nil {
+		if firstErr != nil {
 			continue
 		}
 		pt, err := em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: ct})
 		if err != nil {
-			decryptErr = err
+			firstErr = err
 			continue
 		}
-		out.Write(pt)
+		if err := sink(pt); err != nil {
+			firstErr = &sinkError{err: err}
+		}
 	}
-	if decryptErr != nil {
-		return nil, decryptErr
-	}
-	return out.Bytes(), nil
 }

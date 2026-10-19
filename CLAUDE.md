@@ -55,7 +55,7 @@ Version 2 can zstd-compress each file before encryption (`archive/codec.go`, pol
 
 Opt-in solid mode (`--solid`, `io/solid.go`, record format in `archive/solid.go`) packs files up to 1 MiB into solid group entries (`EntryTypeSolid`, up to 8 MiB uncompressed) compressed as one zstd stream. Groups reuse the file-entry framing, so skip/resync logic is shared; extraction verifies the group HMAC before writing any member.
 
-Data is split into variable-length blocks (~64 KB ± 8 KB), each with a unique 12-byte `crypto/rand` nonce. A sealed HMAC-SHA256 of the plaintext is stored encrypted at the end of each file entry and verified with `crypto/subtle.ConstantTimeCompare` after decryption — before writing any output to disk.
+Data is split into variable-length blocks (~64 KB ± 8 KB), each with a unique 12-byte `crypto/rand` nonce. A sealed HMAC-SHA256 of the plaintext is stored encrypted at the end of each file entry. Extraction streams each file into a hidden temp file (`io/verified_file.go`) while computing the HMAC, and renames it into place only after a constant-time match, so memory is constant and unverified data never appears under the final name. The footer is an unkeyed SHA-256 checksum (corruption detection only).
 
 ### Anti-deduplication
 
@@ -63,7 +63,7 @@ The core security property: the same file archived twice must produce completely
 
 ### Concurrency model
 
-`ConcurrentArchiver` (in `io/concurrent.go`) encrypts files in parallel using a goroutine pool. A collector goroutine assembles results in submission order before the writer flushes them, preserving deterministic archive layout regardless of which worker finishes first. The streaming archiver (`io/streaming.go`) maintains <200 MB memory by processing one 64 KB chunk at a time.
+`ConcurrentArchiver` (in `io/concurrent.go`) encrypts small files and solid groups on a goroutine pool and writes results in submission order as they complete, with at most workers+2 results in flight; files of 4 MiB or more are streamed by the writer itself. Memory is bounded regardless of archive size, and `--output -` / `--archive -` stream archives through pipes.
 
 ## Project Conventions
 

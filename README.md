@@ -42,8 +42,15 @@ sarc archive --password "alice-pass-123" --recipient age1... --recipient team.tx
 sarc extract --password "alice-pass-123" --archive shared.sarc --output ./out
 sarc extract --identity bob.key --archive shared.sarc --output ./out
 
-# Verify archive integrity (no password required)
+# Check the archive checksum for corruption (no password required)
 sarc verify --archive backup.sarc
+
+# Streaming: "-" reads the archive from stdin or writes it to stdout, so archives can be
+# piped to S3, ssh, or another process with no temporary archive file. Memory stays
+# constant regardless of archive size.
+sarc archive --password "StrongPass123" --output - files/* | aws s3 cp - s3://bucket/backup.sarc
+curl -s https://example.com/backup.sarc | sarc extract --password "StrongPass123" --archive - --output ./out
+sarc archive --password "StrongPass123" --output - files/* | ssh user@host "sarc extract --password 'StrongPass123' --archive - --output /backup/"
 
 # List contents with codec and compression ratio (password required to decrypt filenames)
 sarc list --password "StrongPass123" --archive backup.sarc
@@ -85,7 +92,8 @@ Solid trade-off: every file in a solid group is encrypted under the group's key,
 isolation is per group rather than per file, and the archive reveals which small files
 were packed together (the entry type byte marks solid groups). Member names, sizes, and
 permissions are inside the encrypted stream. Solid mode is off unless `--solid` is given.
-| Container integrity | HMAC-SHA256 over entire archive body, verified by `sarc verify` without decryption |
+| Container checksum | SHA-256 over the archive body in the footer, checked by `sarc verify` without a password. It is not keyed: it detects accidental corruption, not tampering |
+| Authenticity | Every entry is authenticated by its GCM tags and a sealed plaintext HMAC, and the header by the recipient block; `extract` and `list` reject anything modified, including when streaming |
 
 ## Benchmark
 
@@ -106,7 +114,7 @@ To increase the file size, set `TEST_FILE_GB` in `.github/workflows/benchmark.ym
 |---|---|
 | Encryption | 200-500 MB/s (parallel) |
 | Decryption | 150-300 MB/s |
-| Memory footprint | < 200 MB (streaming mode) |
+| Memory footprint | Constant: peak Go heap of about 25-45 MB to archive or extract, independent of file and archive size (archiving files of 64 MB or more memory-maps them, so RSS also counts reclaimable page cache) |
 | Archive overhead | < 5% (padding + headers) |
 
 ## Building from source

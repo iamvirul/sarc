@@ -187,20 +187,38 @@ framing, so it is fatal and extraction stops.
 
 ## Concurrency model
 
-`ConcurrentArchiver` encrypts files in parallel:
+`ConcurrentArchiver` encrypts files in parallel with bounded memory:
 
 ```
-main goroutine: sends fileJob{index, path} to jobs channel
-N workers:      read jobs, encrypt file -> send fileResult{index, entry} to results channel
-collector:      reads all results into ordered[index] slice
-writer:         flushes ordered slice to archive in submission order
+dispatcher: sends jobs to workers in order, holding at most workers+2 results in flight
+N workers:  encrypt a small file (< 4 MiB) or a solid group in memory -> per-job result channel
+writer:     walks jobs in order; writes each result as soon as it is ready, or streams a
+            large file (>= 4 MiB) itself with block-level parallelism
 ```
 
-Result ordering preserves deterministic archive layout regardless of which worker finishes first.
+Entries are written in submission order regardless of which worker finishes first, and
+memory is bounded by the window, not by the number or size of files.
+
+## Streaming
+
+The format is strictly sequential: the writer only appends (the footer checksum is a
+running hash), and the reader never seeks. So archives can be written to and read from
+pipes (`--output -`, `--archive -`) with no format change and no temporary archive file.
+
+- Extraction decrypts each file entry block by block into a hidden temporary file in the
+  output directory (`.sarc-extract-*`, mode 0600) while computing the plaintext HMAC.
+  Only after the trailer verifies is it renamed to its final name; on any failure it is
+  deleted. Unverified plaintext never appears under the final name, and memory stays
+  constant for any file size. Solid groups (at most 8 MiB) are verified in memory.
+- `sarc verify` hashes the stream once, holding back the 64-byte footer, so it also works
+  on stdin.
+- A truncated stream fails with `TRUNCATED` at the missing end marker; each block, entry,
+  and the header remain authenticated, so streaming loses no protection. The footer is an
+  unkeyed SHA-256 checksum in every mode: it detects corruption, not tampering.
 
 ## Security boundaries
 
 - All `crypto/rand` calls: nonce generation, salt generation, padding generation
 - GCM tag is verified by `cipher.AEAD.Open` before any plaintext is returned
-- Plaintext HMAC is verified by `crypto/subtle.ConstantTimeCompare` after decryption, before writing output
+- Plaintext HMAC is verified in constant time after decryption, before an extracted file is renamed to its final name
 - Error messages never include key material, decrypted filenames, or internal stack traces

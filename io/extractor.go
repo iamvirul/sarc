@@ -4,6 +4,7 @@
 package io
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -347,25 +348,34 @@ func (se *SafeExtractor) extractEntry(keys *archive.KeySchedule, entryType byte,
 	return []ExtractionResult{result}, nil
 }
 
-// extractFileBody extracts the rest of a file entry after its head.
+// extractFileBody extracts the rest of a file entry after its head, streaming the
+// plaintext into a hidden temporary file in outputDir while its HMAC and size are
+// computed. Only after the trailer verifies is the file renamed to its final name, so
+// unverified data never appears under it and memory stays constant for any file size.
 func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHead, dec *archive.BlockDecompressor, outputDir string) (ExtractionResult, error) {
 	fileKey, pm := head.fileKey, head.pm
 	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
 	if err != nil {
 		return ExtractionResult{}, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
 	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return ExtractionResult{}, fatal(ErrCodeWriteFailed, "create output dir", err)
+	}
+	out, err := newVerifiedFile(outputDir, fileKey)
+	if err != nil {
+		return ExtractionResult{}, se.skipEntryBody(recoverable(ErrCodeWriteFailed, "create file", err))
+	}
+	defer out.discard()
 
 	if err := se.skipPadding(); err != nil {
 		return ExtractionResult{}, recoverable(ErrCodeTruncated, "skip inter-block padding", err)
 	}
-
-	plaintext, err := se.decryptDataBlocks(fileKey, pm.SizeBucket, pm.Codec, dec)
-	if err != nil {
+	if err := se.streamDataBlocks(fileKey, pm.SizeBucket, pm.Codec, dec, out.write); err != nil {
 		if isFatal(err) {
 			return ExtractionResult{}, err
 		}
-		// Block framing is intact (decryptDataBlocks drains to the sentinel), so skip
-		// the trailer and leave the reader at the next entry.
+		// Block framing is intact (the pipeline drains to the sentinel), so skip the
+		// trailer and leave the reader at the next entry.
 		return ExtractionResult{}, se.skipTrailer(err)
 	}
 
@@ -373,20 +383,16 @@ func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHe
 	if err != nil {
 		return ExtractionResult{}, err
 	}
-	if err := verifyPlaintext(fileKey, plaintext, trailer); err != nil {
+	if err := out.verify(trailer); err != nil {
 		return ExtractionResult{}, err
 	}
-
 	outPath := filepath.Join(outputDir, filepath.Base(filename))
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return ExtractionResult{}, fatal(ErrCodeWriteFailed, "create output dir", err)
-	}
-	if err := os.WriteFile(outPath, plaintext, os.FileMode(pm.Permissions)); err != nil {
+	if err := out.publish(outPath, os.FileMode(pm.Permissions).Perm()); err != nil {
 		return ExtractionResult{}, recoverable(ErrCodeWriteFailed, "write file", err)
 	}
 
 	se.progress.FileFinished(filename)
-	return ExtractionResult{Filename: filename, Size: int64(len(plaintext)), OK: true}, nil
+	return ExtractionResult{Filename: filename, Size: out.size, OK: true}, nil
 }
 
 func (se *SafeExtractor) readMetadataBlock() (archive.MetadataBlock, error) {
@@ -461,10 +467,12 @@ func (se *SafeExtractor) skipPadding() error {
 // reading in order; the CPU-bound AES-256-GCM Open call for each block is what gets
 // parallelised.
 // CodecZstd payloads are decoded on the same worker right after decryption.
-func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket archive.SizeBucket, codec archive.Codec, dec *archive.BlockDecompressor) ([]byte, error) {
+// Each block's plaintext is passed to sink in order; memory stays bounded by the
+// pipeline depth regardless of file size.
+func (se *SafeExtractor) streamDataBlocks(fileKey [crypto.KeySize]byte, bucket archive.SizeBucket, codec archive.Codec, dec *archive.BlockDecompressor, sink blockSink) error {
 	em, err := crypto.NewEncryptionManager(fileKey)
 	if err != nil {
-		return nil, fatal(ErrCodeAuthFailed, "init block decryptor", err)
+		return fatal(ErrCodeAuthFailed, "init block decryptor", err)
 	}
 	var opener blockOpener = em
 	if codec == archive.CodecZstd {
@@ -513,17 +521,36 @@ func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket 
 			workers = w
 		}
 	}
-	plaintext, err := decryptBlocksParallel(opener, workers, next)
-	if err != nil {
-		if readErr != nil {
-			return nil, readErr
-		}
-		if errors.Is(err, errDecompress) {
-			return nil, recoverable(ErrCodeIntegrityFail, "decompress block", err)
-		}
-		return nil, recoverable(ErrCodeAuthFailed, "decrypt block", err)
+	err = decryptBlocksParallel(opener, workers, next, sink)
+	if err == nil {
+		return nil
 	}
-	return plaintext, nil
+	if readErr != nil {
+		return readErr
+	}
+	var sinkErr *sinkError
+	switch {
+	case errors.As(err, &sinkErr):
+		return recoverable(ErrCodeWriteFailed, "write file", err)
+	case errors.Is(err, errDecompress):
+		return recoverable(ErrCodeIntegrityFail, "decompress block", err)
+	default:
+		return recoverable(ErrCodeAuthFailed, "decrypt block", err)
+	}
+}
+
+// decryptDataBlocks is streamDataBlocks collecting the plaintext in memory, for
+// payloads with a small fixed bound such as solid groups.
+func (se *SafeExtractor) decryptDataBlocks(fileKey [crypto.KeySize]byte, bucket archive.SizeBucket, codec archive.Codec, dec *archive.BlockDecompressor) ([]byte, error) {
+	var out bytes.Buffer
+	err := se.streamDataBlocks(fileKey, bucket, codec, dec, func(pt []byte) error {
+		_, werr := out.Write(pt)
+		return werr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 // skipDataBlocks consumes a file's data blocks through the sentinel without decrypting
