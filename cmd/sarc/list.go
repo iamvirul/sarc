@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -21,7 +20,7 @@ var listCmd = &cobra.Command{
 func init() {
 	listCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
 	listCmd.Flags().StringArrayVarP(&flagIdentities, "identity", "i", nil, "age identity file (repeatable); an alternative to --password")
-	listCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path (required)")
+	listCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
 	_ = listCmd.MarkFlagRequired("archive")
 }
 
@@ -30,9 +29,9 @@ func runList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.Open(flagArchive)
+	f, err := openArchiveInput(flagArchive)
 	if err != nil {
-		return fmt.Errorf("cannot open archive: %w", err)
+		return err
 	}
 	defer f.Close()
 
