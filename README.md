@@ -42,6 +42,31 @@ sarc archive --password "alice-pass-123" --recipient age1... --recipient team.tx
 sarc extract --password "alice-pass-123" --archive shared.sarc --output ./out
 sarc extract --identity bob.key --archive shared.sarc --output ./out
 
+# Key file instead of a password: nothing to remember or phish. Any file of 32 bytes to
+# 1 MiB works; sarc keygen --keyfile writes a random 32-byte one (mode 0600). Keep a
+# backup: a lost key file cannot be recovered.
+sarc keygen --keyfile --output /Volumes/USB/backup.key
+sarc archive --key /Volumes/USB/backup.key --output backup.sarc files/
+sarc extract --key /Volumes/USB/backup.key --archive backup.sarc --output ./out
+
+# Two factors: --key with --password makes them one credential, and both are required.
+sarc archive --key device.key --password "second-factor" --output backup.sarc files/
+sarc extract --key device.key --password "second-factor" --archive backup.sarc --output ./out
+
+# SSH keys: archive for anyone's SSH public key, open with the private key (ed25519 or
+# RSA; a passphrase-protected key prompts on the terminal). --identity on archive uses
+# only the public half, so archiving never needs the passphrase.
+sarc archive --recipient "$(cat ~/.ssh/id_ed25519.pub)" --output backup.sarc files/
+sarc archive --identity ~/.ssh/id_ed25519 --output backup.sarc files/
+sarc extract --identity ~/.ssh/id_ed25519 --archive backup.sarc --output ./out
+
+# Hardware tokens through age plugins (age-plugin-yubikey, age-plugin-fido2-hmac,
+# age-plugin-tpm, age-plugin-se, ...): the secret never leaves the device. sarc runs
+# age-plugin-NAME from PATH; touch and PIN prompts go to the terminal, never to stdout.
+age-plugin-yubikey --generate > yubikey.id                 # prints age1yubikey1...
+sarc archive --recipient age1yubikey1... --output backup.sarc files/
+sarc extract --identity yubikey.id --archive backup.sarc --output ./out
+
 # Check the archive checksum for corruption (no password required)
 sarc verify --archive backup.sarc
 
@@ -52,7 +77,7 @@ sarc archive --password "StrongPass123" --output - files/* | aws s3 cp - s3://bu
 curl -s https://example.com/backup.sarc | sarc extract --password "StrongPass123" --archive - --output ./out
 sarc archive --password "StrongPass123" --output - files/* | ssh user@host "sarc extract --password 'StrongPass123' --archive - --output /backup/"
 
-# List contents with codec and compression ratio (password required to decrypt filenames)
+# List contents with codec and compression ratio (a credential is required to decrypt filenames)
 sarc list --password "StrongPass123" --archive backup.sarc
 ```
 
@@ -76,12 +101,14 @@ Per-file mode stays larger than zip on small-file trees because every entry carr
 |---|---|
 | Confidentiality | AES-256-GCM per block |
 | Key isolation | Random per-archive content key; a unique HKDF-SHA256 key per file from a unique 32-byte salt |
-| Recipients | Content key wrapped once per password (PBKDF2-SHA256, 100k+ iterations, AES-256-GCM) and once for all age X25519 recipients; recipient public keys are not stored |
+| Recipients | Content key wrapped once per password (PBKDF2-SHA256, 100k+ iterations, AES-256-GCM), once per key file (HKDF-SHA256, AES-256-GCM), once per key file + password pair (both combined in one HKDF), and once for all public-key recipients (age X25519, SSH, plugins); recipient public keys are not stored |
 | Integrity | GCM auth tag per block + HMAC-SHA256 over full plaintext |
 | Deduplication resistance | Random padding (1-4 KB header, 512-2048 B trailer), variable chunk sizes (64 KB +/- 8 KB), unique nonce per block |
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |
 | Compression | Optional zstd before encryption, per file; the codec is recorded inside the encrypted metadata |
 | Solid groups (`--solid`) | Small files share one entry: one key, one padding set, one HMAC per group of up to 8 MiB |
+| Container checksum | SHA-256 over the archive body in the footer, checked by `sarc verify` without a password. It is not keyed: it detects accidental corruption, not tampering |
+| Authenticity | Every entry is authenticated by its GCM tags and a sealed plaintext HMAC, and the header by the recipient block; `extract` and `list` reject anything modified, including when streaming |
 
 Compression trade-off: compressing before encrypting makes ciphertext size depend on how
 compressible each file is, which weakly hints at file type and content to anyone who can
@@ -92,8 +119,12 @@ Solid trade-off: every file in a solid group is encrypted under the group's key,
 isolation is per group rather than per file, and the archive reveals which small files
 were packed together (the entry type byte marks solid groups). Member names, sizes, and
 permissions are inside the encrypted stream. Solid mode is off unless `--solid` is given.
-| Container checksum | SHA-256 over the archive body in the footer, checked by `sarc verify` without a password. It is not keyed: it detects accidental corruption, not tampering |
-| Authenticity | Every entry is authenticated by its GCM tags and a sealed plaintext HMAC, and the header by the recipient block; `extract` and `list` reject anything modified, including when streaming |
+
+Recipient privacy: age X25519 recipients are anonymous, but age's SSH stanzas and most
+hardware-token stanzas carry a short fingerprint of the recipient key. Anyone holding a
+candidate public key (for example from GitHub) can check whether it is a recipient,
+though not decrypt anything. The archive also reveals which kinds of credential open it,
+which `extract` reports when none of the supplied ones match.
 
 ## Benchmark
 

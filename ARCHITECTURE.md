@@ -87,26 +87,48 @@ The CEK is never derived from a credential. The header's recipient block holds o
 wrapped copy of it per way to open the archive, and any one of them unlocks everything:
 
 ```
-recipient_block := count(2) | stanza*
-stanza          := type(1) | body_len(4) | body
-password (0x01) := iterations(4) | salt(32) | nonce(12) | AES-256-GCM(kek, cek)(48)
-                   kek = PBKDF2-SHA256(password, salt, iterations), iterations >= 100_000
-age (0x02)      := a standard age file whose payload is the CEK
+recipient_block            := count(2) | stanza*
+stanza                     := type(1) | body_len(4) | body
+password (0x01)            := iterations(4) | salt(32) | nonce(12) | AES-256-GCM(kek, cek)(48)
+                              kek = PBKDF2-SHA256(password, salt, iterations), iterations >= 100_000
+age (0x02)                 := a standard age file whose payload is the CEK
+key file (0x03)            := salt(32) | nonce(12) | AES-256-GCM(kek, cek)(48)
+                              kek = HKDF-SHA256(ikm = key_file, salt, "sarc key file recipient")
+key file + password (0x04) := iterations(4) | salt(32) | nonce(12) | AES-256-GCM(kek, cek)(48)
+                              kek = HKDF-SHA256(ikm = PBKDF2-SHA256(password, salt, iterations) || key_file,
+                                                salt, "sarc key file and password recipient")
 ```
 
-- Public-key recipients use age: the CEK is age-encrypted to every `age1...` recipient, so
-  keys from `age-keygen` (or `sarc keygen`) work unchanged, and any age identity matching
-  one recipient recovers the CEK. age X25519 stanzas contain only an ephemeral share, so
-  the archive does not reveal recipient public keys.
+Each wrap uses its HKDF info string (or "sarc password recipient") as the GCM additional
+data, so a stanza cannot be reinterpreted as another type.
+
+- Public-key recipients use age: the CEK is age-encrypted to every recipient, so keys from
+  `age-keygen` (or `sarc keygen`) work unchanged, and any identity matching one recipient
+  recovers the CEK. Supported: X25519 (`age1...`), post-quantum hybrid (`age1pq1...`),
+  tagged hardware keys (`age1tag1...`), SSH ed25519 and RSA, and plugin recipients
+  (`age1<name>1...`, served by `age-plugin-<name>` from PATH, for example YubiKey, FIDO2,
+  TPM, or Secure Enclave). age X25519 stanzas contain only an ephemeral share, so the
+  archive does not reveal those recipients; SSH and most hardware stanzas include a short
+  key fingerprint.
+- Key files are high-entropy, so their wrap uses HKDF instead of a slow KDF and costs
+  microseconds. A key file is any file of 32 bytes to 1 MiB, used verbatim. In the
+  combined stanza the password is still stretched with PBKDF2 (in case the key file is
+  stolen) and runs once per stanza however many key files are tried. The CLI binds
+  `--password` to every `--key` when both are given, so the password alone no longer
+  opens the archive.
 - Passwords are separate stanzas (age's own scrypt stanza must be the only one in a file).
   The iteration count is stored so it can be raised later; readers reject counts outside
-  100k-10M before deriving anything. At most 8 password stanzas, one age stanza.
-- What is public: the number of password stanzas, whether there are age recipients, and
+  100k-10M before deriving anything. At most 8 password stanzas, 8 key file stanzas of
+  each kind, and one age stanza.
+- What is public: the number and kind of stanzas, whether there are age recipients, and
   how many (one age stanza line each). Salts, nonces, and ephemeral shares are fresh per
   archive, so two archives for the same people share no header bytes.
-- The extractor tries the password against password stanzas and identities against the
-  age stanza, then confirms the CEK by opening `file_count_encrypted` with `header_key`,
-  all before parsing any entry. No match fails with `AUTH_FAILED` and writes nothing.
+- The extractor tries each stanza only with the credentials it needs (password, key
+  files, both, or identities), then confirms the CEK by opening `file_count_encrypted`
+  with `header_key`, all before parsing any entry. No match fails with `AUTH_FAILED`,
+  names the credential kinds the archive accepts, and writes nothing. An identity that
+  fails rather than mismatches (wrong SSH passphrase, missing plugin, cancelled touch) is
+  reported as such, after every other stanza has been tried.
 
 Archiving or extracting costs one PBKDF2 run per password tried plus one HKDF expansion
 per file (microseconds each).
