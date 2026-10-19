@@ -2,8 +2,9 @@ name: Live examples
 
 # Runs the README's sarc commands for real on Linux and macOS (scripts/e2e.sh): piping
 # archive into extract, curl into extract, multi-recipient archives with the real age
-# CLI, solid mode, verify from stdin, truncated and wrong-password failures, a
-# constant-memory streaming extract, and refusing binary output to a terminal.
+# CLI, solid mode, verify from stdin, truncated and wrong-password failures, key files,
+# SSH keys, a hardware-token-style age plugin, a constant-memory streaming extract, and
+# refusing binary output to a terminal.
 # Any broken example fails the run; results appear in the job summary.
 
 on:
@@ -16,6 +17,7 @@ on:
       - "cmd/**"
       - "go.mod"
       - "go.sum"
+      - "tests/testdata/age-plugin-sarctest/**"
       - "scripts/e2e.sh"
       - ".github/workflows/e2e.yml"
   push:
@@ -58,6 +60,9 @@ jobs:
 
       - name: Install age CLI (${{ env.AGE_VERSION }})
         run: GOBIN="$RUNNER_TEMP/age" go install "filippo.io/age/cmd/...@${AGE_VERSION}"
+
+      - name: Build test age plugin
+        run: go build -o "$RUNNER_TEMP/age/age-plugin-sarctest" ./tests/testdata/age-plugin-sarctest
 
       - name: Ensure GNU time (Linux)
         if: runner.os == 'Linux'
