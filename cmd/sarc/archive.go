@@ -21,7 +21,9 @@ var archiveCmd = &cobra.Command{
 }
 
 func init() {
-	archiveCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "master password (required)")
+	archiveCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
+	archiveCmd.Flags().StringArrayVarP(&flagRecipients, "recipient", "r", nil,
+		"age public key (age1...) or recipients file allowed to decrypt (repeatable); any one recipient or the password can open the archive")
 	archiveCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output archive path (required)")
 	archiveCmd.Flags().IntVar(&flagParallel, "parallel", 0, "worker count (default: NumCPU)")
 	archiveCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")
@@ -32,14 +34,22 @@ func init() {
 	archiveCmd.Flags().BoolVar(&flagSolid, "solid", false,
 		"pack files up to 1 MiB into shared solid groups compressed as one stream (smaller archives of many small files; one key per group instead of per file)")
 	archiveCmd.MarkFlagsMutuallyExclusive("compress", "no-compress")
-	_ = archiveCmd.MarkFlagRequired("password")
 	_ = archiveCmd.MarkFlagRequired("output")
 }
 
 func runArchive(cmd *cobra.Command, args []string) error {
 	log := initLogger()
 
-	if err := validatePassword(flagPassword); err != nil {
+	if flagPassword == "" && len(flagRecipients) == 0 {
+		return errNoCredential
+	}
+	if flagPassword != "" {
+		if err := validatePassword(flagPassword); err != nil {
+			return err
+		}
+	}
+	recipients, err := parseRecipients(flagRecipients)
+	if err != nil {
 		return err
 	}
 	compression, err := compressionOptions(cmd)
@@ -68,7 +78,8 @@ func runArchive(cmd *cobra.Command, args []string) error {
 
 	if flagParallel != 1 {
 		log.Debug("using concurrent archiver", "workers", flagParallel)
-		ca, err := sarcio.NewConcurrentArchiver(f, flagPassword, flagParallel, progress, sarcio.WithCompression(compression))
+		ca, err := sarcio.NewConcurrentArchiver(f, flagPassword, flagParallel, progress,
+			sarcio.WithCompression(compression), sarcio.WithAgeRecipients(recipients...))
 		if err != nil {
 			return err
 		}
@@ -76,7 +87,8 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Debug("using streaming archiver")
-	sa, err := sarcio.NewStreamingArchiver(f, flagPassword, progress, sarcio.WithCompression(compression))
+	sa, err := sarcio.NewStreamingArchiver(f, flagPassword, progress,
+		sarcio.WithCompression(compression), sarcio.WithAgeRecipients(recipients...))
 	if err != nil {
 		return err
 	}

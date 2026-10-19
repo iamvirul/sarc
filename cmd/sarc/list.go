@@ -14,25 +14,29 @@ import (
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List contents of a SARC archive (requires password to decrypt filenames)",
+	Short: "List contents of a SARC archive (requires a password or identity to decrypt filenames)",
 	RunE:  runList,
 }
 
 func init() {
-	listCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "master password (required)")
+	listCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
+	listCmd.Flags().StringArrayVarP(&flagIdentities, "identity", "i", nil, "age identity file (repeatable); an alternative to --password")
 	listCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path (required)")
-	_ = listCmd.MarkFlagRequired("password")
 	_ = listCmd.MarkFlagRequired("archive")
 }
 
 func runList(cmd *cobra.Command, args []string) error {
+	opts, err := readerOptions()
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(flagArchive)
 	if err != nil {
 		return fmt.Errorf("cannot open archive: %w", err)
 	}
 	defer f.Close()
 
-	ex := sarcio.NewSafeExtractor(f, flagPassword, sarcio.NopProgressTracker{})
+	ex := sarcio.NewSafeExtractor(f, flagPassword, sarcio.NopProgressTracker{}, opts...)
 	results, err := ex.List()
 	if err != nil {
 		return err

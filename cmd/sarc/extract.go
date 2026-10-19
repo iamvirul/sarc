@@ -19,17 +19,21 @@ var extractCmd = &cobra.Command{
 }
 
 func init() {
-	extractCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "master password (required)")
+	extractCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
+	extractCmd.Flags().StringArrayVarP(&flagIdentities, "identity", "i", nil, "age identity file (repeatable); an alternative to --password")
 	extractCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path (required)")
 	extractCmd.Flags().StringVarP(&flagOutput, "output", "o", ".", "output directory")
 	extractCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")
-	_ = extractCmd.MarkFlagRequired("password")
 	_ = extractCmd.MarkFlagRequired("archive")
 }
 
 func runExtract(cmd *cobra.Command, args []string) error {
 	log := initLogger()
 
+	opts, err := readerOptions()
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(flagArchive)
 	if err != nil {
 		return fmt.Errorf("cannot open archive: %w", err)
@@ -38,7 +42,7 @@ func runExtract(cmd *cobra.Command, args []string) error {
 
 	// Progress tracker handles per-file error printing via FileError.
 	progress := sarcio.NewConsoleProgressBar(os.Stdout)
-	ex := sarcio.NewSafeExtractor(f, flagPassword, progress)
+	ex := sarcio.NewSafeExtractor(f, flagPassword, progress, opts...)
 
 	results, err := ex.Extract(flagOutput)
 	if err != nil {

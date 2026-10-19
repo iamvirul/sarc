@@ -19,6 +19,9 @@ var (
 	flagNoCompress    bool
 	flagCompressLevel int
 	flagSolid         bool
+
+	flagRecipients []string
+	flagIdentities []string
 )
 
 // initLogger configures the global structured logger.
