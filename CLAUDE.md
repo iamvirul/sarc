@@ -47,8 +47,8 @@ examples/     Standalone Go programs showing archive/extract API usage.
 
 ### On-disk format
 
-Each file entry in the `.sarc` container has its own AES-256 key. Format version 2 (current) stretches the password once per archive, then expands per-file keys with HKDF:
-`master_key = PBKDF2(password, archive_salt, 100_000 iterations, SHA-256)`, `file_key = HKDF-SHA256-Expand(master_key, "sarc file key" || entry_salt)`.
+Each file entry in the `.sarc` container has its own AES-256 key. Format version 2 (current) uses a random per-archive content key (CEK) and expands per-file keys with HKDF:
+`file_key = HKDF-SHA256-Expand(cek, "sarc file key" || entry_salt)`. The header's recipient block (`archive/recipients.go`) stores the CEK wrapped per password (PBKDF2 + AES-256-GCM) and once for all age X25519 recipients (`filippo.io/age`); any one credential unlocks the archive.
 Version 1 archives (one PBKDF2 per file entry) remain extractable; `archive.KeySchedule` selects the derivation from the header version. `tests/testdata/v1_multi.sarc` is the v1 compatibility fixture.
 
 Version 2 can zstd-compress each file before encryption (`archive/codec.go`, policy in `io/compression.go`). The codec is per file, stored in sealed metadata; each block of a zstd entry is an independent frame, so `FrameBuilder` compresses inside its chunk-encrypt methods and the pipelines are codec-agnostic. The HMAC and the trailer's plaintext size cover the original plaintext.
