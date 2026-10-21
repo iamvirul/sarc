@@ -59,15 +59,15 @@ func TestLoadIdentitiesErrorDoesNotEchoSecret(t *testing.T) {
 }
 
 func TestReaderOptionsRequireACredential(t *testing.T) {
-	flagPassword, flagIdentities = "", nil
+	resetCredentialFlags(t)
 	if _, err := readerOptions(); err == nil {
-		t.Fatal("accepted no password and no identity")
+		t.Fatal("accepted no password, key file, or identity")
 	}
 }
 
 func runKeygenTo(t *testing.T, output string) (string, string, error) {
 	t.Helper()
-	flagKeygenOutput = output
+	flagKeygenOutput, flagKeygenKeyFile = output, false
 	var stdout, stderr bytes.Buffer
 	cmd := &cobra.Command{}
 	cmd.SetOut(&stdout)

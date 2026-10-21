@@ -13,13 +13,12 @@ import (
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List contents of a SARC archive (requires a password or identity to decrypt filenames)",
+	Short: "List contents of a SARC archive (requires a credential to decrypt filenames)",
 	RunE:  runList,
 }
 
 func init() {
-	listCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
-	listCmd.Flags().StringArrayVarP(&flagIdentities, "identity", "i", nil, "age identity file (repeatable); an alternative to --password")
+	addReaderCredentialFlags(listCmd)
 	listCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
 	_ = listCmd.MarkFlagRequired("archive")
 }

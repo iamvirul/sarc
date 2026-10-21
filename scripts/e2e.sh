@@ -7,7 +7,8 @@
 #
 # Usage: scripts/e2e.sh SARC_BINARY AGE_BIN_DIR [REPORT_MD]
 #   SARC_BINARY  path to the sarc CLI under test
-#   AGE_BIN_DIR  directory containing the age and age-keygen binaries
+#   AGE_BIN_DIR  directory containing the age and age-keygen binaries, and optionally
+#                age-plugin-sarctest (built from tests/testdata) for the plugin example
 #   REPORT_MD    optional Markdown report path (for example $GITHUB_STEP_SUMMARY)
 # Env: E2E_BIG_MB (default 1024), E2E_MAX_RSS_MB (default 256)
 
@@ -160,7 +161,12 @@ example_verify_stdin() {
   "$SARC" archive -p "$PASS" -o v.sarc in/* >/dev/null
   "$SARC" verify -a - <v.sarc | grep -q PASSED
   cp v.sarc corrupt.sarc
-  printf '\xff' | dd of=corrupt.sarc bs=1 seek=5000 conv=notrunc 2>/dev/null
+  # Flip every bit of one byte; overwriting with a fixed value is a no-op 1 time in 256.
+  local byte
+  byte="$(od -An -tu1 -j 5000 -N 1 v.sarc | tr -d ' ')"
+  # shellcheck disable=SC2059
+  printf "\\$(printf '%03o' $((byte ^ 255)))" | dd of=corrupt.sarc bs=1 seek=5000 conv=notrunc 2>/dev/null
+  cmp -s v.sarc corrupt.sarc && { echo "corruption did not change the archive"; return 1; }
   if "$SARC" verify -a - <corrupt.sarc >/dev/null 2>&1; then
     echo "verify accepted a corrupted stream"; return 1
   fi
@@ -188,6 +194,91 @@ example_truncated_and_wrong_password() {
   fi
   no_leftovers out-wrong
   echo "truncated stream and wrong password fail with no leftover files"
+}
+
+# with_pty CMD...: runs CMD on a pseudo-terminal, so a passphrase prompt reads from it;
+# stdin is forwarded to the terminal after a delay so the prompt is waiting.
+with_pty() {
+  if [ "$(uname)" = "Darwin" ]; then
+    script -q /dev/null "$@"
+  else
+    script -qec "$(printf '%q ' "$@")" /dev/null
+  fi
+}
+
+perm_bits() {
+  if [ "$(uname)" = "Darwin" ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
+}
+
+example_key_file() {
+  "$SARC" keygen --keyfile -o backup.key 2>/dev/null
+  [ "$(wc -c <backup.key | tr -d ' ')" = 32 ] || { echo "key file is not 32 bytes"; return 1; }
+  [ "$(perm_bits backup.key)" = 600 ] || { echo "key file mode is $(perm_bits backup.key), want 600"; return 1; }
+  if "$SARC" keygen --keyfile -o backup.key 2>/dev/null; then echo "keygen overwrote a key file"; return 1; fi
+  head -c 4096 /dev/urandom >usb.key
+  "$SARC" archive -k backup.key -k usb.key -o - in/* 2>/dev/null >k.sarc
+  nonempty k.sarc
+  "$SARC" extract -k backup.key -a - -o out-key <k.sarc >/dev/null && same_files in out-key
+  "$SARC" extract -k usb.key -a k.sarc -o out-usb >/dev/null && same_files in out-usb
+  local err
+  if err="$("$SARC" extract -p "$PASS" -a k.sarc -o out-pw 2>&1)"; then echo "password opened a key file archive"; return 1; fi
+  echo "$err" | grep -q "accepts: key file" || { echo "unhelpful error: $err"; return 1; }
+  no_leftovers out-pw
+  echo "keygen --keyfile (32 bytes, 0600), generated and user-supplied key files open it; password refused"
+}
+
+example_key_file_and_password() {
+  "$SARC" keygen --keyfile -o device.key 2>/dev/null
+  "$SARC" archive -k device.key -p "$PASS" -o both.sarc in/* >/dev/null
+  "$SARC" extract -k device.key -p "$PASS" -a both.sarc -o out-both >/dev/null && same_files in out-both
+  local err
+  if err="$("$SARC" extract -k device.key -a both.sarc -o out-key-only 2>&1)"; then echo "key file alone opened it"; return 1; fi
+  echo "$err" | grep -q "accepts: key file + password" || { echo "unhelpful error: $err"; return 1; }
+  if "$SARC" extract -p "$PASS" -a both.sarc -o out-pw-only >/dev/null 2>&1; then echo "password alone opened it"; return 1; fi
+  no_leftovers out-key-only
+  no_leftovers out-pw-only
+  echo "--key with --password needs both; either alone is refused"
+}
+
+example_ssh_keys() {
+  ssh-keygen -q -t ed25519 -N "" -C e2e -f id_ed25519
+  ssh-keygen -q -t rsa -b 3072 -N "" -C e2e -f id_rsa
+  ssh-keygen -q -t ed25519 -N "ssh-passphrase-1" -C e2e -f id_locked
+  ssh-keygen -q -t ed25519 -N "" -C e2e -f id_other
+  "$SARC" archive -r "$(cat id_ed25519.pub)" -r id_rsa.pub -i id_locked -o - in/* 2>/dev/null >ssh.sarc
+  nonempty ssh.sarc
+  "$SARC" extract -i id_ed25519 -a - -o out-ed <ssh.sarc >/dev/null && same_files in out-ed
+  "$SARC" extract -i id_rsa -a ssh.sarc -o out-rsa >/dev/null && same_files in out-rsa
+  if "$SARC" extract -i id_other -a ssh.sarc -o out-other >/dev/null 2>&1; then echo "unrelated SSH key opened it"; return 1; fi
+  no_leftovers out-other
+  if ! command -v script >/dev/null; then
+    echo "ed25519 and RSA keys open it; unrelated key refused (passphrase prompt skipped: no script)"; return 0
+  fi
+  (sleep 2; echo "ssh-passphrase-1") | with_pty "$SARC" extract -i id_locked -a ssh.sarc -o out-locked >/dev/null 2>&1 || true
+  same_files in out-locked
+  (sleep 2; echo "wrong-passphrase") | with_pty "$SARC" extract -i id_locked -a ssh.sarc -o out-wrong >wrong.log 2>&1 || true
+  grep -q "identity could not be used" wrong.log || { echo "wrong passphrase not reported: $(tr -d '\r' <wrong.log | tail -n 1)"; return 1; }
+  no_leftovers out-wrong
+  echo "ed25519, RSA, and passphrase-protected keys (prompted on the terminal) open it; wrong passphrase and unrelated key refused"
+}
+
+example_hardware_token_plugin() {
+  if [ ! -x "$AGE_DIR/age-plugin-sarctest" ]; then
+    echo "skipped: age-plugin-sarctest not built into $AGE_DIR"; return 0
+  fi
+  export PATH="$AGE_DIR:$PATH"
+  age-plugin-sarctest -generate >token.id
+  local recipient
+  recipient="$(grep -o 'age1sarctest1[0-9a-z]*' token.id)"
+  "$SARC" archive -r "$recipient" -o - in/* 2>plugin.log >token.sarc
+  nonempty token.sarc
+  [ "$(head -c 4 token.sarc)" = "SARC" ] || { echo "plugin output corrupted the archive stream"; return 1; }
+  grep -q "sarctest token wrapping" plugin.log || { echo "plugin message missing from stderr"; return 1; }
+  "$SARC" extract -i token.id -a - -o out-token <token.sarc 2>plugin.log >/dev/null && same_files in out-token
+  grep -q "touch your sarctest token" plugin.log || { echo "plugin prompt missing from stderr"; return 1; }
+  # The same identity works with the age CLI, so the plugin speaks the standard protocol.
+  [ "$(echo "token interop" | age -r "$recipient" | age -d -i token.id 2>/dev/null)" = "token interop" ]
+  echo "plugin recipient (as age1yubikey1...) via stdout; plugin prompts on stderr; age CLI uses the same token"
 }
 
 example_constant_memory() {
@@ -220,6 +311,10 @@ run_example "Multi-recipient with age keys" example_multi_recipient_age
 run_example "Solid mode through a pipe" example_solid_pipe
 run_example "Verify from stdin" example_verify_stdin
 run_example "Truncated stream and wrong password" example_truncated_and_wrong_password
+run_example "Key file" example_key_file
+run_example "Key file and password" example_key_file_and_password
+run_example "SSH keys" example_ssh_keys
+run_example "Hardware token plugin" example_hardware_token_plugin
 run_example "Constant memory streaming extract" example_constant_memory
 run_example "Refuse terminal output" example_refuses_terminal
 

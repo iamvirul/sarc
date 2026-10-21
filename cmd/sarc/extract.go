@@ -19,8 +19,7 @@ var extractCmd = &cobra.Command{
 }
 
 func init() {
-	extractCmd.Flags().StringVarP(&flagPassword, "password", "p", "", "archive password")
-	extractCmd.Flags().StringArrayVarP(&flagIdentities, "identity", "i", nil, "age identity file (repeatable); an alternative to --password")
+	addReaderCredentialFlags(extractCmd)
 	extractCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
 	extractCmd.Flags().StringVarP(&flagOutput, "output", "o", ".", "output directory")
 	extractCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")

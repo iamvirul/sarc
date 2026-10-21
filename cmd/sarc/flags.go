@@ -22,6 +22,7 @@ var (
 
 	flagRecipients []string
 	flagIdentities []string
+	flagKeyFiles   []string
 )
 
 // initLogger configures the global structured logger.
