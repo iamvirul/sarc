@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
@@ -52,8 +53,14 @@ type IncrementalResult struct {
 	Failed        int   // files that could not be read; their previous versions are kept
 	ChangedBytes  int64 // total size of the changed files
 	NewChunks     int
-	AppendedBytes int64 // how much the archive grew
+	AppendedBytes int64 // how much the archive grew, not counting its signature
 	Repaired      bool  // a damaged tail left by an interrupted update was rebuilt
+	// Signed reports that this run wrote a signature with the WithSigner key. A run that
+	// changes nothing keeps a signature that still holds for that key and reports false.
+	Signed bool
+	// SignatureRemoved reports that the run changed a signed archive without a signer,
+	// so its signature, which no longer matched, was removed.
+	SignatureRemoved bool
 }
 
 // ArchiveIncremental records the current state of inputs (files and directories,
@@ -123,6 +130,16 @@ func createIncremental(path string, files []inputFile, cfg archiverConfig, opts 
 	if err != nil {
 		return res, err
 	}
+	if cfg.signer != nil {
+		block, err := signatureBlock(aw.Checksum(), cfg.signer)
+		if err != nil {
+			return res, err
+		}
+		if _, err := tmp.Write(block); err != nil {
+			return res, fatal(ErrCodeWriteFailed, "write signature", err)
+		}
+		res.Signed = true
+	}
 	if err := tmp.Sync(); err != nil {
 		return res, fatal(ErrCodeWriteFailed, "sync archive", err)
 	}
@@ -145,7 +162,8 @@ type changedFile struct {
 }
 
 // updateIncremental appends a session to the incremental archive at path when files
-// differ from its newest state.
+// differ from its newest state. A signature is renewed with cfg's signer, or removed
+// when the archive changes without one.
 func updateIncremental(path string, files []inputFile, skipped []skippedInput, cfg archiverConfig, opts IncrementalOptions) (IncrementalResult, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -168,24 +186,73 @@ func updateIncremental(path string, files []inputFile, skipped []skippedInput, c
 	if !se.header.incremental() {
 		return IncrementalResult{}, fatal(ErrCodeInvalidOption, "the output exists and is not an incremental archive", nil)
 	}
-	ia, err := loadIncremental(f, info.Size(), keys, se.header)
+	proper, signature, err := splitSignature(f, info.Size())
+	if err != nil {
+		return IncrementalResult{}, err
+	}
+	ia, err := loadIncremental(f, proper, keys, se.header)
 	if err != nil {
 		return IncrementalResult{}, err
 	}
 	res := IncrementalResult{Session: ia.sessions}
+	size := info.Size()
+	var checksum []byte // the footer checksum, when this run has computed it
 	if ia.recovered {
-		if err := repairTail(f, ia); err != nil {
+		if checksum, err = repairTail(f, ia); err != nil {
 			return res, err
 		}
 		res.Repaired = true
+		size = ia.tail + int64(archive.TailSize)
 	}
 
 	changed, deleted, unchanged := diffInputs(ia, files, skipped)
 	res.Unchanged = unchanged
 	if len(changed) == 0 && len(deleted) == 0 {
+		return finishUnchanged(f, ia, res, signature, checksum, cfg.signer)
+	}
+	res, checksum, end, err := appendSession(f, ia, changed, deleted, cfg, opts.Progress, res, size)
+	if err != nil || checksum == nil {
+		return res, err
+	}
+	switch {
+	case cfg.signer != nil:
+		if err := writeSignature(f, end, checksum, cfg.signer); err != nil {
+			return res, err
+		}
+		res.Signed = true
+	case signature != nil:
+		res.SignatureRemoved = true
+	}
+	return res, nil
+}
+
+// finishUnchanged completes a run that records no change. A signature that still holds
+// for the signer is kept; otherwise, with a signer, the archive is signed after its
+// checksum is verified. A repair without a signer removed the old signature.
+func finishUnchanged(f *os.File, ia *incrementalArchive, res IncrementalResult, signature, checksum []byte, signer ssh.Signer) (IncrementalResult, error) {
+	end := ia.tail + int64(archive.TailSize)
+	if signer == nil {
+		res.SignatureRemoved = res.Repaired && signature != nil
 		return res, nil
 	}
-	return appendSession(f, ia, changed, deleted, cfg, opts.Progress, res)
+	if checksum == nil {
+		footer := make([]byte, archive.HMACSize)
+		if _, err := f.ReadAt(footer, end-archive.FooterSize); err != nil {
+			return res, fatal(ErrCodeReadFailed, "read footer", err)
+		}
+		if signature != nil && signedBy(signature, footer, signer.PublicKey()) {
+			return res, nil
+		}
+		var err error
+		if checksum, err = archiveChecksum(f, end); err != nil {
+			return res, err
+		}
+	}
+	if err := writeSignature(f, end, checksum, signer); err != nil {
+		return res, err
+	}
+	res.Signed = true
+	return res, nil
 }
 
 // diffInputs compares files with the archive's newest state. A file is changed when it
@@ -237,37 +304,39 @@ func underAny(name string, prefixes []string) bool {
 
 // repairTail rebuilds the tail of an archive whose last update was interrupted: it cuts
 // everything after the last complete session and writes a fresh checkpoint, end
-// marker, and footer, rehashing the archive once to recover the checksum state.
-func repairTail(f *os.File, ia *incrementalArchive) error {
+// marker, and footer, rehashing the archive once to recover the checksum state. It
+// returns the new footer checksum.
+func repairTail(f *os.File, ia *incrementalArchive) ([]byte, error) {
 	sum := archive.NewArchiveChecksum()
 	if _, err := io.Copy(sum, io.NewSectionReader(f, 0, ia.tail)); err != nil {
-		return fatal(ErrCodeReadFailed, "rehash archive", err)
+		return nil, fatal(ErrCodeReadFailed, "rehash archive", err)
 	}
 	state, err := sum.MarshalBinary()
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "save checksum state", err)
+		return nil, fatal(ErrCodeWriteFailed, "save checksum state", err)
 	}
-	if err := writeTail(f, ia, ia.tail, state, ia.lastIndex); err != nil {
-		return err
+	checksum, err := writeTail(f, ia, ia.tail, state, ia.lastIndex)
+	if err != nil {
+		return nil, err
 	}
 	ia.hashState, ia.recovered = state, false
-	return nil
+	return checksum, nil
 }
 
 // writeTail writes a checkpoint for lastIndex, the end marker, and the footer at
-// offset, truncates the file after them, and syncs it.
-func writeTail(f *os.File, ia *incrementalArchive, offset int64, hashState []byte, lastIndex int64) error {
+// offset, truncates the file after them, syncs it, and returns the footer checksum.
+func writeTail(f *os.File, ia *incrementalArchive, offset int64, hashState []byte, lastIndex int64) ([]byte, error) {
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return fatal(ErrCodeWriteFailed, "seek archive", err)
+		return nil, fatal(ErrCodeWriteFailed, "seek archive", err)
 	}
 	aw, err := archive.ResumeArchiveWriter(f, ia.keys, offset, hashState)
 	if err != nil {
-		return fatal(ErrCodeIntegrityFail, "resume archive", err)
+		return nil, fatal(ErrCodeIntegrityFail, "resume archive", err)
 	}
 	if err := aw.WriteCheckpointFooter(lastIndex); err != nil {
-		return fatal(ErrCodeWriteFailed, "write archive tail", err)
+		return nil, fatal(ErrCodeWriteFailed, "write archive tail", err)
 	}
-	return truncateAndSync(f, aw.Offset()+archive.FooterSize)
+	return aw.Checksum(), truncateAndSync(f, aw.Offset()+archive.FooterSize)
 }
 
 func truncateAndSync(f *os.File, size int64) error {
@@ -280,27 +349,29 @@ func truncateAndSync(f *os.File, size int64) error {
 	return nil
 }
 
-// appendSession writes a new session over the archive's tail, then reseals the header's
-// session count. If writing fails, the previous tail is restored, so the archive is
-// left exactly as it was.
-func appendSession(f *os.File, ia *incrementalArchive, changed []changedFile, deleted []string, cfg archiverConfig, progress ProgressTracker, res IncrementalResult) (IncrementalResult, error) {
-	oldTail := make([]byte, archive.TailSize)
+// appendSession writes a new session over the archive's tail in a file of size bytes,
+// then reseals the header's session count. It returns the new footer checksum and the
+// end of the archive, or a nil checksum when no session was written. If writing fails,
+// everything from the previous tail on (any signature included) is restored, so the
+// archive is left exactly as it was.
+func appendSession(f *os.File, ia *incrementalArchive, changed []changedFile, deleted []string, cfg archiverConfig, progress ProgressTracker, res IncrementalResult, size int64) (IncrementalResult, []byte, int64, error) {
+	oldTail := make([]byte, size-ia.tail)
 	if _, err := f.ReadAt(oldTail, ia.tail); err != nil {
-		return res, fatal(ErrCodeReadFailed, "read archive tail", err)
+		return res, nil, 0, fatal(ErrCodeReadFailed, "read archive tail", err)
 	}
-	startSize := ia.tail + int64(archive.TailSize)
+	archiveEnd := ia.tail + int64(archive.TailSize)
 	if _, err := f.Seek(ia.tail, io.SeekStart); err != nil {
-		return res, fatal(ErrCodeWriteFailed, "seek archive", err)
+		return res, nil, 0, fatal(ErrCodeWriteFailed, "seek archive", err)
 	}
 	aw, err := archive.ResumeArchiveWriter(f, ia.keys, ia.tail, ia.hashState)
 	if err != nil {
-		return res, fatal(ErrCodeIntegrityFail, "resume archive", err)
+		return res, nil, 0, fatal(ErrCodeIntegrityFail, "resume archive", err)
 	}
 	restore := func(cause error) error {
 		if _, err := f.WriteAt(oldTail, ia.tail); err != nil {
 			return fatal(ErrCodeWriteFailed, "restore archive tail", err)
 		}
-		if err := truncateAndSync(f, startSize); err != nil {
+		if err := truncateAndSync(f, size); err != nil {
 			return err
 		}
 		return cause
@@ -309,28 +380,28 @@ func appendSession(f *os.File, ia *incrementalArchive, changed []changedFile, de
 	sessionRes, err := writeSession(aw, ia, changed, deleted, cfg.compression, progress, false)
 	if errors.Is(err, errEmptySession) {
 		res.Failed = sessionRes.Failed
-		return res, restore(nil)
+		return res, nil, 0, restore(nil)
 	}
 	if err != nil {
-		return res, restore(err)
+		return res, nil, 0, restore(err)
 	}
 	end := aw.Offset() + archive.FooterSize
 	if err := truncateAndSync(f, end); err != nil {
-		return res, restore(err)
+		return res, nil, 0, restore(err)
 	}
 	sealed, err := archive.SealFileCount(ia.keys, sessionRes.Session)
 	if err != nil {
-		return res, fatal(ErrCodeWriteFailed, "seal session count", err)
+		return res, nil, 0, fatal(ErrCodeWriteFailed, "seal session count", err)
 	}
 	if _, err := f.WriteAt(sealed[:], archive.FileCountOffset(ia.header.recipientBlockLen)); err != nil {
-		return res, fatal(ErrCodeWriteFailed, "write session count", err)
+		return res, nil, 0, fatal(ErrCodeWriteFailed, "write session count", err)
 	}
 	if err := f.Sync(); err != nil {
-		return res, fatal(ErrCodeWriteFailed, "sync archive", err)
+		return res, nil, 0, fatal(ErrCodeWriteFailed, "sync archive", err)
 	}
 	sessionRes.Unchanged, sessionRes.Repaired = res.Unchanged, res.Repaired
-	sessionRes.AppendedBytes = end - startSize
-	return sessionRes, nil
+	sessionRes.AppendedBytes = end - archiveEnd
+	return sessionRes, aw.Checksum(), end, nil
 }
 
 // errEmptySession reports that a session recorded nothing, so it is not written.

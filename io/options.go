@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"filippo.io/age"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/iamvirul/sarc/archive"
 )
@@ -18,6 +19,7 @@ type archiverConfig struct {
 	compression   CompressionOptions
 	ageRecipients []age.Recipient
 	keyFiles      []archive.KeyFile
+	signer        ssh.Signer
 }
 
 // WithCompression overrides the default compression options (CompressionAuto, level 3).
@@ -38,6 +40,13 @@ func WithKeyFileRecipients(keyFiles ...archive.KeyFile) ArchiverOption {
 	return func(c *archiverConfig) { c.keyFiles = append(c.keyFiles, keyFiles...) }
 }
 
+// WithSigner signs the archive with signer: a signature over the footer checksum is
+// appended after the footer (see archive.AppendSignatureBlock). Incremental archives are
+// re-signed after each update.
+func WithSigner(signer ssh.Signer) ArchiverOption {
+	return func(c *archiverConfig) { c.signer = signer }
+}
+
 // newArchiverConfig applies opts over the defaults.
 func newArchiverConfig(opts []ArchiverOption) archiverConfig {
 	cfg := archiverConfig{compression: DefaultCompressionOptions()}
@@ -49,21 +58,21 @@ func newArchiverConfig(opts []ArchiverOption) archiverConfig {
 
 // openArchiveWriter applies opts, builds the compression policy, and writes the archive
 // header for password (empty for none) plus any key file and age recipients. At least
-// one credential is required.
-func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, error) {
+// one credential is required. It also returns the signer from opts, if any.
+func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, ssh.Signer, error) {
 	cfg := newArchiverConfig(opts)
 	policy, err := newCompressionPolicy(cfg.compression)
 	if err != nil {
-		return nil, nil, fatal(ErrCodeInvalidOption, "invalid compression options", err)
+		return nil, nil, nil, fatal(ErrCodeInvalidOption, "invalid compression options", err)
 	}
 	aw, err := newCredentialedWriter(w, password, cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := aw.WriteHeader(0); err != nil {
-		return nil, nil, fatal(ErrCodeWriteFailed, "write header", err)
+		return nil, nil, nil, fatal(ErrCodeWriteFailed, "write header", err)
 	}
-	return aw, policy, nil
+	return aw, policy, cfg.signer, nil
 }
 
 // newCredentialedWriter returns an ArchiveWriter openable with password (empty for none)
