@@ -82,6 +82,12 @@ func NewSolidCompressor(level int) (*BlockCompressor, error) {
 	return newCompressor(level, MaxSolidStreamSize)
 }
 
+// NewChunkCompressor returns a BlockCompressor for incremental archive chunks; its
+// window spans MaxCDCChunkSize so a whole chunk is one frame.
+func NewChunkCompressor(level int) (*BlockCompressor, error) {
+	return newCompressor(level, MaxCDCChunkSize)
+}
+
 func newCompressor(level, window int) (*BlockCompressor, error) {
 	if level < MinCompressionLevel || level > MaxCompressionLevel {
 		return nil, fmt.Errorf("%w: %d (want %d-%d)", ErrInvalidCompressionLevel, level, MinCompressionLevel, MaxCompressionLevel)
@@ -132,6 +138,12 @@ func NewBlockDecompressor() (*BlockDecompressor, error) {
 // any frame decoding to more than MaxSolidStreamSize bytes.
 func NewSolidDecompressor() (*BlockDecompressor, error) {
 	return newDecompressor(MaxSolidStreamSize, MaxSolidStreamSize)
+}
+
+// NewChunkDecompressor returns a BlockDecompressor for incremental archive chunks that
+// rejects any frame decoding to more than MaxCDCChunkSize bytes.
+func NewChunkDecompressor() (*BlockDecompressor, error) {
+	return newDecompressor(MaxCDCChunkSize, MaxCDCChunkSize)
 }
 
 func newDecompressor(limit, window int) (*BlockDecompressor, error) {

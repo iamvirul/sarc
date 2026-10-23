@@ -19,6 +19,7 @@ var (
 	flagNoCompress    bool
 	flagCompressLevel int
 	flagSolid         bool
+	flagIncremental   bool
 
 	flagRecipients []string
 	flagIdentities []string

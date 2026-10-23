@@ -335,6 +335,18 @@ func TestCraftedSolidArchiveHelperProducesValidArchive(t *testing.T) {
 	}
 }
 
+func TestSolidMemberInSubdirectoryExtractsThere(t *testing.T) {
+	stream := append(rawSolidRecord("top.txt", []byte("top")), rawSolidRecord("nested/dir/file.txt", []byte("deep"))...)
+	outDir, results := extractAll(t, craftSolidArchive(t, stream))
+	if len(results) != 2 || !results[0].OK || !results[1].OK {
+		t.Fatalf("solid archive with a nested member failed: %+v", results)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "nested", "dir", "file.txt"))
+	if err != nil || string(got) != "deep" {
+		t.Fatalf("nested member = %q, %v", got, err)
+	}
+}
+
 // TestSolidDecompressionBombIsRejected seals a group stream one byte over the maximum;
 // it authenticates, so only the solid decoder's size bound stops it.
 func TestSolidDecompressionBombIsRejected(t *testing.T) {
@@ -344,7 +356,7 @@ func TestSolidDecompressionBombIsRejected(t *testing.T) {
 // TestSolidPathTraversalMemberIsRejected seals an authenticated group whose member name
 // tries to escape the output directory; the whole group must be refused unwritten.
 func TestSolidPathTraversalMemberIsRejected(t *testing.T) {
-	for _, name := range []string{"../escape.txt", "..", "nested/dir.txt"} {
+	for _, name := range []string{"../escape.txt", "..", "/abs.txt", "nested/../../escape.txt", `..\escape.txt`} {
 		t.Run(name, func(t *testing.T) {
 			stream := append(rawSolidRecord("safe.txt", []byte("ok")), rawSolidRecord(name, []byte("evil"))...)
 			requireSolidEntryRejected(t, craftSolidArchive(t, stream))

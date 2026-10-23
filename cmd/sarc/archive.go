@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -38,7 +37,10 @@ func init() {
 		fmt.Sprintf("zstd compression level %d-%d", archive.MinCompressionLevel, archive.MaxCompressionLevel))
 	archiveCmd.Flags().BoolVar(&flagSolid, "solid", false,
 		"pack files up to 1 MiB into shared solid groups compressed as one stream (smaller archives of many small files; one key per group instead of per file)")
+	archiveCmd.Flags().BoolVar(&flagIncremental, "incremental", false,
+		"create the archive at --output, or add a session to it: only new or changed data is written, deleted files are recorded")
 	archiveCmd.MarkFlagsMutuallyExclusive("compress", "no-compress")
+	archiveCmd.MarkFlagsMutuallyExclusive("incremental", "solid")
 	_ = archiveCmd.MarkFlagRequired("output")
 }
 
@@ -54,6 +56,9 @@ func runArchive(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level, "solid", compression.Solid)
+	if flagIncremental {
+		return runIncremental(cmd, args, password, append(credentialOpts, sarcio.WithCompression(compression)))
+	}
 
 	out, err := createArchiveOutput(flagOutput)
 	if err != nil {
@@ -61,12 +66,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 	defer out.Close()
 
-	var totalInputBytes int64
-	for _, path := range args {
-		if info, statErr := os.Stat(path); statErr == nil {
-			totalInputBytes += info.Size()
-		}
-	}
+	totalFiles, totalInputBytes := sarcio.InputTotals(args)
 	if out.file != nil {
 		if err := sarcio.PreallocateOutput(out.file, totalInputBytes); err != nil {
 			log.Debug("preallocate output file skipped", "err", err)
@@ -96,7 +96,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 			log.Error("file failed", "path", path, "err", err)
 		}
 	}
-	return sa.Finalize(len(args), totalInputBytes)
+	return sa.Finalize(totalFiles, totalInputBytes)
 }
 
 // compressionOptions maps the compression flags to archiver options, rejecting

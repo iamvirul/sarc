@@ -24,12 +24,12 @@ const inlineStreamThreshold = minParallelFileSize
 // (workers+resultLookahead) in-memory entries regardless of how many files are archived.
 const resultLookahead = 2
 
-// fileJob carries one indexed file path, or a solid group of member paths, to a worker.
+// fileJob carries one indexed input file, or a solid group of member files, to a worker.
 // inline jobs are not sent to workers; the writer streams them itself.
 type fileJob struct {
 	index   int
-	path    string
-	members []string // non-nil for a solid group job
+	in      inputFile
+	members []inputFile // non-nil for a solid group job
 	inline  bool
 }
 
@@ -77,17 +77,20 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 }
 
 // Archive encrypts all paths concurrently and writes them to the archive in order.
-// Returns the first fatal error, if any. Recoverable per-file errors are reported via progress.
+// Directories are archived recursively (see expandInputs). Returns the first fatal
+// error, if any. Recoverable per-file errors are reported via progress.
 //
 // A single input file cannot be parallelised across the file-level worker pool below
 // (there is only one job), so that case is routed through addFileStreaming instead,
 // which parallelises the block-level AES-256-GCM encryption of that one file across
 // ca.workers goroutines so it still saturates all available cores.
 func (ca *ConcurrentArchiver) Archive(paths []string) error {
-	if len(paths) == 1 {
-		return ca.archiveJobs([]fileJob{{index: 0, path: paths[0], inline: true}}, 1)
+	files, skipped := expandInputs(paths)
+	reportSkipped(skipped, ca.progress)
+	if len(files) == 1 {
+		return ca.archiveJobs([]fileJob{{index: 0, in: files[0], inline: true}}, 1)
 	}
-	return ca.archiveJobs(ca.planJobs(paths), len(paths))
+	return ca.archiveJobs(ca.planJobs(files), len(files))
 }
 
 // archiveJobs runs jobs through the worker pool and writes their entries in job order
@@ -132,7 +135,7 @@ func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, totalFiles int) error 
 	var totalBytes int64
 	for _, j := range jobs {
 		if j.inline {
-			size, err := ca.streamInline(j.path)
+			size, err := ca.streamInline(j.in)
 			if err != nil {
 				return err
 			}
@@ -156,13 +159,13 @@ func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, totalFiles int) error 
 
 // streamInline writes a large file straight to the archive with addFileStreaming. A
 // recoverable failure is reported to progress and skipped; a fatal one is returned.
-func (ca *ConcurrentArchiver) streamInline(path string) (int64, error) {
-	info, statErr := os.Stat(path)
-	if err := addFileStreaming(ca.w, ca.compression, path, ca.workers, ca.progress); err != nil {
+func (ca *ConcurrentArchiver) streamInline(in inputFile) (int64, error) {
+	info, statErr := os.Stat(in.path)
+	if err := addFileStreaming(ca.w, ca.compression, in, ca.workers, ca.progress); err != nil {
 		if isFatal(err) {
 			return 0, err
 		}
-		ca.progress.FileError(path, err)
+		ca.progress.FileError(in.path, err)
 		return 0, nil
 	}
 	if statErr != nil {
@@ -196,22 +199,22 @@ func (ca *ConcurrentArchiver) writeResult(r fileResult) (int64, error) {
 	return r.size, nil
 }
 
-// planJobs returns one job per path, or, in solid mode, one job per individually stored
+// planJobs returns one job per file, or, in solid mode, one job per individually stored
 // file followed by one job per solid group. Files of at least inlineStreamThreshold
 // bytes are marked inline.
-func (ca *ConcurrentArchiver) planJobs(paths []string) []fileJob {
-	individual := paths
-	var groups [][]string
+func (ca *ConcurrentArchiver) planJobs(files []inputFile) []fileJob {
+	individual := files
+	var groups [][]inputFile
 	if ca.compression.solid {
-		plan := planSolid(paths)
+		plan := planSolid(files)
 		individual, groups = plan.individual, plan.groups
 	}
 	jobs := make([]fileJob, 0, len(individual)+len(groups))
-	for _, p := range individual {
-		jobs = append(jobs, fileJob{index: len(jobs), path: p, inline: isLargeFile(p)})
+	for _, f := range individual {
+		jobs = append(jobs, fileJob{index: len(jobs), in: f, inline: isLargeFile(f.path)})
 	}
 	for _, g := range groups {
-		jobs = append(jobs, fileJob{index: len(jobs), path: g[0], members: g})
+		jobs = append(jobs, fileJob{index: len(jobs), in: g[0], members: g})
 	}
 	return jobs
 }
@@ -227,63 +230,64 @@ func isLargeFile(path string) bool {
 func (ca *ConcurrentArchiver) runJob(job fileJob) fileResult {
 	if job.members != nil {
 		entry, members, err := buildSolidEntry(ca.w, ca.compression, job.members, ca.progress)
-		res := fileResult{index: job.index, path: job.path, members: members, err: err, noEntry: entry == nil}
+		res := fileResult{index: job.index, path: job.in.path, members: members, err: err, noEntry: entry == nil}
 		if entry != nil {
 			res.entry = *entry
 		}
 		return res
 	}
-	entry, name, size, err := encryptFile(job.path, ca.w, ca.compression, ca.progress)
-	return fileResult{index: job.index, path: job.path, entry: entry, name: name, size: size, err: err}
+	entry, size, err := encryptFile(job.in, ca.w, ca.compression, ca.progress)
+	return fileResult{index: job.index, path: job.in.path, entry: entry, name: job.in.name, size: size, err: err}
 }
 
-// encryptFile opens path, compresses and encrypts it per compression, and returns a complete FileEntry.
-func encryptFile(path string, aw *archive.ArchiveWriter, compression *compressionPolicy, progress ProgressTracker) (archive.FileEntry, string, int64, error) {
-	f, err := os.Open(path)
+// encryptFile opens in, compresses and encrypts it per compression, and returns a
+// complete FileEntry and the plaintext size.
+func encryptFile(in inputFile, aw *archive.ArchiveWriter, compression *compressionPolicy, progress ProgressTracker) (archive.FileEntry, int64, error) {
+	f, err := os.Open(in.path)
 	if err != nil {
-		return archive.FileEntry{}, path, 0, recoverable(ErrCodeReadFailed, "open file", err)
+		return archive.FileEntry{}, 0, recoverable(ErrCodeReadFailed, "open file", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return archive.FileEntry{}, path, 0, recoverable(ErrCodeReadFailed, "stat file", err)
+		return archive.FileEntry{}, 0, recoverable(ErrCodeReadFailed, "stat file", err)
 	}
 
-	progress.FileStarted(info.Name(), info.Size())
+	progress.FileStarted(in.name, info.Size())
 
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "generate salt", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "generate salt", err)
 	}
 	fileKey, err := aw.DeriveFileKey(salt)
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "derive file key", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "derive file key", err)
 	}
 
 	plaintext, err := io.ReadAll(&progressReader{r: f, progress: progress})
 	if err != nil {
-		return archive.FileEntry{}, path, 0, recoverable(ErrCodeReadFailed, "read file", err)
+		return archive.FileEntry{}, 0, recoverable(ErrCodeReadFailed, "read file", err)
 	}
 
 	plaintextHMAC := crypto.ComputeHMAC(fileKey, plaintext)
-	codec := compression.codecFor(info.Name(), plaintext[:min(len(plaintext), compressionProbeSize)])
+	codec := compression.codecFor(in.name, plaintext[:min(len(plaintext), compressionProbeSize)])
 
 	fb, err := compression.newFrameBuilder(fileKey, codec)
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "init frame builder", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "init frame builder", err)
 	}
 	frameHdr, err := fb.FrameHeader()
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "frame header", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "frame header", err)
 	}
 	mm, err := archive.NewMetadataManager(fileKey)
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "init metadata manager", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "init metadata manager", err)
 	}
-	encName, err := encryptFilename(info.Name(), fileKey)
+	encName, err := encryptFilename(in.name, fileKey)
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "encrypt filename", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "encrypt filename", err)
 	}
 
 	pm := archive.PlaintextMetadata{
@@ -295,19 +299,19 @@ func encryptFile(path string, aw *archive.ArchiveWriter, compression *compressio
 	}
 	metaBlock, err := mm.Seal(pm)
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "seal metadata", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "seal metadata", err)
 	}
 	interPad, err := fb.InterBlockPadding()
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "inter-block padding", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "inter-block padding", err)
 	}
 	dataBlocks, err := fb.EncryptStream(bytes.NewReader(plaintext))
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "encrypt stream", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "encrypt stream", err)
 	}
 	trailer, err := fb.BuildTrailer(plaintextHMAC, uint64(len(plaintext)))
 	if err != nil {
-		return archive.FileEntry{}, path, 0, fatal(ErrCodeWriteFailed, "build trailer", err)
+		return archive.FileEntry{}, 0, fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
 
 	return archive.FileEntry{
@@ -318,5 +322,5 @@ func encryptFile(path string, aw *archive.ArchiveWriter, compression *compressio
 		InterBlockPad: interPad,
 		DataBlocks:    dataBlocks,
 		Trailer:       trailer,
-	}, info.Name(), info.Size(), nil
+	}, info.Size(), nil
 }

@@ -66,3 +66,27 @@ func (ks *KeySchedule) HeaderKey() ([crypto.KeySize]byte, error) {
 	}
 	return key, nil
 }
+
+// ChunkIDKey returns the HMAC key that names chunks in an incremental archive.
+func (ks *KeySchedule) ChunkIDKey() ([crypto.KeySize]byte, error) {
+	if ks.version == Version1 {
+		return [crypto.KeySize]byte{}, fmt.Errorf("%w: no chunk keys for version %d", ErrUnsupportedVersion, ks.version)
+	}
+	key, err := crypto.DeriveChunkIDKey(ks.masterKey)
+	if err != nil {
+		return key, fmt.Errorf("archive/keys: chunk id key: %w", err)
+	}
+	return key, nil
+}
+
+// GearTable returns the secret gear table for content-defined chunking.
+func (ks *KeySchedule) GearTable() ([crypto.GearTableSize]uint64, error) {
+	if ks.version == Version1 {
+		return [crypto.GearTableSize]uint64{}, fmt.Errorf("%w: no chunk keys for version %d", ErrUnsupportedVersion, ks.version)
+	}
+	table, err := crypto.DeriveGearTable(ks.masterKey)
+	if err != nil {
+		return table, fmt.Errorf("archive/keys: gear table: %w", err)
+	}
+	return table, nil
+}

@@ -6,7 +6,7 @@ package io
 import (
 	"io"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 
@@ -16,8 +16,8 @@ import (
 
 // solidPlan splits archive inputs into individually stored files and solid groups.
 type solidPlan struct {
-	individual []string
-	groups     [][]string
+	individual []inputFile
+	groups     [][]inputFile
 }
 
 // planSolid packs regular files of at most archive.SolidMemberMaxSize into groups whose
@@ -25,25 +25,25 @@ type solidPlan struct {
 // extension so similar content shares a compression window. Everything else, including
 // paths that cannot be stat'ed (their error surfaces when archived), stays individual,
 // as does a group of one, where grouping gains nothing.
-func planSolid(paths []string) solidPlan {
+func planSolid(files []inputFile) solidPlan {
 	type candidate struct {
-		path   string
+		in     inputFile
 		ext    string
 		record int
 	}
 	var plan solidPlan
 	var candidates []candidate
-	for _, p := range paths {
-		record, ok := solidCandidate(p)
+	for _, f := range files {
+		record, ok := solidCandidate(f)
 		if !ok {
-			plan.individual = append(plan.individual, p)
+			plan.individual = append(plan.individual, f)
 			continue
 		}
-		candidates = append(candidates, candidate{path: p, ext: strings.ToLower(filepath.Ext(p)), record: record})
+		candidates = append(candidates, candidate{in: f, ext: strings.ToLower(path.Ext(f.name)), record: record})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].ext < candidates[j].ext })
 
-	var group []string
+	var group []inputFile
 	groupSize := 0
 	flush := func() {
 		switch len(group) {
@@ -59,23 +59,21 @@ func planSolid(paths []string) solidPlan {
 		if groupSize+c.record > archive.MaxSolidStreamSize {
 			flush()
 		}
-		group = append(group, c.path)
+		group = append(group, c.in)
 		groupSize += c.record
 	}
 	flush()
 	return plan
 }
 
-// solidCandidate reports whether path can join a solid group and, if so, the estimated
-// size of its record: it must be a regular file of at most archive.SolidMemberMaxSize
-// with a name a solid record can hold.
-func solidCandidate(path string) (int, bool) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > archive.SolidMemberMaxSize ||
-		!archive.ValidSolidMemberName(info.Name()) {
+// solidCandidate reports whether in can join a solid group and, if so, the estimated
+// size of its record: it must be a regular file of at most archive.SolidMemberMaxSize.
+func solidCandidate(in inputFile) (int, bool) {
+	info, err := os.Stat(in.path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > archive.SolidMemberMaxSize {
 		return 0, false
 	}
-	return archive.SolidRecordSize(len(info.Name()), int(info.Size())), true
+	return archive.SolidRecordSize(len(in.name), int(info.Size())), true
 }
 
 // solidMemberResult is the outcome of packing one file into a solid group.
@@ -89,13 +87,13 @@ type solidMemberResult struct {
 // buildSolidEntry packs paths into one record stream, compresses it per policy, and
 // seals it as a solid group entry. Members that cannot be read are skipped and reported
 // in the results with recoverable errors. The entry is nil when no member was readable.
-func buildSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, paths []string, progress ProgressTracker) (*archive.FileEntry, []solidMemberResult, error) {
+func buildSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, members []inputFile, progress ProgressTracker) (*archive.FileEntry, []solidMemberResult, error) {
 	stream := make([]byte, 0, archive.MaxSolidStreamSize)
-	results := make([]solidMemberResult, 0, len(paths))
+	results := make([]solidMemberResult, 0, len(members))
 	packed := 0
-	for _, p := range paths {
+	for _, m := range members {
 		var res solidMemberResult
-		stream, res = appendSolidMember(stream, p, progress)
+		stream, res = appendSolidMember(stream, m, progress)
 		results = append(results, res)
 		if res.err == nil {
 			packed++
@@ -111,11 +109,11 @@ func buildSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, paths
 	return &entry, results, nil
 }
 
-// appendSolidMember reads path and appends its record to stream. On failure stream is
+// appendSolidMember reads in and appends its record to stream. On failure stream is
 // returned unchanged and the result carries a recoverable error.
-func appendSolidMember(stream []byte, path string, progress ProgressTracker) ([]byte, solidMemberResult) {
-	res := solidMemberResult{path: path, name: filepath.Base(path)}
-	f, err := os.Open(path)
+func appendSolidMember(stream []byte, in inputFile, progress ProgressTracker) ([]byte, solidMemberResult) {
+	res := solidMemberResult{path: in.path, name: in.name}
+	f, err := os.Open(in.path)
 	if err != nil {
 		res.err = recoverable(ErrCodeReadFailed, "open file", err)
 		return stream, res
@@ -127,8 +125,7 @@ func appendSolidMember(stream []byte, path string, progress ProgressTracker) ([]
 		res.err = recoverable(ErrCodeReadFailed, "stat file", err)
 		return stream, res
 	}
-	res.name = info.Name()
-	progress.FileStarted(info.Name(), info.Size())
+	progress.FileStarted(in.name, info.Size())
 
 	// Read one byte past the member limit to detect a file that grew after planning.
 	data, err := io.ReadAll(io.LimitReader(&progressReader{r: f, progress: progress}, archive.SolidMemberMaxSize+1))
@@ -137,12 +134,12 @@ func appendSolidMember(stream []byte, path string, progress ProgressTracker) ([]
 		return stream, res
 	}
 	if len(data) > archive.SolidMemberMaxSize ||
-		len(stream)+archive.SolidRecordSize(len(info.Name()), len(data)) > archive.MaxSolidStreamSize {
+		len(stream)+archive.SolidRecordSize(len(in.name), len(data)) > archive.MaxSolidStreamSize {
 		res.err = recoverable(ErrCodeReadFailed, "file changed size during archive", nil)
 		return stream, res
 	}
 	out, err := archive.AppendSolidRecord(stream, archive.SolidMember{
-		Name:        info.Name(),
+		Name:        in.name,
 		Permissions: uint32(info.Mode().Perm()),
 		Data:        data,
 	})
@@ -157,6 +154,19 @@ func appendSolidMember(stream []byte, path string, progress ProgressTracker) ([]
 // sealSolidEntry compresses stream per policy and seals it as a solid group entry under
 // a fresh entry salt. The HMAC and recorded size cover the uncompressed stream.
 func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream []byte) (archive.FileEntry, error) {
+	codec := policy.solidCodecFor(stream)
+	payload := stream
+	if codec == archive.CodecZstd {
+		payload = policy.solidCompressor.Compress(nil, stream)
+	}
+	return sealPayloadEntry(aw, archive.EntryTypeSolid, codec, payload, stream)
+}
+
+// sealPayloadEntry seals an in-memory entry of entryType under a fresh entry salt: its
+// metadata records codec and plaintext's size bucket, payload (plaintext already
+// encoded per codec) fills the data blocks, and the trailer HMAC and size cover
+// plaintext.
+func sealPayloadEntry(aw *archive.ArchiveWriter, entryType byte, codec archive.Codec, payload, plaintext []byte) (archive.FileEntry, error) {
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "generate salt", err)
@@ -164,12 +174,6 @@ func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream
 	fileKey, err := aw.DeriveFileKey(salt)
 	if err != nil {
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "derive file key", err)
-	}
-
-	codec := policy.solidCodecFor(stream)
-	payload := stream
-	if codec == archive.CodecZstd {
-		payload = policy.solidCompressor.Compress(nil, stream)
 	}
 
 	// The payload is already encoded, so the FrameBuilder seals chunks as-is.
@@ -186,7 +190,7 @@ func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "init metadata manager", err)
 	}
 	meta, err := mm.Seal(archive.PlaintextMetadata{
-		SizeBucket: archive.BucketizeSize(int64(len(stream))),
+		SizeBucket: archive.BucketizeSize(int64(len(plaintext))),
 		Codec:      codec,
 	})
 	if err != nil {
@@ -202,18 +206,18 @@ func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream
 		n := min(fb.NextChunkSize(), len(payload)-off)
 		db, err := fb.EncryptChunk(payload[off : off+n])
 		if err != nil {
-			return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "encrypt solid block", err)
+			return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "encrypt block", err)
 		}
 		blocks = append(blocks, db)
 		off += n
 	}
 
-	trailer, err := fb.BuildTrailer(crypto.ComputeHMAC(fileKey, stream), uint64(len(stream)))
+	trailer, err := fb.BuildTrailer(crypto.ComputeHMAC(fileKey, plaintext), uint64(len(plaintext)))
 	if err != nil {
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
 	return archive.FileEntry{
-		EntryType:     archive.EntryTypeSolid,
+		EntryType:     entryType,
 		EntrySalt:     salt,
 		FrameHdr:      frameHdr,
 		Metadata:      meta,
@@ -313,7 +317,12 @@ func (se *SafeExtractor) extractSolidBody(keys *archive.KeySchedule, head entryH
 	}
 	results := make([]ExtractionResult, 0, len(members))
 	for _, m := range members {
-		outPath := filepath.Join(outputDir, filepath.Base(m.Name))
+		outPath, err := entryOutputPath(outputDir, m.Name)
+		if err != nil {
+			se.progress.FileError(m.Name, err)
+			results = append(results, ExtractionResult{Filename: m.Name, Err: err})
+			continue
+		}
 		if err := os.WriteFile(outPath, m.Data, os.FileMode(m.Permissions).Perm()); err != nil {
 			writeErr := recoverable(ErrCodeWriteFailed, "write file", err)
 			se.progress.FileError(m.Name, writeErr)

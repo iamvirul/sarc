@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // A solid group entry uses the same framing as a file entry (salt, frame header, sealed
@@ -27,7 +26,6 @@ const (
 	MaxSolidStreamSize = 8 << 20
 	// solidRecordHeaderSize is the fixed part of a record (name, permissions, data lengths).
 	solidRecordHeaderSize = 2 + 4 + 8
-	maxSolidNameLen       = 0xFFFF
 )
 
 // ErrMalformedSolidStream is returned when a solid record stream cannot be parsed.
@@ -46,16 +44,9 @@ func SolidRecordSize(nameLen, dataLen int) int {
 	return solidRecordHeaderSize + nameLen + dataLen
 }
 
-// ValidSolidMemberName reports whether name can be stored in a solid group: a non-empty
-// base name of at most 64 KiB with no path separator or NUL, and not "." or "..".
-func ValidSolidMemberName(name string) bool {
-	return name != "" && len(name) <= maxSolidNameLen && name != "." && name != ".." &&
-		!strings.ContainsAny(name, "/\x00")
-}
-
 // AppendSolidRecord appends the encoded record for m to dst.
 func AppendSolidRecord(dst []byte, m SolidMember) ([]byte, error) {
-	if !ValidSolidMemberName(m.Name) {
+	if !ValidEntryName(m.Name) {
 		return dst, fmt.Errorf("archive/solid: invalid member name")
 	}
 	var hdr [8]byte
@@ -84,7 +75,7 @@ func ParseSolidStream(stream []byte) ([]SolidMember, error) {
 		}
 		name := string(stream[off : off+nameLen])
 		off += nameLen
-		if !ValidSolidMemberName(name) {
+		if !ValidEntryName(name) {
 			return nil, fmt.Errorf("%w: invalid member name", ErrMalformedSolidStream)
 		}
 		perms := binary.LittleEndian.Uint32(stream[off:])
