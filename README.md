@@ -79,6 +79,15 @@ sarc archive --password "StrongPass123" --incremental --output backup.sarc ./dat
 # session 2: 3 file(s) changed (412 MB), 97 unchanged, 1 deleted; appended 8.03 MB in 7 new chunk(s)
 sarc extract --password "StrongPass123" --archive backup.sarc --output ./restored/
 
+# Split archives: volumes of at most the given size (for upload limits or several
+# drives), named backup.sarc.001, .002, ... Name any volume, or the base name, to extract;
+# a missing, damaged, reordered, or foreign volume is reported by number. Units follow
+# GNU split: K/M/G are powers of 1024, KB/MB/GB powers of 1000.
+sarc archive --password "pass" --split 2GB --output backup.sarc files/
+sarc extract --password "pass" --archive backup.sarc.001 --output ./out
+sarc verify --archive backup.sarc            # every volume present and intact
+cat backup.sarc.* | sarc extract --password "pass" --archive - --output ./out
+
 # Signing: prove who created an archive, not just that it is intact. Signatures are
 # standard SSH signatures, so existing SSH keys work, and checking one needs no password.
 sarc keygen --signing --output signing.key       # writes signing.key and signing.key.pub

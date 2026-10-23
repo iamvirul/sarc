@@ -262,6 +262,34 @@ header | (pack* index)+ | checkpoint | end marker | footer
 - Limits: indexes are bounded at 256 MiB, chunk and pack sizes are checked when an index
   is parsed, and a file's chunks must add up to its recorded size.
 
+## Split archives
+
+`--split SIZE` cuts the archive stream into volume files `<output>.001`, `.002`, ... of
+at most SIZE bytes each:
+
+```
+volume := header(40) | payload | checksum(32)
+header := "SARCVOL1" | archive_id(16) | index(4) | flags(1) | reserved(3) | payload_len(8)
+checksum := SHA-256(payload || header)
+```
+
+- Concatenating the payloads in order gives back the single-file archive exactly, so the
+  archive format, the readers, and signatures are unchanged; splitting adds 72 bytes per
+  volume. `archive_id` is random per archive; the last volume sets flag `0x01`.
+- Reading a split archive (named by any volume or the base name) first checks every
+  volume's header and size: present, same archive ID, numbered in sequence, length as
+  declared, up to the volume marked last. Each volume's checksum is verified as it is
+  read. Failures are `io.VolumeError` values naming the volume and file, so a missing,
+  truncated, corrupted, reordered, or foreign volume is identified.
+- Volumes concatenated into one stream (`cat backup.sarc.* | sarc extract -a -`) are
+  recognised by the volume magic and joined the same way.
+- The writer creates volumes as data arrives and rewrites the last header with its
+  length and flag on close. Stale volumes numbered after the last one, left by an earlier
+  and larger archive of the same name, are removed if they start with the volume magic.
+- The checksum, like the footer, detects corruption; authenticity still comes from the
+  archive's keys. Split output needs files, so it cannot go to stdout, and incremental
+  archives (which need one random-access file) cannot be split.
+
 ## Signatures
 
 An archive can carry one SSH signature (OpenSSH's PROTOCOL.sshsig format) after its
