@@ -214,7 +214,7 @@ jobs:
           git push
 
       - name: Post benchmark results as PR comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           SARC_ARCHIVE_MS: ${{ env.SARC_ARCHIVE_MS }}
           ZIP_ARCHIVE_MS:  ${{ env.ZIP_ARCHIVE_MS }}
