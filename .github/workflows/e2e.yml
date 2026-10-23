@@ -3,8 +3,9 @@ name: Live examples
 # Runs the README's sarc commands for real on Linux and macOS (scripts/e2e.sh): piping
 # archive into extract, curl into extract, multi-recipient archives with the real age
 # CLI, solid mode, verify from stdin, truncated and wrong-password failures, key files,
-# SSH keys, a hardware-token-style age plugin, directory trees, incremental backups, a
-# constant-memory streaming extract, and refusing binary output to a terminal.
+# SSH keys, a hardware-token-style age plugin, directory trees, incremental backups,
+# signed archives (also checked with ssh-keygen), a constant-memory streaming extract,
+# and refusing binary output to a terminal.
 # Any broken example fails the run; results appear in the job summary.
 
 on:
