@@ -21,7 +21,7 @@ func TestIsTerminalFalseForRegularFile(t *testing.T) {
 }
 
 func TestCreateArchiveOutputFileSendsProgressToStdout(t *testing.T) {
-	out, err := createArchiveOutput(filepath.Join(t.TempDir(), "a.sarc"))
+	out, err := createArchiveOutput(filepath.Join(t.TempDir(), "a.sarc"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
