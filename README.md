@@ -79,6 +79,15 @@ sarc archive --password "StrongPass123" --incremental --output backup.sarc ./dat
 # session 2: 3 file(s) changed (412 MB), 97 unchanged, 1 deleted; appended 8.03 MB in 7 new chunk(s)
 sarc extract --password "StrongPass123" --archive backup.sarc --output ./restored/
 
+# Signing: prove who created an archive, not just that it is intact. Signatures are
+# standard SSH signatures, so existing SSH keys work, and checking one needs no password.
+sarc keygen --signing --output signing.key       # writes signing.key and signing.key.pub
+sarc archive --password "pass" --sign signing.key --output release.sarc files/
+sarc sign --signing-key ~/.ssh/id_ed25519 --archive old.sarc   # sign an existing archive
+sarc verify --archive release.sarc --signer signing.key.pub
+# signature VALID: signed by SHA256:2B5w0n/WSq... (ssh-ed25519), sarc signing key
+# integrity check PASSED
+
 # Check the archive checksum for corruption (no password required)
 sarc verify --archive backup.sarc
 
@@ -121,6 +130,7 @@ Per-file mode stays larger than zip on small-file trees because every entry carr
 | Solid groups (`--solid`) | Small files share one entry: one key, one padding set, one HMAC per group of up to 8 MiB |
 | Incremental archives (`--incremental`) | Files are split into content-defined chunks (about 1 MiB) whose boundaries depend on a secret derived from the archive key; chunks are named by keyed HMAC, deduplicated within the archive, and packed into encrypted, padded pack entries, so chunk boundaries and identities never appear outside the encryption. The header seals the session count, so cutting off the newest sessions is detected |
 | Container checksum | SHA-256 over the archive body in the footer, checked by `sarc verify` without a password. It is not keyed: it detects accidental corruption, not tampering |
+| Provenance (`--sign`, `sign`) | Optional SSH signature (Ed25519, ECDSA, or RSA with SHA-512) over the footer checksum, appended after the footer. `verify --signer` recomputes the checksum and requires a valid signature by a trusted key, without the password; knowing the password does not let anyone forge it |
 | Authenticity | Every entry is authenticated by its GCM tags and a sealed plaintext HMAC, and the header by the recipient block; `extract` and `list` reject anything modified, including when streaming |
 
 Compression trade-off: compressing before encrypting makes ciphertext size depend on how
@@ -139,6 +149,13 @@ deduplication within one archive makes it smaller than the sum of its files. The
 content in two different incremental archives shares nothing, because the chunking
 secret and keys differ. Restoring needs random access, so an incremental archive must be
 extracted from a file, not a pipe.
+
+Signature scope: a signature proves which key signed the archive's exact bytes, and
+reveals that key's public half to anyone holding the archive. It says nothing about who
+can decrypt it. Any change, including an incremental update, invalidates it: updates
+re-sign with `--sign` or remove the stale signature and say so. Because signatures are
+standard SSH signatures in the `sarc-archive` namespace over the 32-byte footer checksum,
+`ssh-keygen -Y verify` can check them without sarc (see ARCHITECTURE.md).
 
 Recipient privacy: age X25519 recipients are anonymous, but age's SSH stanzas and most
 hardware-token stanzas carry a short fingerprint of the recipient key. Anyone holding a
