@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	sarcio "github.com/iamvirul/sarc/io"
 )
 
 // stdioPath as --archive or archive --output means stdin or stdout, for pipelines.
@@ -86,4 +88,19 @@ func (out *archiveOutput) Close() error {
 		return nil
 	}
 	return out.file.Close()
+}
+
+// randomAccess returns the extractor option giving random access to a regular archive
+// file, including stdin redirected from one, which incremental archives need. It
+// returns none for a pipe.
+func (in *archiveInput) randomAccess() []sarcio.ExtractorOption {
+	f := in.file
+	if f == nil {
+		f = os.Stdin
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+	return []sarcio.ExtractorOption{sarcio.WithRandomAccess(f, info.Size())}
 }

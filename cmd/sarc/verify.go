@@ -4,7 +4,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -52,12 +51,13 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// verifyStream reports whether the SHA-256 of everything in r before the footer matches
-// the checksum stored in the footer. It reads r once without seeking, holding back the
-// last footer-sized bytes, so it works on pipes; the comparison is constant time.
+// verifyStream reports whether the archive checksum (see archive.ArchiveChecksum) of
+// everything in r before the footer matches the checksum stored in the footer. It reads
+// r once without seeking, holding back the last footer-sized bytes, so it works on
+// pipes; the comparison is constant time.
 func verifyStream(r io.Reader) (bool, error) {
 	const footerSize = archive.HMACSize + archive.ReservedSize
-	h := sha256.New()
+	h := archive.NewArchiveChecksum()
 	work := make([]byte, footerSize+verifyChunkSize)
 	held := 0
 	for {

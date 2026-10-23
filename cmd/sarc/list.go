@@ -34,7 +34,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	}
 	defer f.Close()
 
-	ex := sarcio.NewSafeExtractor(f, flagPassword, sarcio.NopProgressTracker{}, opts...)
+	ex := sarcio.NewSafeExtractor(f, flagPassword, sarcio.NopProgressTracker{}, append(opts, f.randomAccess()...)...)
 	results, err := ex.List()
 	if err != nil {
 		return err
