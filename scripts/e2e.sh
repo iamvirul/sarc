@@ -377,6 +377,39 @@ example_signed_archive() {
   echo "archive --sign through a pipe, sign with an ssh-keygen key; untrusted, unsigned, and tampered refused; ssh-keygen verifies it too"
 }
 
+example_split_archive() {
+  mkdir -p media
+  head -c $((64 * 1048576)) /dev/urandom >media/video.raw
+  cp in/app.log media/
+  "$SARC" archive -p "$PASS" --split 20MB -o vol.sarc media >/dev/null
+  local volumes v
+  volumes="$(find . -maxdepth 1 -name 'vol.sarc.*' | wc -l | tr -d ' ')"
+  [ "$volumes" = 4 ] || { echo "64 MB in 20 MB volumes made $volumes volumes, want 4"; return 1; }
+  for v in vol.sarc.*; do
+    [ "$(wc -c <"$v" | tr -d ' ')" -le 20000000 ] || { echo "$v exceeds 20 MB"; return 1; }
+  done
+  "$SARC" extract -p "$PASS" -a vol.sarc.002 -o out-split >/dev/null
+  diff -r media out-split/media >/dev/null || { echo "extract from volume 2 differs"; return 1; }
+  cat vol.sarc.0* | "$SARC" extract -p "$PASS" -a - -o out-cat >/dev/null
+  diff -r media out-cat/media >/dev/null || { echo "extract of concatenated volumes differs"; return 1; }
+  "$SARC" verify -a vol.sarc | grep -q "all 4 volume(s) present and intact"
+
+  local err
+  mv vol.sarc.003 held.003
+  if err="$("$SARC" extract -p "$PASS" -a vol.sarc.001 -o out-missing 2>&1)"; then echo "extracted with a volume missing"; return 1; fi
+  echo "$err" | grep -q "volume 3 (vol.sarc.003): missing" || { echo "unclear missing-volume error: $err"; return 1; }
+  [ ! -e out-missing ] || { echo "extraction started without every volume"; return 1; }
+  mv held.003 vol.sarc.003
+  cp vol.sarc.002 corrupt.002
+  local byte
+  byte="$(od -An -tu1 -j 1000000 -N 1 corrupt.002 | tr -d ' ')"
+  # shellcheck disable=SC2059
+  printf "\\$(printf '%03o' $((byte ^ 1)))" | dd of=vol.sarc.002 bs=1 seek=1000000 conv=notrunc 2>/dev/null
+  if err="$("$SARC" verify -a vol.sarc 2>&1)"; then echo "verify accepted a corrupted volume"; return 1; fi
+  echo "$err" | grep -q "volume 2 (vol.sarc.002): corrupted" || { echo "unclear corrupted-volume error: $err"; return 1; }
+  echo "64 MB in 20 MB volumes: 4 files; extract from volume 2 or cat; missing volume 3 and corrupted volume 2 named"
+}
+
 example_constant_memory() {
   head -c "$((BIG_MB * 1048576))" /dev/urandom >big.bin
   local want rss
@@ -414,6 +447,7 @@ run_example "Hardware token plugin" example_hardware_token_plugin
 run_example "Directory tree" example_directory_tree
 run_example "Incremental backup" example_incremental_backup
 run_example "Signed archive" example_signed_archive
+run_example "Split archive" example_split_archive
 run_example "Constant memory streaming extract" example_constant_memory
 run_example "Refuse terminal output" example_refuses_terminal
 
