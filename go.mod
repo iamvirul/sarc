@@ -1,6 +1,6 @@
 module github.com/iamvirul/sarc
 
-go 1.25.5
+go 1.25.13
 
 require (
 	filippo.io/age v1.3.2
