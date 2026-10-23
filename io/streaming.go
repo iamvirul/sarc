@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
 )
@@ -25,6 +27,8 @@ const minParallelFileSize = 4 * 1024 * 1024
 // next one would overflow a group, and at Finalize.
 type StreamingArchiver struct {
 	w           *archive.ArchiveWriter
+	out         io.Writer
+	signer      ssh.Signer
 	compression *compressionPolicy
 	progress    ProgressTracker
 	start       time.Time
@@ -36,14 +40,14 @@ type StreamingArchiver struct {
 // (empty for none) and any recipients added with WithAgeRecipients; at least one is
 // required. Compression defaults to CompressionAuto at level 3; override with WithCompression.
 func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker, opts ...ArchiverOption) (*StreamingArchiver, error) {
-	aw, compression, err := openArchiveWriter(w, password, opts)
+	aw, compression, signer, err := openArchiveWriter(w, password, opts)
 	if err != nil {
 		return nil, err
 	}
 	if progress == nil {
 		progress = NopProgressTracker{}
 	}
-	return &StreamingArchiver{w: aw, compression: compression, progress: progress, start: time.Now()}, nil
+	return &StreamingArchiver{w: aw, out: w, signer: signer, compression: compression, progress: progress, start: time.Now()}, nil
 }
 
 // AddFile reads path from disk and appends it to the archive as a single file entry.
@@ -253,8 +257,8 @@ func (sa *StreamingArchiver) Finalize(totalFiles int, totalBytes int64) error {
 	if err := sa.flushSolid(); err != nil {
 		return err
 	}
-	if err := sa.w.WriteFooter(); err != nil {
-		return fatal(ErrCodeWriteFailed, "write footer", err)
+	if err := finishArchive(sa.w, sa.out, sa.signer); err != nil {
+		return err
 	}
 	sa.progress.Done(totalFiles, totalBytes, time.Since(sa.start))
 	return nil

@@ -55,10 +55,15 @@ func (se *SafeExtractor) openIncremental(keys *archive.KeySchedule) (*incrementa
 	if se.random == nil {
 		return nil, fatal(ErrCodeInvalidOption, "incremental archives must be read from a file, not a pipe", nil)
 	}
-	return loadIncremental(se.random, se.randomSize, keys, se.header)
+	proper, _, err := splitSignature(se.random, se.randomSize)
+	if err != nil {
+		return nil, err
+	}
+	return loadIncremental(se.random, proper, keys, se.header)
 }
 
-// loadIncremental reads the session index chain from the newest session back to the
+// loadIncremental reads the incremental archive in the first size bytes of ra (the
+// archive proper, without any signature block). It reads the session index chain from the newest session back to the
 // first and applies it in order. The newest session is found through the checkpoint,
 // or, when the tail is damaged (an interrupted update), by scanning forward for the
 // last complete index. A newest session older than the header's sealed session count

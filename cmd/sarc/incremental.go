@@ -40,6 +40,9 @@ func runIncremental(cmd *cobra.Command, args []string, password string, opts []s
 		return err
 	}
 	printIncrementalResult(out, res)
+	if res.SignatureRemoved {
+		fmt.Fprintln(cmd.ErrOrStderr(), "note: the archive changed, so its signature was removed; sign it again with sarc sign or --sign")
+	}
 	if !res.Created && len(flagRecipients) > 0 {
 		fmt.Fprintln(cmd.ErrOrStderr(), "note: --recipient was ignored; recipients are fixed when an incremental archive is created")
 	}
@@ -57,11 +60,17 @@ func printIncrementalResult(w io.Writer, res sarcio.IncrementalResult) {
 	case res.Created:
 		fmt.Fprintf(w, "created incremental archive: session 1, %d file(s) (%s), %d chunk(s), %s written\n",
 			res.Changed, sarcio.FormatBytes(res.ChangedBytes), res.NewChunks, sarcio.FormatBytes(res.AppendedBytes))
+	case res.Changed == 0 && res.Deleted == 0 && res.Signed:
+		fmt.Fprintf(w, "no changes since session %d (%d file(s) unchanged); archive signed\n", res.Session, res.Unchanged)
+		return
 	case res.Changed == 0 && res.Deleted == 0:
 		fmt.Fprintf(w, "no changes since session %d; archive not modified (%d file(s) unchanged)\n", res.Session, res.Unchanged)
 	default:
 		fmt.Fprintf(w, "session %d: %d file(s) changed (%s), %d unchanged, %d deleted; appended %s in %d new chunk(s)\n",
 			res.Session, res.Changed, sarcio.FormatBytes(res.ChangedBytes), res.Unchanged, res.Deleted,
 			sarcio.FormatBytes(res.AppendedBytes), res.NewChunks)
+	}
+	if res.Signed {
+		fmt.Fprintln(w, "archive signed")
 	}
 }

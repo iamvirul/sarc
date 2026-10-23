@@ -57,6 +57,11 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
 [ARCHIVE FOOTER]
   archive_hmac(32)      SHA-256 of all bytes preceding the footer, end marker included
   reserved(32)
+
+[SIGNATURE BLOCK]       optional, after the footer (see Signatures)
+  signature             SSH signature (PROTOCOL.sshsig) over archive_hmac
+  signature_len(4)
+  magic(8)              "SARCSIG1"
 ```
 
 The reader loops on `entry_type`: `0x01` starts a file entry and, in version 2, `0x02`
@@ -257,6 +262,34 @@ header | (pack* index)+ | checkpoint | end marker | footer
 - Limits: indexes are bounded at 256 MiB, chunk and pack sizes are checked when an index
   is parsed, and a file's chunks must add up to its recorded size.
 
+## Signatures
+
+An archive can carry one SSH signature (OpenSSH's PROTOCOL.sshsig format) after its
+footer. It signs the 32-byte footer checksum, which commits to every byte before the
+footer, so signing and verifying never need the password, and re-signing after an
+incremental update costs nothing beyond the update.
+
+- Signed data: `"SSHSIG" | namespace "sarc-archive" | reserved "" | "sha512" |
+  SHA-512(checksum)`, as ssh-keygen signs it. Keys: Ed25519, ECDSA (P-256/384/521), and
+  RSA of at least 2048 bits signing with rsa-sha2-512; security-key (sk-) signatures can
+  be verified. SHA-1 RSA signatures are refused.
+- The block is outside the archive proper: readers stop at the end marker, so extraction
+  (streaming too) ignores it. An unsigned archive ends with the footer's zero reserved
+  bytes, which never match the trailer magic.
+- `verify` streams the archive holding back its last 16 KiB + 76 bytes, recomputes the
+  checksum, and verifies the signature against the recomputed value, not the stored
+  footer. With `--signer` it requires the signature to be valid and by one of the given
+  keys (`.pub`, authorized_keys, allowed_signers, or PEM public key files).
+- `sign` recomputes the checksum first and refuses a corrupted archive, then appends the
+  block, replacing any existing one, without rewriting the archive.
+- Incremental archives: a run that changes the archive re-signs with `--sign`, or removes
+  the old signature (which no longer matches) and reports it. A run with no change keeps
+  a signature that still holds; a failed update restores it with the old tail.
+- Checking without sarc: take `signature_len` from the last 12 bytes, the signature
+  before them, and the checksum from the first 32 bytes of the footer (64 bytes before
+  the signature); armor the signature as `-----BEGIN SSH SIGNATURE-----` base64 and run
+  `ssh-keygen -Y verify -n sarc-archive -f allowed_signers -I <id> -s sig < checksum`.
+
 ## Error recovery
 
 A failure inside one entry (authentication, decompression, integrity) is recoverable: the
@@ -311,3 +344,4 @@ pipes (`--output -`, `--archive -`) with no format change and no temporary archi
 - GCM tag is verified by `cipher.AEAD.Open` before any plaintext is returned
 - Plaintext HMAC is verified in constant time after decryption, before an extracted file is renamed to its final name
 - Error messages never include key material, decrypted filenames, or internal stack traces
+- Archive signatures are verified against the recomputed checksum, and only Ed25519, ECDSA, and RSA (SHA-512, 2048+ bits) are accepted

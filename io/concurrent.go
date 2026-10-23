@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
 )
@@ -52,6 +54,8 @@ type fileResult struct {
 // and writes entries to the archive in original submission order.
 type ConcurrentArchiver struct {
 	w           *archive.ArchiveWriter
+	out         io.Writer
+	signer      ssh.Signer
 	compression *compressionPolicy
 	workers     int
 	progress    ProgressTracker
@@ -66,14 +70,16 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	aw, compression, err := openArchiveWriter(w, password, opts)
+	aw, compression, signer, err := openArchiveWriter(w, password, opts)
 	if err != nil {
 		return nil, err
 	}
 	if progress == nil {
 		progress = NopProgressTracker{}
 	}
-	return &ConcurrentArchiver{w: aw, compression: compression, workers: workers, progress: progress, start: time.Now()}, nil
+	return &ConcurrentArchiver{
+		w: aw, out: w, signer: signer, compression: compression, workers: workers, progress: progress, start: time.Now(),
+	}, nil
 }
 
 // Archive encrypts all paths concurrently and writes them to the archive in order.
@@ -150,8 +156,8 @@ func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, totalFiles int) error 
 		}
 		totalBytes += size
 	}
-	if err := ca.w.WriteFooter(); err != nil {
-		return fatal(ErrCodeWriteFailed, "write footer", err)
+	if err := finishArchive(ca.w, ca.out, ca.signer); err != nil {
+		return err
 	}
 	ca.progress.Done(totalFiles, totalBytes, time.Since(ca.start))
 	return nil

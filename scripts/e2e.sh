@@ -332,6 +332,51 @@ example_incremental_backup() {
   echo "unchanged rerun writes 0 bytes; 1 byte changed in ${BIG_MB} MB appends $((grown / 1024)) KB; deletions not restored"
 }
 
+example_signed_archive() {
+  "$SARC" keygen --signing -o release.key 2>/dev/null
+  ssh-keygen -q -t ed25519 -N "" -C ops@example -f ops_key
+  "$SARC" archive -p "$PASS" --sign release.key -o - in/* 2>/dev/null >signed.sarc
+  nonempty signed.sarc
+  "$SARC" verify -a - --signer release.key.pub <signed.sarc | grep -q "signature VALID"
+  if "$SARC" verify -a signed.sarc --signer ops_key.pub >/dev/null 2>&1; then
+    echo "verify accepted a signature by an untrusted key"; return 1
+  fi
+  "$SARC" extract -p "$PASS" -a - -o out-signed <signed.sarc >/dev/null && same_files in out-signed
+
+  "$SARC" archive -p "$PASS" -o plain.sarc in/* >/dev/null
+  if "$SARC" verify -a plain.sarc --signer ops_key.pub >/dev/null 2>&1; then
+    echo "verify --signer accepted an unsigned archive"; return 1
+  fi
+  "$SARC" sign -s ops_key -a plain.sarc >/dev/null
+  "$SARC" verify -a plain.sarc --signer ops_key.pub | grep -q "signature VALID"
+
+  cp signed.sarc tampered.sarc
+  local byte
+  byte="$(od -An -tu1 -j 4000 -N 1 signed.sarc | tr -d ' ')"
+  # shellcheck disable=SC2059
+  printf "\\$(printf '%03o' $((byte ^ 1)))" | dd of=tampered.sarc bs=1 seek=4000 conv=notrunc 2>/dev/null
+  if "$SARC" verify -a tampered.sarc --signer release.key.pub >/dev/null 2>&1; then
+    echo "verify accepted a tampered signed archive"; return 1
+  fi
+
+  # Check the signature without sarc: it is an SSH signature over the footer checksum.
+  local size siglen proper
+  size="$(wc -c <plain.sarc | tr -d ' ')"
+  siglen="$(od -An -tu4 -j $((size - 12)) -N 4 plain.sarc | tr -d ' ')"
+  proper=$((size - 12 - siglen))
+  dd if=plain.sarc of=checksum.bin bs=1 skip=$((proper - 64)) count=32 2>/dev/null
+  {
+    echo "-----BEGIN SSH SIGNATURE-----"
+    dd if=plain.sarc bs=1 skip="$proper" count="$siglen" 2>/dev/null | base64 | tr -d '\n' | fold -w 70
+    echo
+    echo "-----END SSH SIGNATURE-----"
+  } >plain.sig
+  echo "ops@example $(cat ops_key.pub)" >allowed_signers
+  ssh-keygen -Y verify -f allowed_signers -I ops@example -n sarc-archive -s plain.sig <checksum.bin >/dev/null 2>&1 ||
+    { echo "ssh-keygen rejected the archive signature"; return 1; }
+  echo "archive --sign through a pipe, sign with an ssh-keygen key; untrusted, unsigned, and tampered refused; ssh-keygen verifies it too"
+}
+
 example_constant_memory() {
   head -c "$((BIG_MB * 1048576))" /dev/urandom >big.bin
   local want rss
@@ -368,6 +413,7 @@ run_example "SSH keys" example_ssh_keys
 run_example "Hardware token plugin" example_hardware_token_plugin
 run_example "Directory tree" example_directory_tree
 run_example "Incremental backup" example_incremental_backup
+run_example "Signed archive" example_signed_archive
 run_example "Constant memory streaming extract" example_constant_memory
 run_example "Refuse terminal output" example_refuses_terminal
 

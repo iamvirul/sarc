@@ -59,6 +59,8 @@ Directory arguments are archived recursively under slash-separated relative name
 
 `--incremental` (`io/incremental*.go`, format in `archive/incremental.go`, chunker in `archive/chunker.go`) builds an append-only archive of sessions: FastCDC chunks over a CEK-keyed gear table, named by keyed HMAC and deduplicated, are packed into encrypted pack entries, and each session ends with a sealed index of new chunks, changed files, and deletions. A checkpoint before the footer locates the newest index and carries the checksum state for the next append; the header's sealed count is the session count, rewritten last, so rollbacks are detected (`archive.ArchiveChecksum` masks it in the footer checksum). Restoring needs random access (`WithRandomAccess`).
 
+Optional signatures (`archive --sign`, `sarc sign`, `verify --signer`) are OpenSSH SSHSIG signatures (`crypto/signature.go`, namespace `sarc-archive`) over the footer checksum, stored in a block after the footer (`archive/signature.go`, `io/signature.go`); readers stop at the end marker, so extraction ignores it. Incremental updates re-sign or drop the stale signature.
+
 Data is split into variable-length blocks (~64 KB ± 8 KB), each with a unique 12-byte `crypto/rand` nonce. A sealed HMAC-SHA256 of the plaintext is stored encrypted at the end of each file entry. Extraction streams each file into a hidden temp file (`io/verified_file.go`) while computing the HMAC, and renames it into place only after a constant-time match, so memory is constant and unverified data never appears under the final name. The footer is an unkeyed SHA-256 checksum (corruption detection only).
 
 ### Anti-deduplication

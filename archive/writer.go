@@ -29,6 +29,8 @@ type ArchiveWriter struct {
 	keys   *KeySchedule
 	// recipients is the sealed recipient block written into the header.
 	recipients []byte
+	// checksum is the footer checksum, set by WriteFooter.
+	checksum []byte
 }
 
 // NewArchiveWriter returns an ArchiveWriter that writes a Version archive to w, openable
@@ -226,7 +228,8 @@ func (aw *ArchiveWriter) WriteFooter() error {
 		return fmt.Errorf("archive/writer: end marker: %w", err)
 	}
 	var footer ArchiveFooter
-	copy(footer.ArchiveHMAC[:], aw.hasher.Sum(nil))
+	aw.checksum = aw.hasher.Sum(nil)
+	copy(footer.ArchiveHMAC[:], aw.checksum)
 	// Footer bytes go to aw.w (bufio), not aw.tee — footer must not feed the hasher.
 	if _, err := aw.w.Write(footer.ArchiveHMAC[:]); err != nil {
 		return fmt.Errorf("archive/writer: footer HMAC: %w", err)
@@ -237,6 +240,9 @@ func (aw *ArchiveWriter) WriteFooter() error {
 	}
 	return aw.bw.Flush()
 }
+
+// Checksum returns the footer checksum once WriteFooter has run, for signing.
+func (aw *ArchiveWriter) Checksum() []byte { return aw.checksum }
 
 // DeriveFileKey derives the per-file AES-256 key for salt from the archive master key.
 // Safe for concurrent use.
