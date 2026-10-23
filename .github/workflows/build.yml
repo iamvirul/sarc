@@ -24,7 +24,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -59,7 +59,7 @@ jobs:
     steps:
       # Always checkout the default branch — source code is the same.
       # GoReleaser uses GORELEASER_CURRENT_TAG to find the right release.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
