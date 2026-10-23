@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -61,12 +60,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 	defer out.Close()
 
-	var totalInputBytes int64
-	for _, path := range args {
-		if info, statErr := os.Stat(path); statErr == nil {
-			totalInputBytes += info.Size()
-		}
-	}
+	totalFiles, totalInputBytes := sarcio.InputTotals(args)
 	if out.file != nil {
 		if err := sarcio.PreallocateOutput(out.file, totalInputBytes); err != nil {
 			log.Debug("preallocate output file skipped", "err", err)
@@ -96,7 +90,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 			log.Error("file failed", "path", path, "err", err)
 		}
 	}
-	return sa.Finalize(len(args), totalInputBytes)
+	return sa.Finalize(totalFiles, totalInputBytes)
 }
 
 // compressionOptions maps the compression flags to archiver options, rejecting

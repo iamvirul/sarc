@@ -28,8 +28,8 @@ type StreamingArchiver struct {
 	compression *compressionPolicy
 	progress    ProgressTracker
 	start       time.Time
-	pending     []string // solid group members not yet written
-	pendingSize int      // estimated record stream size of pending
+	pending     []inputFile // solid group members not yet written
+	pendingSize int         // estimated record stream size of pending
 }
 
 // NewStreamingArchiver returns a StreamingArchiver writing to w, openable with password
@@ -55,20 +55,44 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 //
 // In solid mode, a small file is only queued here; read errors for queued files are
 // reported through the ProgressTracker when its group is written.
+//
+// A directory is archived recursively (see expandInputs): recoverable failures of its
+// files are reported through the ProgressTracker and only fatal errors are returned.
 func (sa *StreamingArchiver) AddFile(path string) error {
+	files, skipped := expandInputs([]string{path})
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		if len(skipped) > 0 {
+			return skipped[0].err
+		}
+		return sa.addInput(files[0])
+	}
+	reportSkipped(skipped, sa.progress)
+	for _, in := range files {
+		if err := sa.addInput(in); err != nil {
+			if isFatal(err) {
+				return err
+			}
+			sa.progress.FileError(in.path, err)
+		}
+	}
+	return nil
+}
+
+// addInput archives one file, or queues it for a solid group.
+func (sa *StreamingArchiver) addInput(in inputFile) error {
 	if sa.compression.solid {
-		if record, ok := solidCandidate(path); ok {
+		if record, ok := solidCandidate(in); ok {
 			if sa.pendingSize+record > archive.MaxSolidStreamSize {
 				if err := sa.flushSolid(); err != nil {
 					return err
 				}
 			}
-			sa.pending = append(sa.pending, path)
+			sa.pending = append(sa.pending, in)
 			sa.pendingSize += record
 			return nil
 		}
 	}
-	return addFileStreaming(sa.w, sa.compression, path, runtime.GOMAXPROCS(0), sa.progress)
+	return addFileStreaming(sa.w, sa.compression, in, runtime.GOMAXPROCS(0), sa.progress)
 }
 
 // flushSolid writes the queued solid members: as one solid group, or as an individual
@@ -82,7 +106,7 @@ func (sa *StreamingArchiver) flushSolid() error {
 	case 1:
 		err := addFileStreaming(sa.w, sa.compression, pending[0], runtime.GOMAXPROCS(0), sa.progress)
 		if err != nil && !isFatal(err) {
-			sa.progress.FileError(pending[0], err)
+			sa.progress.FileError(pending[0].path, err)
 			return nil
 		}
 		return err
@@ -100,11 +124,11 @@ func (sa *StreamingArchiver) flushSolid() error {
 	return nil
 }
 
-// addFileStreaming streams path into aw as one file entry, encrypting chunks across
+// addFileStreaming streams in into aw as one file entry, encrypting chunks across
 // `workers` goroutines when the file is large enough to benefit (see minParallelFileSize).
 // Shared by StreamingArchiver and ConcurrentArchiver's single-file fast path.
-func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy, path string, workers int, progress ProgressTracker) error {
-	f, err := os.Open(path)
+func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy, in inputFile, workers int, progress ProgressTracker) error {
+	f, err := os.Open(in.path)
 	if err != nil {
 		return recoverable(ErrCodeReadFailed, "open file", err)
 	}
@@ -115,7 +139,7 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 		return recoverable(ErrCodeReadFailed, "stat file", err)
 	}
 
-	progress.FileStarted(info.Name(), info.Size())
+	progress.FileStarted(in.name, info.Size())
 
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
@@ -130,7 +154,7 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 	if err != nil {
 		return recoverable(ErrCodeReadFailed, "read compression probe", err)
 	}
-	codec := compression.codecFor(info.Name(), probe)
+	codec := compression.codecFor(in.name, probe)
 
 	fb, err := compression.newFrameBuilder(fileKey, codec)
 	if err != nil {
@@ -147,7 +171,7 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 		return fatal(ErrCodeWriteFailed, "init metadata manager", err)
 	}
 
-	encFilename, err := encryptFilename(info.Name(), fileKey)
+	encFilename, err := encryptFilename(in.name, fileKey)
 	if err != nil {
 		return fatal(ErrCodeWriteFailed, "encrypt filename", err)
 	}
@@ -219,7 +243,7 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 		return fatal(ErrCodeWriteFailed, "end file entry", err)
 	}
 
-	progress.FileFinished(info.Name())
+	progress.FileFinished(in.name)
 	return nil
 }
 

@@ -22,6 +22,15 @@ func writeSizedFile(t *testing.T, dir, name string, size int) string {
 	return path
 }
 
+// inputsFor returns the input files for paths, each stored under its base name.
+func inputsFor(paths ...string) []inputFile {
+	files := make([]inputFile, len(paths))
+	for i, p := range paths {
+		files[i] = inputFile{path: p, name: filepath.Base(p)}
+	}
+	return files
+}
+
 func TestPlanSolidSeparatesCandidatesFromIndividualFiles(t *testing.T) {
 	dir := t.TempDir()
 	small1 := writeSizedFile(t, dir, "b.txt", 100)
@@ -34,14 +43,14 @@ func TestPlanSolidSeparatesCandidatesFromIndividualFiles(t *testing.T) {
 	}
 	missing := filepath.Join(dir, "missing.txt")
 
-	plan := planSolid([]string{small1, large, small2, subdir, small3, missing})
+	plan := planSolid(inputsFor(small1, large, small2, subdir, small3, missing))
 
 	wantIndividual := []string{large, subdir, missing}
 	if len(plan.individual) != len(wantIndividual) {
 		t.Fatalf("individual = %v, want %v", plan.individual, wantIndividual)
 	}
 	for i, p := range wantIndividual {
-		if plan.individual[i] != p {
+		if plan.individual[i].path != p {
 			t.Fatalf("individual[%d] = %s, want %s", i, plan.individual[i], p)
 		}
 	}
@@ -51,7 +60,7 @@ func TestPlanSolidSeparatesCandidatesFromIndividualFiles(t *testing.T) {
 		t.Fatalf("groups = %v, want one group %v", plan.groups, want)
 	}
 	for i, p := range want {
-		if plan.groups[0][i] != p {
+		if plan.groups[0][i].path != p {
 			t.Fatalf("group[%d] = %s, want %s", i, plan.groups[0][i], p)
 		}
 	}
@@ -64,7 +73,7 @@ func TestPlanSolidSplitsGroupsAtMaxStreamSize(t *testing.T) {
 	for i := 0; i < fileCount; i++ {
 		paths = append(paths, writeSizedFile(t, dir, string(rune('a'+i))+".dat", archive.SolidMemberMaxSize))
 	}
-	plan := planSolid(paths)
+	plan := planSolid(inputsFor(paths...))
 
 	if len(plan.individual) != 0 {
 		t.Fatalf("unexpected individual files: %v", plan.individual)
@@ -72,8 +81,8 @@ func TestPlanSolidSplitsGroupsAtMaxStreamSize(t *testing.T) {
 	total := 0
 	for _, g := range plan.groups {
 		size := 0
-		for _, p := range g {
-			info, err := os.Stat(p)
+		for _, in := range g {
+			info, err := os.Stat(in.path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -93,7 +102,7 @@ func TestPlanSolidStoresLoneCandidateIndividually(t *testing.T) {
 	dir := t.TempDir()
 	only := writeSizedFile(t, dir, "only.txt", 10)
 	large := writeSizedFile(t, dir, "large.bin", archive.SolidMemberMaxSize+1)
-	plan := planSolid([]string{only, large})
+	plan := planSolid(inputsFor(only, large))
 	if len(plan.groups) != 0 || len(plan.individual) != 2 {
 		t.Fatalf("got groups %v individual %v, want no groups", plan.groups, plan.individual)
 	}
@@ -123,7 +132,7 @@ func TestBuildSolidEntrySkipsUnreadableMembers(t *testing.T) {
 	ok2 := writeSizedFile(t, dir, "ok2.txt", 2000)
 	vanished := filepath.Join(dir, "vanished.txt")
 
-	entry, members, err := buildSolidEntry(newTestArchiveWriter(t), mustSolidPolicy(t), []string{ok1, vanished, ok2}, NopProgressTracker{})
+	entry, members, err := buildSolidEntry(newTestArchiveWriter(t), mustSolidPolicy(t), inputsFor(ok1, vanished, ok2), NopProgressTracker{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +154,7 @@ func TestBuildSolidEntrySkipsUnreadableMembers(t *testing.T) {
 func TestBuildSolidEntryWithNoReadableMembersReturnsNoEntry(t *testing.T) {
 	dir := t.TempDir()
 	entry, members, err := buildSolidEntry(newTestArchiveWriter(t), mustSolidPolicy(t),
-		[]string{filepath.Join(dir, "gone1"), filepath.Join(dir, "gone2")}, NopProgressTracker{})
+		inputsFor(filepath.Join(dir, "gone1"), filepath.Join(dir, "gone2")), NopProgressTracker{})
 	if err != nil {
 		t.Fatal(err)
 	}

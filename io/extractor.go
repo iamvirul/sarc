@@ -372,7 +372,11 @@ func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHe
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return ExtractionResult{}, fatal(ErrCodeWriteFailed, "create output dir", err)
 	}
-	out, err := newVerifiedFile(outputDir, fileKey)
+	outPath, err := entryOutputPath(outputDir, filename)
+	if err != nil {
+		return ExtractionResult{}, se.skipEntryBody(err)
+	}
+	out, err := newVerifiedFile(filepath.Dir(outPath), fileKey)
 	if err != nil {
 		return ExtractionResult{}, se.skipEntryBody(recoverable(ErrCodeWriteFailed, "create file", err))
 	}
@@ -397,13 +401,28 @@ func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHe
 	if err := out.verify(trailer); err != nil {
 		return ExtractionResult{}, err
 	}
-	outPath := filepath.Join(outputDir, filepath.Base(filename))
 	if err := out.publish(outPath, os.FileMode(pm.Permissions).Perm()); err != nil {
 		return ExtractionResult{}, recoverable(ErrCodeWriteFailed, "write file", err)
 	}
 
 	se.progress.FileFinished(filename)
 	return ExtractionResult{Filename: filename, Size: out.size, OK: true}, nil
+}
+
+// entryOutputPath returns where the entry named name is extracted under outputDir and
+// creates its parent directories. A name that is not a safe relative path (absolute,
+// containing "..", or reserved on this OS) is refused, so no entry can be written
+// outside outputDir.
+func entryOutputPath(outputDir, name string) (string, error) {
+	local := filepath.FromSlash(name)
+	if !archive.ValidEntryName(name) || !filepath.IsLocal(local) {
+		return "", recoverable(ErrCodeIntegrityFail, "unsafe file name", nil)
+	}
+	outPath := filepath.Join(outputDir, local)
+	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		return "", recoverable(ErrCodeWriteFailed, "create directory", err)
+	}
+	return outPath, nil
 }
 
 func (se *SafeExtractor) readMetadataBlock() (archive.MetadataBlock, error) {

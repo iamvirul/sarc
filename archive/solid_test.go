@@ -49,21 +49,6 @@ func TestSolidStreamRoundtrip(t *testing.T) {
 	}
 }
 
-func TestValidSolidMemberName(t *testing.T) {
-	valid := []string{"a", "main.go", ".hidden", "with space.txt", `back\slash`, strings.Repeat("x", 0xFFFF)}
-	invalid := []string{"", ".", "..", "dir/file", "../escape", "nul\x00byte", strings.Repeat("x", 0x10000)}
-	for _, name := range valid {
-		if !archive.ValidSolidMemberName(name) {
-			t.Fatalf("%q rejected", name)
-		}
-	}
-	for _, name := range invalid {
-		if archive.ValidSolidMemberName(name) {
-			t.Fatalf("%q accepted", name)
-		}
-	}
-}
-
 func TestAppendSolidRecordRejectsInvalidName(t *testing.T) {
 	if _, err := archive.AppendSolidRecord(nil, archive.SolidMember{Name: "../etc/passwd"}); err == nil {
 		t.Fatal("path-traversal member name accepted")
