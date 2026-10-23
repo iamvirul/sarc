@@ -48,6 +48,10 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
 [SOLID GROUP ENTRY]     entry_type=0x02, version 2+ only; same framing as a file entry,
                         but the plaintext is a record stream (see Solid groups)
 
+[PACK ENTRY]            entry_type=0x03, incremental archives only (see Incremental archives)
+[INDEX ENTRY]           entry_type=0x04, incremental archives only
+[CHECKPOINT]            entry_type=0x05, incremental archives only, unencrypted
+
 [END MARKER]            entry_type=0x00(1), version 2+ only
 
 [ARCHIVE FOOTER]
@@ -182,13 +186,76 @@ record := name_len(2) | name | permissions(4) | data_len(8) | data
   result is split into data blocks, and each block is sealed like any other. The codec
   in the sealed metadata applies to the whole stream.
 - The trailer HMAC and size cover the uncompressed stream and are verified before any
-  member is written. Decoding is bounded at 8 MiB, and member names must be non-empty
-  base names without `/` or NUL and not `.` or `..`; any violation rejects the group.
+  member is written. Decoding is bounded at 8 MiB, and member names must be safe
+  relative paths (see Directories); any violation rejects the group.
 - `sarc list` decrypts solid groups in memory to read member records; each member is
   reported with its group's compression ratio.
 - Memory: the archiver holds at most one stream and payload (8 MiB each) per worker. The
   best-compression tier is limited to two concurrent zstd encoders (each holds 35-50 MB),
   and auto mode probes with a separate fastest-level encoder.
+
+## Directories
+
+Archive arguments that are directories are walked in lexical order. A file is stored
+under its path relative to the argument's parent, slash-separated (`data/` stores
+`data/sub/a.txt`; `.` stores paths relative to itself); a file argument keeps its base
+name. Symlinks and special files inside directories are skipped and reported.
+
+Stored names must be relative paths whose elements are non-empty and not `.` or `..`,
+with no NUL or backslash (`archive.ValidEntryName`). The extractor also requires
+`filepath.IsLocal` on the OS form of the name, creates parent directories, and refuses
+any other name for that entry only, so no archive can write outside the output
+directory.
+
+## Incremental archives
+
+`--incremental` creates an archive whose header has `HeaderFlagIncremental` set in its
+first reserved byte, or appends a session to one. The archive grows by sessions and
+ends with a checkpoint:
+
+```
+header | (pack* index)+ | checkpoint | end marker | footer
+```
+
+- Chunking: files are split with FastCDC (normalized, min 256 KiB, average 1 MiB, max
+  4 MiB) over a gear table derived from the CEK (`HKDF(cek, "sarc chunker gear table")`),
+  so cut points, and the chunk sizes they produce, differ between archives for the same
+  content. A one-byte edit changes the chunks around it and no others.
+- Chunk IDs are `HMAC-SHA256(HKDF(cek, "sarc chunk id key"), chunk)`. A chunk whose ID
+  the archive already holds is referenced, not stored again, within and across sessions.
+- Packs: new chunks, zstd-compressed when the file's codec is zstd and that is smaller,
+  are concatenated into pack entries (at most 64 MiB of plaintext each). A pack uses the
+  file-entry framing with random block sizes and padding, so chunk boundaries are
+  invisible; its trailer HMAC covers the pack plaintext.
+- Session index: one sealed index entry per session lists its packs (archive offsets), its
+  new chunks (ID, pack, offset, stored and raw sizes, codec), the new or changed files
+  (name, mode, modification time, size, chunk numbers), and the names deleted since the
+  previous session, plus the offset of the previous index. Chunks are numbered globally
+  in the order sessions add them.
+- Checkpoint: the newest index offset and the marshaled SHA-256 state of every byte
+  before the checkpoint, so an update extends the footer checksum without rereading the
+  archive. It is not trusted for security: the indexes are authenticated.
+- An update reads the checkpoint, walks the index chain back to session 1, applies the
+  sessions in order, and compares the inputs: a file with the same size, modification
+  time, and mode is not read. New and changed files are chunked; missing files become
+  deletions, except under a directory that could not be read. It then writes over the old
+  tail (packs, index, new tail), syncs, and reseals the header's session count in place.
+  A run with no change writes nothing. A failed write restores the old tail.
+- Rollback: the sealed session count (authenticated by the header key) must not exceed
+  the newest session found, so cutting off newest sessions and rewriting the unkeyed tail
+  is detected. The footer checksum of an incremental archive hashes that count as zeros
+  (`archive.ArchiveChecksum`), since updates rewrite it.
+- Crash safety: a new archive is written to a temporary file and renamed into place. An
+  interrupted update leaves the old sessions intact and the header count unchanged (it is
+  rewritten last); readers that find a damaged tail scan forward for the last index that
+  verifies completely, and the next update repairs the tail.
+- Restore needs random access (`WithRandomAccess`; the CLI provides it for files and
+  redirected stdin). Each pack holding a needed chunk is read once, in archive order;
+  every chunk is checked against its keyed ID and size before it is written to each
+  position that uses it in a temporary file, and a file is renamed into place only when
+  all of its chunks are written.
+- Limits: indexes are bounded at 256 MiB, chunk and pack sizes are checked when an index
+  is parsed, and a file's chunks must add up to its recorded size.
 
 ## Error recovery
 

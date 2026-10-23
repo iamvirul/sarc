@@ -13,7 +13,9 @@ Or download a signed release binary from the [Releases](https://github.com/iamvi
 ## Usage
 
 ```bash
-# Create an archive
+# Create an archive. Directories are archived recursively and restored with their
+# structure: "folder/" is stored as folder/..., "." as paths relative to it. Symlinks and
+# special files inside directories are skipped.
 sarc archive --password "StrongPass123" --output backup.sarc file1.txt file2.bin folder/
 
 # Parallel archive (defaults to NumCPU workers)
@@ -67,6 +69,16 @@ age-plugin-yubikey --generate > yubikey.id                 # prints age1yubikey1
 sarc archive --recipient age1yubikey1... --output backup.sarc files/
 sarc extract --identity yubikey.id --archive backup.sarc --output ./out
 
+# Incremental backups: the first run creates the archive, each later run appends only
+# data the archive does not hold yet, plus a record of changed and deleted files. Files
+# whose size, modification time, and mode are unchanged are not even read, and a run
+# with no changes writes nothing. extract and list show the latest state.
+sarc archive --password "StrongPass123" --incremental --output backup.sarc ./data/
+# created incremental archive: session 1, 100 file(s) (10.2 GB), 9871 chunk(s), 9.84 GB written
+sarc archive --password "StrongPass123" --incremental --output backup.sarc ./data/
+# session 2: 3 file(s) changed (412 MB), 97 unchanged, 1 deleted; appended 8.03 MB in 7 new chunk(s)
+sarc extract --password "StrongPass123" --archive backup.sarc --output ./restored/
+
 # Check the archive checksum for corruption (no password required)
 sarc verify --archive backup.sarc
 
@@ -107,6 +119,7 @@ Per-file mode stays larger than zip on small-file trees because every entry carr
 | Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |
 | Compression | Optional zstd before encryption, per file; the codec is recorded inside the encrypted metadata |
 | Solid groups (`--solid`) | Small files share one entry: one key, one padding set, one HMAC per group of up to 8 MiB |
+| Incremental archives (`--incremental`) | Files are split into content-defined chunks (about 1 MiB) whose boundaries depend on a secret derived from the archive key; chunks are named by keyed HMAC, deduplicated within the archive, and packed into encrypted, padded pack entries, so chunk boundaries and identities never appear outside the encryption. The header seals the session count, so cutting off the newest sessions is detected |
 | Container checksum | SHA-256 over the archive body in the footer, checked by `sarc verify` without a password. It is not keyed: it detects accidental corruption, not tampering |
 | Authenticity | Every entry is authenticated by its GCM tags and a sealed plaintext HMAC, and the header by the recipient block; `extract` and `list` reject anything modified, including when streaming |
 
@@ -119,6 +132,13 @@ Solid trade-off: every file in a solid group is encrypted under the group's key,
 isolation is per group rather than per file, and the archive reveals which small files
 were packed together (the entry type byte marks solid groups). Member names, sizes, and
 permissions are inside the encrypted stream. Solid mode is off unless `--solid` is given.
+
+Incremental trade-off: an update appends only new data, so anyone who sees successive
+versions of the archive learns roughly how much changed in each session, and
+deduplication within one archive makes it smaller than the sum of its files. The same
+content in two different incremental archives shares nothing, because the chunking
+secret and keys differ. Restoring needs random access, so an incremental archive must be
+extracted from a file, not a pipe.
 
 Recipient privacy: age X25519 recipients are anonymous, but age's SSH stanzas and most
 hardware-token stanzas carry a short fingerprint of the recipient key. Anyone holding a
