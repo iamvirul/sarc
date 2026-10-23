@@ -61,6 +61,9 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		return errChecksumFailed
 	}
 	fmt.Fprintln(out, "integrity check PASSED")
+	if in.volumes != nil {
+		fmt.Fprintf(out, "all %d volume(s) present and intact\n", in.volumes.Volumes())
+	}
 	return sigErr
 }
 

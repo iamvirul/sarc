@@ -21,6 +21,7 @@ var (
 	flagSolid         bool
 	flagIncremental   bool
 	flagSign          string
+	flagSplit         string
 
 	flagRecipients []string
 	flagIdentities []string

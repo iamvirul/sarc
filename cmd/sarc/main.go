@@ -4,10 +4,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
+
+	sarcio "github.com/iamvirul/sarc/io"
 )
 
 // Build metadata injected via ldflags at release time.
@@ -29,7 +33,17 @@ func main() {
 	rootCmd.SilenceErrors = true
 	rootCmd.AddCommand(archiveCmd, extractCmd, verifyCmd, listCmd, keygenCmd, signCmd)
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, withVolumeDetail(err))
 		os.Exit(1)
 	}
+}
+
+// withVolumeDetail appends the volume that failed to an error caused by a damaged or
+// missing volume of a split archive, which an archive error's message alone omits.
+func withVolumeDetail(err error) error {
+	var ve *sarcio.VolumeError
+	if errors.As(err, &ve) && !strings.Contains(err.Error(), ve.Error()) {
+		return fmt.Errorf("%v: %w", err, ve)
+	}
+	return err
 }

@@ -44,7 +44,10 @@ func init() {
 	archiveCmd.Flags().BoolVar(&flagIncremental, "incremental", false,
 		"create the archive at --output, or add a session to it: only new or changed data is written, deleted files are recorded")
 	archiveCmd.MarkFlagsMutuallyExclusive("compress", "no-compress")
+	archiveCmd.Flags().StringVar(&flagSplit, "split", "",
+		"split the archive into volumes of at most this size (2GB, 700MiB, 1.5G; K/M/G are powers of 1024, KB/MB/GB of 1000), written as <output>.001, .002, ...")
 	archiveCmd.MarkFlagsMutuallyExclusive("incremental", "solid")
+	archiveCmd.MarkFlagsMutuallyExclusive("incremental", "split")
 	_ = archiveCmd.MarkFlagRequired("output")
 }
 
@@ -71,7 +74,13 @@ func runArchive(cmd *cobra.Command, args []string) error {
 		return runIncremental(cmd, args, password, append(credentialOpts, sarcio.WithCompression(compression)))
 	}
 
-	out, err := createArchiveOutput(flagOutput)
+	var split int64
+	if flagSplit != "" {
+		if split, err = parseSize(flagSplit); err != nil {
+			return err
+		}
+	}
+	out, err := createArchiveOutput(flagOutput, split)
 	if err != nil {
 		return err
 	}
@@ -96,8 +105,7 @@ func runArchive(cmd *cobra.Command, args []string) error {
 		if err := ca.Archive(args); err != nil {
 			return err
 		}
-		reportSigned(out.progress, signer)
-		return nil
+		return finishOutput(out, signer)
 	}
 
 	log.Debug("using streaming archiver")
@@ -113,6 +121,19 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	}
 	if err := sa.Finalize(totalFiles, totalInputBytes); err != nil {
 		return err
+	}
+	return finishOutput(out, signer)
+}
+
+// finishOutput closes the output, which finishes the last volume of a split archive,
+// and reports the volumes written and the signing key.
+func finishOutput(out *archiveOutput, signer ssh.Signer) error {
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if out.volumes != nil {
+		paths := out.volumes.Paths()
+		fmt.Fprintf(out.progress, "wrote %d volume(s): %s .. %s\n", len(paths), paths[0], paths[len(paths)-1])
 	}
 	reportSigned(out.progress, signer)
 	return nil
