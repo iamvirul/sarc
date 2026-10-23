@@ -127,6 +127,26 @@ type SafeExtractor struct {
 	keyFiles   [][]byte
 	identities []age.Identity
 	progress   ProgressTracker
+	header     headerInfo
+	// random, when set, gives the random access incremental archives need; r reads the
+	// same archive sequentially from its start.
+	random     io.ReaderAt
+	randomSize int64
+}
+
+// headerInfo is what readHeader learned beyond the key schedule (Version2+ only).
+type headerInfo struct {
+	flags             byte
+	sealedCount       uint64 // file count, or session count for incremental archives
+	recipientBlockLen int
+}
+
+// incremental reports whether the header marks an incremental archive.
+func (h headerInfo) incremental() bool { return h.flags&archive.HeaderFlagIncremental != 0 }
+
+// end returns the archive offset just past the Version2 header.
+func (h headerInfo) end() int64 {
+	return archive.FileCountOffset(h.recipientBlockLen) + archive.FileCountSealedSize + archive.ReservedSize
 }
 
 // NewSafeExtractor returns a SafeExtractor reading from r that unlocks the archive with
@@ -152,6 +172,9 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
+	}
+	if se.header.incremental() {
+		return se.extractIncremental(keys, outputDir)
 	}
 	block, err := archive.NewBlockDecompressor()
 	if err != nil {
@@ -261,27 +284,35 @@ func (se *SafeExtractor) readVersion2Header() (*archive.KeySchedule, error) {
 		return nil, fatal(ErrCodeIntegrityFail, "malformed recipient block", err)
 	}
 	keys := archive.NewVersion2KeySchedule(cek)
-	if err := openFileCount(keys, hdr.FileCountEncrypted); err != nil {
+	count, err := openFileCount(keys, hdr.FileCountEncrypted)
+	if err != nil {
 		return nil, fatal(ErrCodeAuthFailed, "corrupted header", err)
 	}
+	se.header = headerInfo{flags: hdr.Reserved[0], sealedCount: count, recipientBlockLen: int(blockLen)}
 	return keys, nil
 }
 
-// openFileCount authenticates the sealed header file count with the header key,
-// confirming the recovered CEK and the header's integrity.
-func openFileCount(keys *archive.KeySchedule, sealed [archive.FileCountSealedSize]byte) error {
+// openFileCount authenticates and returns the sealed header file count with the header
+// key, confirming the recovered CEK and the header's integrity.
+func openFileCount(keys *archive.KeySchedule, sealed [archive.FileCountSealedSize]byte) (uint64, error) {
 	headerKey, err := keys.HeaderKey()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	em, err := crypto.NewEncryptionManager(headerKey)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var nonce [crypto.NonceSize]byte
 	copy(nonce[:], sealed[:crypto.NonceSize])
-	_, err = em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: sealed[crypto.NonceSize:]})
-	return err
+	plain, err := em.DecryptBlock(crypto.EncryptedBlock{Nonce: nonce, Ciphertext: sealed[crypto.NonceSize:]})
+	if err != nil {
+		return 0, err
+	}
+	if len(plain) != 8 {
+		return 0, fmt.Errorf("sealed count is %d bytes", len(plain))
+	}
+	return binary.LittleEndian.Uint64(plain), nil
 }
 
 // nextEntryType reads the next entry type byte and reports whether an entry follows.
@@ -677,6 +708,9 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
+	}
+	if se.header.incremental() {
+		return se.listIncremental(keys)
 	}
 
 	decs := &entryDecoders{}

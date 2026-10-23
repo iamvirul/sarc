@@ -47,7 +47,7 @@ func NewConsoleProgressBar(w io.Writer) *ConsoleProgressBar {
 func (pb *ConsoleProgressBar) Metrics() *Metrics { return pb.metrics }
 
 func (pb *ConsoleProgressBar) FileStarted(name string, sizeBytes int64) {
-	fmt.Fprintf(pb.w, "  -> %s (%s)\n", name, formatBytes(sizeBytes))
+	fmt.Fprintf(pb.w, "  -> %s (%s)\n", name, FormatBytes(sizeBytes))
 }
 
 func (pb *ConsoleProgressBar) BytesProcessed(n int64) {
@@ -66,7 +66,7 @@ func (pb *ConsoleProgressBar) FileError(name string, err error) {
 func (pb *ConsoleProgressBar) Done(totalFiles int, totalBytes int64, elapsed time.Duration) {
 	throughput := float64(totalBytes) / elapsed.Seconds() / (1024 * 1024)
 	fmt.Fprintf(pb.w, "done: %d file(s), %s in %.2fs (%.0f MB/s)\n",
-		totalFiles, formatBytes(totalBytes), elapsed.Seconds(), throughput)
+		totalFiles, FormatBytes(totalBytes), elapsed.Seconds(), throughput)
 }
 
 // NopProgressTracker discards all progress events.
@@ -78,7 +78,8 @@ func (NopProgressTracker) FileFinished(_ string)                {}
 func (NopProgressTracker) FileError(_ string, _ error)          {}
 func (NopProgressTracker) Done(_ int, _ int64, _ time.Duration) {}
 
-func formatBytes(b int64) string {
+// FormatBytes renders a byte count with a binary unit (B, KB, MB, GB).
+func FormatBytes(b int64) string {
 	switch {
 	case b >= 1<<30:
 		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))

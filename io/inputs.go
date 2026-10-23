@@ -20,10 +20,14 @@ type inputFile struct {
 }
 
 // skippedInput is an archive argument, or an entry inside a directory argument, that
-// is not archived.
+// is not archived. name is its stored name when known. unreadable marks a failure to
+// read it, as opposed to a file that is never archived (such as a symlink); an
+// incremental update keeps the previous versions of unreadable files and directories.
 type skippedInput struct {
-	path string
-	err  error
+	path       string
+	name       string
+	err        error
+	unreadable bool
 }
 
 // expandInputs resolves archive arguments into regular files. A file argument (a
@@ -38,7 +42,7 @@ func expandInputs(paths []string) ([]inputFile, []skippedInput) {
 	for _, p := range paths {
 		info, err := os.Stat(p)
 		if err != nil {
-			skipped = append(skipped, skippedInput{p, recoverable(ErrCodeReadFailed, "stat file", err)})
+			skipped = append(skipped, skippedInput{path: p, err: recoverable(ErrCodeReadFailed, "stat file", err), unreadable: true})
 			continue
 		}
 		if !info.IsDir() {
@@ -47,8 +51,9 @@ func expandInputs(paths []string) ([]inputFile, []skippedInput) {
 		}
 		prefix := directoryPrefix(p)
 		walkErr := filepath.WalkDir(p, func(walked string, d fs.DirEntry, err error) error {
+			name := storedName(prefix, p, walked)
 			if err != nil {
-				skipped = append(skipped, skippedInput{walked, recoverable(ErrCodeReadFailed, "read directory", err)})
+				skipped = append(skipped, skippedInput{walked, name, recoverable(ErrCodeReadFailed, "read directory", err), true})
 				if d != nil && d.IsDir() && walked != p {
 					return fs.SkipDir
 				}
@@ -57,21 +62,16 @@ func expandInputs(paths []string) ([]inputFile, []skippedInput) {
 			if d.IsDir() {
 				return nil
 			}
-			rel, err := filepath.Rel(p, walked)
-			if err != nil {
-				skipped = append(skipped, skippedInput{walked, recoverable(ErrCodeReadFailed, "resolve path", err)})
-				return nil
-			}
 			info, err := d.Info()
 			if err != nil {
-				skipped = append(skipped, skippedInput{walked, recoverable(ErrCodeReadFailed, "stat file", err)})
+				skipped = append(skipped, skippedInput{walked, name, recoverable(ErrCodeReadFailed, "stat file", err), true})
 				return nil
 			}
-			files, skipped = appendInput(files, skipped, walked, path.Join(prefix, filepath.ToSlash(rel)), info)
+			files, skipped = appendInput(files, skipped, walked, name, info)
 			return nil
 		})
 		if walkErr != nil {
-			skipped = append(skipped, skippedInput{p, recoverable(ErrCodeReadFailed, "walk directory", walkErr)})
+			skipped = append(skipped, skippedInput{path: p, err: recoverable(ErrCodeReadFailed, "walk directory", walkErr), unreadable: true})
 		}
 	}
 	return files, skipped
@@ -81,11 +81,22 @@ func expandInputs(paths []string) ([]inputFile, []skippedInput) {
 func appendInput(files []inputFile, skipped []skippedInput, p, name string, info fs.FileInfo) ([]inputFile, []skippedInput) {
 	switch {
 	case !info.Mode().IsRegular():
-		return files, append(skipped, skippedInput{p, recoverable(ErrCodeReadFailed, "not a regular file", nil)})
+		return files, append(skipped, skippedInput{path: p, name: name, err: recoverable(ErrCodeReadFailed, "not a regular file", nil)})
 	case !archive.ValidEntryName(name):
-		return files, append(skipped, skippedInput{p, recoverable(ErrCodeReadFailed, "unsupported file name", nil)})
+		return files, append(skipped, skippedInput{path: p, err: recoverable(ErrCodeReadFailed, "unsupported file name", nil)})
 	}
 	return append(files, inputFile{path: p, name: name}), skipped
+}
+
+// storedName returns the stored name of walked, found while walking the directory
+// argument dir whose names start with prefix. It is "" for dir itself or a path that
+// cannot be made relative to it.
+func storedName(prefix, dir, walked string) string {
+	rel, err := filepath.Rel(dir, walked)
+	if err != nil || rel == "." {
+		return prefix
+	}
+	return path.Join(prefix, filepath.ToSlash(rel))
 }
 
 // directoryPrefix returns the stored name prefix for a directory argument: its base

@@ -154,6 +154,19 @@ func appendSolidMember(stream []byte, in inputFile, progress ProgressTracker) ([
 // sealSolidEntry compresses stream per policy and seals it as a solid group entry under
 // a fresh entry salt. The HMAC and recorded size cover the uncompressed stream.
 func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream []byte) (archive.FileEntry, error) {
+	codec := policy.solidCodecFor(stream)
+	payload := stream
+	if codec == archive.CodecZstd {
+		payload = policy.solidCompressor.Compress(nil, stream)
+	}
+	return sealPayloadEntry(aw, archive.EntryTypeSolid, codec, payload, stream)
+}
+
+// sealPayloadEntry seals an in-memory entry of entryType under a fresh entry salt: its
+// metadata records codec and plaintext's size bucket, payload (plaintext already
+// encoded per codec) fills the data blocks, and the trailer HMAC and size cover
+// plaintext.
+func sealPayloadEntry(aw *archive.ArchiveWriter, entryType byte, codec archive.Codec, payload, plaintext []byte) (archive.FileEntry, error) {
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "generate salt", err)
@@ -161,12 +174,6 @@ func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream
 	fileKey, err := aw.DeriveFileKey(salt)
 	if err != nil {
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "derive file key", err)
-	}
-
-	codec := policy.solidCodecFor(stream)
-	payload := stream
-	if codec == archive.CodecZstd {
-		payload = policy.solidCompressor.Compress(nil, stream)
 	}
 
 	// The payload is already encoded, so the FrameBuilder seals chunks as-is.
@@ -183,7 +190,7 @@ func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "init metadata manager", err)
 	}
 	meta, err := mm.Seal(archive.PlaintextMetadata{
-		SizeBucket: archive.BucketizeSize(int64(len(stream))),
+		SizeBucket: archive.BucketizeSize(int64(len(plaintext))),
 		Codec:      codec,
 	})
 	if err != nil {
@@ -199,18 +206,18 @@ func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream
 		n := min(fb.NextChunkSize(), len(payload)-off)
 		db, err := fb.EncryptChunk(payload[off : off+n])
 		if err != nil {
-			return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "encrypt solid block", err)
+			return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "encrypt block", err)
 		}
 		blocks = append(blocks, db)
 		off += n
 	}
 
-	trailer, err := fb.BuildTrailer(crypto.ComputeHMAC(fileKey, stream), uint64(len(stream)))
+	trailer, err := fb.BuildTrailer(crypto.ComputeHMAC(fileKey, plaintext), uint64(len(plaintext)))
 	if err != nil {
 		return archive.FileEntry{}, fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
 	return archive.FileEntry{
-		EntryType:     archive.EntryTypeSolid,
+		EntryType:     entryType,
 		EntrySalt:     salt,
 		FrameHdr:      frameHdr,
 		Metadata:      meta,

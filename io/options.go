@@ -38,20 +38,40 @@ func WithKeyFileRecipients(keyFiles ...archive.KeyFile) ArchiverOption {
 	return func(c *archiverConfig) { c.keyFiles = append(c.keyFiles, keyFiles...) }
 }
 
-// openArchiveWriter applies opts, builds the compression policy, and writes the archive
-// header for password (empty for none) plus any key file and age recipients. At least
-// one credential is required.
-func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, error) {
+// newArchiverConfig applies opts over the defaults.
+func newArchiverConfig(opts []ArchiverOption) archiverConfig {
 	cfg := archiverConfig{compression: DefaultCompressionOptions()}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	return cfg
+}
+
+// openArchiveWriter applies opts, builds the compression policy, and writes the archive
+// header for password (empty for none) plus any key file and age recipients. At least
+// one credential is required.
+func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, error) {
+	cfg := newArchiverConfig(opts)
 	policy, err := newCompressionPolicy(cfg.compression)
 	if err != nil {
 		return nil, nil, fatal(ErrCodeInvalidOption, "invalid compression options", err)
 	}
+	aw, err := newCredentialedWriter(w, password, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := aw.WriteHeader(0); err != nil {
+		return nil, nil, fatal(ErrCodeWriteFailed, "write header", err)
+	}
+	return aw, policy, nil
+}
+
+// newCredentialedWriter returns an ArchiveWriter openable with password (empty for none)
+// and cfg's key file and age recipients, without writing the header. At least one
+// credential is required.
+func newCredentialedWriter(w io.Writer, password string, cfg archiverConfig) (*archive.ArchiveWriter, error) {
 	if password == "" && len(cfg.keyFiles) == 0 && len(cfg.ageRecipients) == 0 {
-		return nil, nil, fatal(ErrCodeInvalidOption, "a password, key file, or age recipient is required", nil)
+		return nil, fatal(ErrCodeInvalidOption, "a password, key file, or age recipient is required", nil)
 	}
 	creds := archive.Credentials{KeyFiles: cfg.keyFiles, AgeRecipients: cfg.ageRecipients}
 	if password != "" {
@@ -59,12 +79,9 @@ func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*ar
 	}
 	aw, err := archive.NewArchiveWriter(w, creds)
 	if err != nil {
-		return nil, nil, fatal(ErrCodeWriteFailed, "init archive writer", err)
+		return nil, fatal(ErrCodeWriteFailed, "init archive writer", err)
 	}
-	if err := aw.WriteHeader(0); err != nil {
-		return nil, nil, fatal(ErrCodeWriteFailed, "write header", err)
-	}
-	return aw, policy, nil
+	return aw, nil
 }
 
 // ExtractorOption configures a SafeExtractor.
@@ -74,6 +91,13 @@ type ExtractorOption func(*SafeExtractor)
 // try against a Version2 archive's age recipients.
 func WithIdentities(identities ...age.Identity) ExtractorOption {
 	return func(se *SafeExtractor) { se.identities = append(se.identities, identities...) }
+}
+
+// WithRandomAccess gives the extractor random access to the archive it reads, as
+// incremental archives require; ra must hold the same size bytes the extractor's
+// reader yields. Without it, an incremental archive fails with ErrCodeInvalidOption.
+func WithRandomAccess(ra io.ReaderAt, size int64) ExtractorOption {
+	return func(se *SafeExtractor) { se.random, se.randomSize = ra, size }
 }
 
 // WithKeyFiles adds key file contents to try against a Version2 archive's key file
