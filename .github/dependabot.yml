@@ -1,0 +1,44 @@
+# Weekly dependency updates. Each ecosystem's minor and patch updates are grouped into
+# one PR; major updates get their own PRs so breaking changes are reviewed separately.
+# Security updates are always raised immediately, outside the schedule.
+#
+# Dependabot does not change the go directive in go.mod, which selects the Go toolchain
+# and so the standard library version: raise it by hand when govulncheck reports a
+# standard library vulnerability.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    commit-message:
+      prefix: deps
+    groups:
+      go-modules:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    commit-message:
+      prefix: deps
+    groups:
+      docker-images:
+        update-types: [minor, patch]
