@@ -23,6 +23,7 @@ const identityFileMode = 0o600
 var (
 	flagKeygenOutput  string
 	flagKeygenKeyFile bool
+	flagKeygenSigning bool
 )
 
 var keygenCmd = &cobra.Command{
@@ -32,7 +33,9 @@ var keygenCmd = &cobra.Command{
 		"public key (age1...) with whoever archives for you; keep the identity file secret.\n\n" +
 		"With --keyfile it writes a random 32-byte key file instead, for --key. Anyone with the\n" +
 		"key file can open archives made with it, so store it like a password (for example on a\n" +
-		"USB drive) and keep a backup: a lost key file cannot be recovered.",
+		"USB drive) and keep a backup: a lost key file cannot be recovered.\n\n" +
+		"With --signing it writes an Ed25519 signing key in OpenSSH format for archive --sign and\n" +
+		"sign, and its public key to <output>.pub for verify --signer. Existing SSH keys work too.",
 	Args: cobra.NoArgs,
 	RunE: runKeygen,
 }
@@ -42,11 +45,26 @@ func init() {
 		"file to create (default: stdout, identities only); never overwritten")
 	keygenCmd.Flags().BoolVar(&flagKeygenKeyFile, "keyfile", false,
 		"write a random 32-byte key file for --key instead of an age identity (requires --output)")
+	keygenCmd.Flags().BoolVar(&flagKeygenSigning, "signing", false,
+		"write an Ed25519 signing key to --output and its public key to <output>.pub (requires --output)")
+	keygenCmd.MarkFlagsMutuallyExclusive("keyfile", "signing")
 }
 
 func runKeygen(cmd *cobra.Command, args []string) error {
 	if flagKeygenKeyFile {
 		return writeKeyFile(cmd, flagKeygenOutput)
+	}
+	if flagKeygenSigning {
+		if flagKeygenOutput == "" {
+			return errors.New("--signing requires --output")
+		}
+		pub, err := writeSigningKey(flagKeygenOutput)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "Signing key written to %s; public key %s.pub: %s\n",
+			flagKeygenOutput, flagKeygenOutput, describeKey(pub))
+		return nil
 	}
 	identity, err := age.GenerateX25519Identity()
 	if err != nil {

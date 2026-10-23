@@ -5,8 +5,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/iamvirul/sarc/archive"
 	sarcio "github.com/iamvirul/sarc/io"
@@ -37,6 +39,8 @@ func init() {
 		fmt.Sprintf("zstd compression level %d-%d", archive.MinCompressionLevel, archive.MaxCompressionLevel))
 	archiveCmd.Flags().BoolVar(&flagSolid, "solid", false,
 		"pack files up to 1 MiB into shared solid groups compressed as one stream (smaller archives of many small files; one key per group instead of per file)")
+	archiveCmd.Flags().StringVar(&flagSign, "sign", "",
+		"sign the archive with this private key (OpenSSH or PEM; ed25519, ECDSA, or RSA); check with verify --signer")
 	archiveCmd.Flags().BoolVar(&flagIncremental, "incremental", false,
 		"create the archive at --output, or add a session to it: only new or changed data is written, deleted files are recorded")
 	archiveCmd.MarkFlagsMutuallyExclusive("compress", "no-compress")
@@ -54,6 +58,13 @@ func runArchive(cmd *cobra.Command, args []string) error {
 	compression, err := compressionOptions(cmd)
 	if err != nil {
 		return err
+	}
+	var signer ssh.Signer
+	if flagSign != "" {
+		if signer, err = loadSigner(flagSign); err != nil {
+			return err
+		}
+		credentialOpts = append(credentialOpts, sarcio.WithSigner(signer))
 	}
 	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level, "solid", compression.Solid)
 	if flagIncremental {
@@ -82,7 +93,11 @@ func runArchive(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		return ca.Archive(args)
+		if err := ca.Archive(args); err != nil {
+			return err
+		}
+		reportSigned(out.progress, signer)
+		return nil
 	}
 
 	log.Debug("using streaming archiver")
@@ -96,7 +111,18 @@ func runArchive(cmd *cobra.Command, args []string) error {
 			log.Error("file failed", "path", path, "err", err)
 		}
 	}
-	return sa.Finalize(totalFiles, totalInputBytes)
+	if err := sa.Finalize(totalFiles, totalInputBytes); err != nil {
+		return err
+	}
+	reportSigned(out.progress, signer)
+	return nil
+}
+
+// reportSigned notes which key signed the archive, if any.
+func reportSigned(w io.Writer, signer ssh.Signer) {
+	if signer != nil {
+		fmt.Fprintf(w, "signed with %s\n", describeKey(signer.PublicKey()))
+	}
 }
 
 // compressionOptions maps the compression flags to archiver options, rejecting

@@ -4,79 +4,91 @@
 package main
 
 import (
-	"crypto/subtle"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 
-	"github.com/iamvirul/sarc/archive"
 	"github.com/spf13/cobra"
+
+	sarcio "github.com/iamvirul/sarc/io"
 )
+
+var flagSigners []string
 
 var verifyCmd = &cobra.Command{
 	Use:   "verify",
-	Short: "Check the archive checksum for corruption, without a password",
+	Short: "Check the archive checksum and signature, without a password",
 	Long: "verify recomputes the SHA-256 checksum stored in the archive footer. It detects\n" +
 		"accidental corruption (bad disks, truncated transfers) without decrypting anything.\n" +
-		"The checksum is not keyed, so it does not prove authenticity: tampering is detected\n" +
-		"by extract and list, which authenticate every entry with the archive's keys.",
+		"The checksum alone is not keyed: tampering is detected by extract and list, which\n" +
+		"authenticate every entry with the archive's keys.\n\n" +
+		"A signed archive (archive --sign, or sign) also proves who created it: with --signer,\n" +
+		"verify succeeds only if the archive is signed by one of the given public keys.",
 	RunE: runVerify,
 }
 
 func init() {
 	verifyCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
+	verifyCmd.Flags().StringArrayVar(&flagSigners, "signer", nil,
+		"trusted signer: an SSH public key (ssh-ed25519 AAAA...), or a .pub, authorized_keys, allowed_signers, or PEM public key file (repeatable); require a valid signature by one of them")
 	_ = verifyCmd.MarkFlagRequired("archive")
 }
 
-// verifyChunkSize is how much of the archive verifyStream reads at a time.
-const verifyChunkSize = 1 << 20
-
-var errArchiveTooSmall = errors.New("archive too small to contain a valid footer")
+var (
+	errChecksumFailed = errors.New("integrity check FAILED: archive checksum mismatch (corrupted or modified)")
+	errSignatureCheck = errors.New("signature check FAILED")
+)
 
 func runVerify(cmd *cobra.Command, args []string) error {
+	signers, err := parseSigners(flagSigners)
+	if err != nil {
+		return err
+	}
 	in, err := openArchiveInput(flagArchive)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	ok, err := verifyStream(in)
+	report, err := sarcio.VerifyArchive(in)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return fmt.Errorf("integrity check FAILED: archive checksum mismatch (corrupted or modified)")
+	out := cmd.OutOrStdout()
+	sigErr := reportSignature(out, report, signers)
+	if !report.ChecksumOK {
+		return errChecksumFailed
 	}
-	fmt.Println("integrity check PASSED")
-	return nil
+	fmt.Fprintln(out, "integrity check PASSED")
+	return sigErr
 }
 
-// verifyStream reports whether the archive checksum (see archive.ArchiveChecksum) of
-// everything in r before the footer matches the checksum stored in the footer. It reads
-// r once without seeking, holding back the last footer-sized bytes, so it works on
-// pipes; the comparison is constant time.
-func verifyStream(r io.Reader) (bool, error) {
-	const footerSize = archive.HMACSize + archive.ReservedSize
-	h := archive.NewArchiveChecksum()
-	work := make([]byte, footerSize+verifyChunkSize)
-	held := 0
-	for {
-		n, err := r.Read(work[held:])
-		held += n
-		if held > footerSize {
-			h.Write(work[:held-footerSize])
-			copy(work, work[held-footerSize:held])
-			held = footerSize
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return false, fmt.Errorf("read archive: %w", err)
+// reportSignature prints the signature status and returns errSignatureCheck when
+// signers were required and none of them signed the archive validly, or when a
+// signature is present but invalid.
+func reportSignature(w io.Writer, report sarcio.VerifyReport, signers []trustedSigner) error {
+	switch {
+	case !report.Signed && len(signers) > 0:
+		fmt.Fprintln(w, "signature MISSING: the archive is not signed")
+		return errSignatureCheck
+	case !report.Signed:
+		return nil
+	case report.SignatureErr != nil:
+		fmt.Fprintln(w, "signature INVALID: it does not match the archive")
+		return errSignatureCheck
+	}
+	signer := describeKey(report.Signer)
+	if len(signers) == 0 {
+		fmt.Fprintf(w, "signature valid, signed by %s; pass --signer to check it is a key you trust\n", signer)
+		return nil
+	}
+	for _, s := range signers {
+		if bytes.Equal(s.key.Marshal(), report.Signer.Marshal()) {
+			fmt.Fprintf(w, "signature VALID: signed by %s, %s\n", signer, s.label)
+			return nil
 		}
 	}
-	if held < footerSize {
-		return false, errArchiveTooSmall
-	}
-	return subtle.ConstantTimeCompare(h.Sum(nil), work[:archive.HMACSize]) == 1, nil
+	fmt.Fprintf(w, "signature UNTRUSTED: signed by %s, which is not a given --signer\n", signer)
+	return errSignatureCheck
 }
