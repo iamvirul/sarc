@@ -6,10 +6,8 @@ package archive
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"hash"
 	"io"
 
 	"github.com/iamvirul/sarc/crypto"
@@ -25,8 +23,9 @@ const writeBufferSize = 4 * 1024 * 1024
 type ArchiveWriter struct {
 	w      io.Writer     // points to bw; footer writes bypass tee but still go here
 	bw     *bufio.Writer // flushed once in WriteFooter
-	hasher hash.Hash
-	tee    io.Writer // MultiWriter(bw, hasher) — all archive content goes through this
+	hasher *ArchiveChecksum
+	tee    io.Writer // MultiWriter(bw, hasher, counter): all archive content goes through this
+	offset *offsetCounter
 	keys   *KeySchedule
 	// recipients is the sealed recipient block written into the header.
 	recipients []byte
@@ -44,39 +43,118 @@ func NewArchiveWriter(w io.Writer, creds Credentials) (*ArchiveWriter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("archive/writer: %w", err)
 	}
+	return newArchiveWriter(w, NewVersion2KeySchedule(cek), recipients, NewArchiveChecksum(), 0), nil
+}
+
+// ResumeArchiveWriter returns an ArchiveWriter that appends to an existing archive at
+// offset, where w is positioned. hashState is the marshaled SHA-256 state of the
+// archive's first offset bytes (from a Checkpoint), so the footer checksum covers the
+// whole archive without rereading it. No header is written.
+func ResumeArchiveWriter(w io.Writer, keys *KeySchedule, offset int64, hashState []byte) (*ArchiveWriter, error) {
+	hasher, err := ResumeArchiveChecksum(hashState)
+	if err != nil {
+		return nil, fmt.Errorf("archive/writer: %w", err)
+	}
+	return newArchiveWriter(w, keys, nil, hasher, offset), nil
+}
+
+func newArchiveWriter(w io.Writer, keys *KeySchedule, recipients []byte, hasher *ArchiveChecksum, offset int64) *ArchiveWriter {
 	bw := bufio.NewWriterSize(w, writeBufferSize)
-	hasher := sha256.New()
+	counter := &offsetCounter{n: offset}
 	return &ArchiveWriter{
 		w:          bw,
 		bw:         bw,
 		hasher:     hasher,
-		tee:        io.MultiWriter(bw, hasher),
-		keys:       NewVersion2KeySchedule(cek),
+		tee:        io.MultiWriter(bw, hasher, counter),
+		offset:     counter,
+		keys:       keys,
 		recipients: recipients,
-	}, nil
+	}
 }
+
+// offsetCounter counts the archive bytes written so far.
+type offsetCounter struct{ n int64 }
+
+func (c *offsetCounter) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+	return len(p), nil
+}
+
+// Offset returns the archive offset of the next byte to be written.
+func (aw *ArchiveWriter) Offset() int64 { return aw.offset.n }
+
+// Keys returns the writer's key schedule.
+func (aw *ArchiveWriter) Keys() *KeySchedule { return aw.keys }
 
 // WriteHeader serialises and writes the archive header, sealing fileCount with the
 // header key. It must be called once, before any entry.
 func (aw *ArchiveWriter) WriteHeader(fileCount uint64) error {
+	return aw.WriteHeaderWithFlags(fileCount, 0)
+}
+
+// WriteHeaderWithFlags is WriteHeader with flags (such as HeaderFlagIncremental) stored
+// in the first reserved header byte.
+func (aw *ArchiveWriter) WriteHeaderWithFlags(fileCount uint64, flags byte) error {
 	hdr := ArchiveHeader{Magic: Magic, Version: aw.keys.Version(), RecipientBlock: aw.recipients}
-	headerKey, err := aw.keys.HeaderKey()
+	sealed, err := SealFileCount(aw.keys, fileCount)
 	if err != nil {
-		return fmt.Errorf("archive/writer: header key: %w", err)
+		return err
+	}
+	hdr.FileCountEncrypted = sealed
+	hdr.Reserved[0] = flags
+	return aw.writeHeader(hdr)
+}
+
+// FileCountOffset returns the archive offset of the sealed file count in a Version2
+// header with this writer's recipient block, for rewriting it in place.
+func (aw *ArchiveWriter) FileCountOffset() int64 {
+	return FileCountOffset(len(aw.recipients))
+}
+
+// FileCountOffset returns the offset of the sealed file count in a Version2 header
+// whose recipient block is recipientBlockLen bytes.
+func FileCountOffset(recipientBlockLen int) int64 {
+	return int64(len(Magic) + 2 + 4 + recipientBlockLen)
+}
+
+// SealFileCount seals count with keys' header key, as stored in the header.
+func SealFileCount(keys *KeySchedule, count uint64) ([FileCountSealedSize]byte, error) {
+	var out [FileCountSealedSize]byte
+	headerKey, err := keys.HeaderKey()
+	if err != nil {
+		return out, fmt.Errorf("archive/writer: header key: %w", err)
 	}
 	em, err := crypto.NewEncryptionManager(headerKey)
 	if err != nil {
-		return fmt.Errorf("archive/writer: header encryption: %w", err)
+		return out, fmt.Errorf("archive/writer: header encryption: %w", err)
 	}
 	var countBuf [8]byte
-	binary.LittleEndian.PutUint64(countBuf[:], fileCount)
+	binary.LittleEndian.PutUint64(countBuf[:], count)
 	sealed, err := em.EncryptBlock(countBuf[:])
 	if err != nil {
-		return fmt.Errorf("archive/writer: seal file count: %w", err)
+		return out, fmt.Errorf("archive/writer: seal file count: %w", err)
 	}
-	copy(hdr.FileCountEncrypted[:crypto.NonceSize], sealed.Nonce[:])
-	copy(hdr.FileCountEncrypted[crypto.NonceSize:], sealed.Ciphertext)
-	return aw.writeHeader(hdr)
+	copy(out[:crypto.NonceSize], sealed.Nonce[:])
+	copy(out[crypto.NonceSize:], sealed.Ciphertext)
+	return out, nil
+}
+
+// WriteCheckpointFooter ends an incremental archive: a checkpoint pointing at the
+// session index at lastIndex and carrying the checksum state so far, then the end
+// marker and footer (see WriteFooter).
+func (aw *ArchiveWriter) WriteCheckpointFooter(lastIndex int64) error {
+	state, err := aw.hasher.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("archive/writer: save checksum state: %w", err)
+	}
+	cp, err := Checkpoint{LastIndex: uint64(lastIndex), HashState: state}.Marshal()
+	if err != nil {
+		return err
+	}
+	if _, err := aw.tee.Write(cp); err != nil {
+		return fmt.Errorf("archive/writer: checkpoint: %w", err)
+	}
+	return aw.WriteFooter()
 }
 
 // WriteFileEntry serialises a complete FileEntry to the stream.

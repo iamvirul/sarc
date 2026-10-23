@@ -98,3 +98,33 @@ func TestSubkeysNeverEqualMasterKey(t *testing.T) {
 		t.Fatal("subkeys are not domain-separated from each other and the master key")
 	}
 }
+
+func TestChunkKeysAreIndependentAndDeterministic(t *testing.T) {
+	var master, other [crypto.KeySize]byte
+	master[0], other[0] = 1, 2
+	idKey, err := crypto.DeriveChunkIDKey(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := crypto.DeriveChunkIDKey(master)
+	otherID, _ := crypto.DeriveChunkIDKey(other)
+	fileKey, _ := crypto.DeriveHeaderSubkey(master)
+	if idKey != again || idKey == otherID || idKey == fileKey {
+		t.Fatal("chunk ID key is not deterministic per master key and independent of other subkeys")
+	}
+	gear, err := crypto.DeriveGearTable(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherGear, _ := crypto.DeriveGearTable(other)
+	if gear == otherGear {
+		t.Fatal("gear tables of different keys are identical")
+	}
+	seen := map[uint64]bool{}
+	for _, v := range gear {
+		seen[v] = true
+	}
+	if len(seen) < crypto.GearTableSize {
+		t.Fatal("gear table has repeated values")
+	}
+}
