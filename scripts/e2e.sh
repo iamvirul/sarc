@@ -281,6 +281,57 @@ example_hardware_token_plugin() {
   echo "plugin recipient (as age1yubikey1...) via stdout; plugin prompts on stderr; age CLI uses the same token"
 }
 
+example_directory_tree() {
+  mkdir -p tree/docs/2026 tree/.config
+  cp in/main.go tree/docs/2026/main.go
+  cp in/app.log tree/docs/app.log
+  echo "key=value" >tree/.config/settings.ini
+  local mode flags
+  for mode in per-file solid; do
+    flags=()
+    if [ "$mode" = solid ]; then flags=(--solid); fi
+    rm -rf out-tree tree.sarc
+    "$SARC" archive -p "$PASS" ${flags[@]+"${flags[@]}"} -o tree.sarc tree >/dev/null
+    "$SARC" extract -p "$PASS" -a tree.sarc -o out-tree >/dev/null
+    diff -r tree out-tree/tree >/dev/null || { echo "tree differs after a $mode roundtrip"; return 1; }
+  done
+  echo "nested directories and hidden files roundtrip, per-file and --solid"
+}
+
+example_incremental_backup() {
+  mkdir -p data/sub
+  head -c "$((BIG_MB * 1048576))" /dev/urandom >data/disk.img
+  cp in/app.log data/sub/app.log
+  echo "temporary" >data/sub/tmp.txt
+  local out size1
+  out="$("$SARC" archive -p "$PASS" --incremental -o backup.sarc data | tail -n 1)"
+  echo "$out" | grep -q "created incremental archive: session 1, 3 file(s)" || { echo "create: $out"; return 1; }
+  size1="$(wc -c <backup.sarc | tr -d ' ')"
+  local before after
+  before="$(sha backup.sarc)"
+  out="$("$SARC" archive -p "$PASS" --incremental -o backup.sarc data | tail -n 1)"
+  after="$(sha backup.sarc)"
+  [ "$before" = "$after" ] || { echo "unchanged run modified the archive: $out"; return 1; }
+
+  printf '\x01' | dd of=data/disk.img bs=1 seek=$((BIG_MB * 524288)) conv=notrunc 2>/dev/null
+  touch data/disk.img
+  rm data/sub/tmp.txt
+  out="$("$SARC" archive -p "$PASS" --incremental -o backup.sarc data | tail -n 1)"
+  echo "$out" | grep -q "session 2: 1 file(s) changed" || { echo "update: $out"; return 1; }
+  echo "$out" | grep -q "1 deleted" || { echo "deletion not recorded: $out"; return 1; }
+  local grown=$(( $(wc -c <backup.sarc) - size1 ))
+  [ "$grown" -lt $((10 * 1048576)) ] || { echo "one changed byte appended $grown bytes"; return 1; }
+
+  "$SARC" list -p "$PASS" -a backup.sarc | grep -q "tmp.txt" && { echo "deleted file still listed"; return 1; }
+  "$SARC" verify -a backup.sarc | grep -q PASSED
+  "$SARC" extract -p "$PASS" -a backup.sarc -o restored >/dev/null
+  diff -r data restored/data >/dev/null || { echo "restored tree differs from the latest state"; return 1; }
+  if dd if=backup.sarc bs=1048576 2>/dev/null | "$SARC" extract -p "$PASS" -a - -o piped >/dev/null 2>&1; then
+    echo "incremental archive extracted from a pipe"; return 1
+  fi
+  echo "unchanged rerun writes 0 bytes; 1 byte changed in ${BIG_MB} MB appends $((grown / 1024)) KB; deletions not restored"
+}
+
 example_constant_memory() {
   head -c "$((BIG_MB * 1048576))" /dev/urandom >big.bin
   local want rss
@@ -315,6 +366,8 @@ run_example "Key file" example_key_file
 run_example "Key file and password" example_key_file_and_password
 run_example "SSH keys" example_ssh_keys
 run_example "Hardware token plugin" example_hardware_token_plugin
+run_example "Directory tree" example_directory_tree
+run_example "Incremental backup" example_incremental_backup
 run_example "Constant memory streaming extract" example_constant_memory
 run_example "Refuse terminal output" example_refuses_terminal
 
