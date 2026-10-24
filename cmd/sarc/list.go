@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/iamvirul/sarc/archive"
 	sarcio "github.com/iamvirul/sarc/io"
 )
 
@@ -40,13 +41,61 @@ func runList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("%-40s  %-12s  %-11s  %s\n", "FILENAME", "SIZE BUCKET", "CODEC", "RATIO")
-	fmt.Printf("%-40s  %-12s  %-11s  %s\n", "--------", "-----------", "-----", "-----")
+	fmt.Printf("%-10s  %-40s  %-12s  %-11s  %s\n", "MODE", "FILENAME", "SIZE BUCKET", "CODEC", "RATIO")
+	fmt.Printf("%-10s  %-40s  %-12s  %-11s  %s\n", "----", "--------", "-----------", "-----", "-----")
 	for _, r := range results {
-		fmt.Printf("%-40s  %-12s  %-11s  %s\n", r.Filename, r.SizeBucket, formatCodec(r), formatRatio(r))
+		if r.Kind != archive.KindRegular {
+			fmt.Printf("%-10s  %s\n", formatMode(r.Kind, r.Mode), formatName(r))
+			continue
+		}
+		fmt.Printf("%-10s  %-40s  %-12s  %-11s  %s\n", formatMode(r.Kind, r.Mode), formatName(r), r.SizeBucket, formatCodec(r), formatRatio(r))
 	}
-	fmt.Printf("\n%d file(s)\n", len(results))
+	fmt.Printf("\n%d entr%s\n", len(results), map[bool]string{true: "y", false: "ies"}[len(results) == 1])
 	return nil
+}
+
+// formatName renders an entry's name with its link target: "a -> b" for a symlink and
+// "a => b" for a hard link.
+func formatName(r sarcio.ListResult) string {
+	switch r.Kind {
+	case archive.KindSymlink:
+		return r.Filename + " -> " + r.LinkTarget
+	case archive.KindHardlink:
+		return r.Filename + " => " + r.LinkTarget
+	}
+	return r.Filename
+}
+
+// formatMode renders a kind and chmod-form mode as ls -l does, e.g. "drwxr-sr-t".
+func formatMode(kind archive.FileKind, mode uint32) string {
+	b := []byte("----------")
+	switch kind {
+	case archive.KindDirectory:
+		b[0] = 'd'
+	case archive.KindSymlink:
+		b[0] = 'l'
+	}
+	const rwx = "rwxrwxrwx"
+	for i := 0; i < 9; i++ {
+		if mode&(1<<(8-i)) != 0 {
+			b[i+1] = rwx[i]
+		}
+	}
+	special := []struct {
+		bit       uint32
+		pos       int
+		set, lone byte
+	}{{0o4000, 3, 's', 'S'}, {0o2000, 6, 's', 'S'}, {0o1000, 9, 't', 'T'}}
+	for _, s := range special {
+		if mode&s.bit != 0 {
+			if b[s.pos] == 'x' {
+				b[s.pos] = s.set
+			} else {
+				b[s.pos] = s.lone
+			}
+		}
+	}
+	return string(b)
 }
 
 // formatCodec renders the codec, marking solid group members, e.g. "zstd+solid".

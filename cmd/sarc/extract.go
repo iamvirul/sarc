@@ -23,6 +23,8 @@ func init() {
 	extractCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
 	extractCmd.Flags().StringVarP(&flagOutput, "output", "o", ".", "output directory")
 	extractCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")
+	extractCmd.Flags().BoolVar(&flagPreserveOwner, "preserve-owner", false,
+		"restore recorded owners and setuid, setgid, and sticky bits (needs root); otherwise they are skipped with a warning")
 	_ = extractCmd.MarkFlagRequired("archive")
 }
 
@@ -41,7 +43,11 @@ func runExtract(cmd *cobra.Command, args []string) error {
 
 	// Progress tracker handles per-file error printing via FileError.
 	progress := sarcio.NewConsoleProgressBar(os.Stdout)
-	ex := sarcio.NewSafeExtractor(f, flagPassword, progress, append(opts, f.randomAccess()...)...)
+	opts = append(opts, f.randomAccess()...)
+	if flagPreserveOwner {
+		opts = append(opts, sarcio.WithRestoreOwner(true))
+	}
+	ex := sarcio.NewSafeExtractor(f, flagPassword, progress, opts...)
 
 	results, err := ex.Extract(flagOutput)
 	if err != nil {
