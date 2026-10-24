@@ -22,6 +22,7 @@ var (
 	flagIncremental   bool
 	flagSign          string
 	flagSplit         string
+	flagPreserveOwner bool
 
 	flagRecipients []string
 	flagIdentities []string

@@ -26,7 +26,7 @@ func writeSizedFile(t *testing.T, dir, name string, size int) string {
 func inputsFor(paths ...string) []inputFile {
 	files := make([]inputFile, len(paths))
 	for i, p := range paths {
-		files[i] = inputFile{path: p, name: filepath.Base(p)}
+		files[i] = inputFile{path: p, name: filepath.Base(p), attrs: archive.Attributes{Mode: 0o644}}
 	}
 	return files
 }
@@ -51,7 +51,7 @@ func TestPlanSolidSeparatesCandidatesFromIndividualFiles(t *testing.T) {
 	}
 	for i, p := range wantIndividual {
 		if plan.individual[i].path != p {
-			t.Fatalf("individual[%d] = %s, want %s", i, plan.individual[i], p)
+			t.Fatalf("individual[%d] = %s, want %s", i, plan.individual[i].path, p)
 		}
 	}
 	// Candidates are ordered by extension, stable within an extension.
@@ -61,7 +61,7 @@ func TestPlanSolidSeparatesCandidatesFromIndividualFiles(t *testing.T) {
 	}
 	for i, p := range want {
 		if plan.groups[0][i].path != p {
-			t.Fatalf("group[%d] = %s, want %s", i, plan.groups[0][i], p)
+			t.Fatalf("group[%d] = %s, want %s", i, plan.groups[0][i].path, p)
 		}
 	}
 }
@@ -86,7 +86,7 @@ func TestPlanSolidSplitsGroupsAtMaxStreamSize(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			size += archive.SolidRecordSize(len(info.Name()), int(info.Size()))
+			size += archive.SolidRecordSize(len(info.Name()), attributesSize(in.attrs), int(info.Size()))
 		}
 		if size > archive.MaxSolidStreamSize {
 			t.Fatalf("group stream %d bytes exceeds %d", size, archive.MaxSolidStreamSize)

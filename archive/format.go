@@ -70,14 +70,20 @@ type MetadataBlock struct {
 }
 
 // PlaintextMetadata is the in-memory form of file metadata before sealing.
-// Codec is absent from Version1 metadata and decodes as CodecNone there.
+// Codec is absent from Version1 metadata and decodes as CodecNone there. Attributes are
+// Version2+ and nil when absent; they supersede Permissions, which stays for Version1.
 type PlaintextMetadata struct {
 	EncryptedFilename []byte
 	SizeBucket        SizeBucket
 	TimestampHash     [32]byte
 	Permissions       uint32
 	Codec             Codec
+	Attributes        *Attributes
 }
+
+// MaxMetadataSize bounds sealed metadata plaintext: the fixed fields, a maximal
+// encrypted filename, and maximal attributes.
+const MaxMetadataSize = 2 + 0xFFFF + 1 + 32 + 4 + 1 + 4 + MaxAttributesSize
 
 // DataBlock is one variable-length encrypted chunk of file content.
 type DataBlock struct {

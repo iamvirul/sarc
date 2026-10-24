@@ -29,6 +29,8 @@ type StreamingArchiver struct {
 	w           *archive.ArchiveWriter
 	out         io.Writer
 	signer      ssh.Signer
+	walk        walkOptions
+	special     []inputFile // directories and links, written after every file
 	compression *compressionPolicy
 	progress    ProgressTracker
 	start       time.Time
@@ -40,14 +42,16 @@ type StreamingArchiver struct {
 // (empty for none) and any recipients added with WithAgeRecipients; at least one is
 // required. Compression defaults to CompressionAuto at level 3; override with WithCompression.
 func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker, opts ...ArchiverOption) (*StreamingArchiver, error) {
-	aw, compression, signer, err := openArchiveWriter(w, password, opts)
+	aw, compression, cfg, err := openArchiveWriter(w, password, opts)
 	if err != nil {
 		return nil, err
 	}
 	if progress == nil {
 		progress = NopProgressTracker{}
 	}
-	return &StreamingArchiver{w: aw, out: w, signer: signer, compression: compression, progress: progress, start: time.Now()}, nil
+	return &StreamingArchiver{
+		w: aw, out: w, signer: cfg.signer, walk: cfg.walkOptions(), compression: compression, progress: progress, start: time.Now(),
+	}, nil
 }
 
 // AddFile reads path from disk and appends it to the archive as a single file entry.
@@ -63,14 +67,19 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 // A directory is archived recursively (see expandInputs): recoverable failures of its
 // files are reported through the ProgressTracker and only fatal errors are returned.
 func (sa *StreamingArchiver) AddFile(path string) error {
-	files, skipped := expandInputs([]string{path})
+	entries, skipped := expandInputs([]string{path}, sa.walk)
 	if info, err := os.Stat(path); err != nil || !info.IsDir() {
-		if len(skipped) > 0 {
-			return skipped[0].err
+		for _, s := range skipped {
+			if !s.warning {
+				return s.err
+			}
 		}
-		return sa.addInput(files[0])
+		reportSkipped(skipped, sa.progress)
+		return sa.addInput(entries[0])
 	}
 	reportSkipped(skipped, sa.progress)
+	files, special := splitSpecial(entries)
+	sa.special = append(sa.special, special...)
 	for _, in := range files {
 		if err := sa.addInput(in); err != nil {
 			if isFatal(err) {
@@ -186,6 +195,7 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 		TimestampHash:     archive.HashTimestamp(salt, info.ModTime()),
 		Permissions:       uint32(info.Mode().Perm()),
 		Codec:             codec,
+		Attributes:        &in.attrs,
 	}
 	metaBlock, err := mm.Seal(pm)
 	if err != nil {
@@ -255,6 +265,9 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 // all AddFile calls.
 func (sa *StreamingArchiver) Finalize(totalFiles int, totalBytes int64) error {
 	if err := sa.flushSolid(); err != nil {
+		return err
+	}
+	if err := writeSpecialEntries(sa.w, sa.special, sa.progress); err != nil {
 		return err
 	}
 	if err := finishArchive(sa.w, sa.out, sa.signer); err != nil {

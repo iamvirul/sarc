@@ -41,6 +41,8 @@ func init() {
 		"pack files up to 1 MiB into shared solid groups compressed as one stream (smaller archives of many small files; one key per group instead of per file)")
 	archiveCmd.Flags().StringVar(&flagSign, "sign", "",
 		"sign the archive with this private key (OpenSSH or PEM; ed25519, ECDSA, or RSA); check with verify --signer")
+	archiveCmd.Flags().BoolVar(&flagPreserveOwner, "preserve-owner", false,
+		"record each entry's numeric owner and group (restored by extract --preserve-owner, usually as root)")
 	archiveCmd.Flags().BoolVar(&flagIncremental, "incremental", false,
 		"create the archive at --output, or add a session to it: only new or changed data is written, deleted files are recorded")
 	archiveCmd.MarkFlagsMutuallyExclusive("compress", "no-compress")
@@ -68,6 +70,9 @@ func runArchive(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		credentialOpts = append(credentialOpts, sarcio.WithSigner(signer))
+	}
+	if flagPreserveOwner {
+		credentialOpts = append(credentialOpts, sarcio.WithPreserveOwner(true))
 	}
 	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level, "solid", compression.Solid)
 	if flagIncremental {

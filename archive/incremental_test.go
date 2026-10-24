@@ -26,9 +26,14 @@ func sampleIndex() *archive.SessionIndex {
 			{ID: [32]byte{2}, Pack: 1, Offset: 4096, StoredLen: 300, RawLen: 900, Codec: archive.CodecZstd},
 		},
 		Files: []archive.FileVersion{
-			{Name: "data/a.txt", Mode: 0o644, ModTime: 1_790_000_000_123_456_789, Size: 1900, Chunks: []uint64{40, 41}},
-			{Name: "data/same.bin", Mode: 0o600, ModTime: -5, Size: 1000, Chunks: []uint64{3, 3, 40}},
-			{Name: "empty", Mode: 0o644, Size: 0, Chunks: []uint64{}},
+			{Name: "data/a.txt", Attributes: archive.Attributes{Mode: 0o644, ModTime: 1_790_000_000_123_456_789,
+				Xattrs: []archive.Xattr{{Name: "user.tag", Value: []byte("x")}}}, Size: 1900, Chunks: []uint64{40, 41}},
+			{Name: "data/same.bin", Attributes: archive.Attributes{Mode: 0o600, ModTime: -5, Owner: &archive.Owner{UID: 1, GID: 2}},
+				Size: 1000, Chunks: []uint64{3, 3, 40}},
+			{Name: "empty", Attributes: archive.Attributes{Mode: 0o644}, Size: 0, Chunks: []uint64{}},
+			{Name: "data", Attributes: archive.Attributes{Kind: archive.KindDirectory, Mode: 0o755}, Chunks: []uint64{}},
+			{Name: "data/link", Attributes: archive.Attributes{Kind: archive.KindSymlink, Mode: 0o777, LinkTarget: "a.txt"}, Chunks: []uint64{}},
+			{Name: "data/hard", Attributes: archive.Attributes{Kind: archive.KindHardlink, Mode: 0o644, LinkTarget: "data/a.txt"}, Chunks: []uint64{}},
 		},
 		Deleted: []string{"data/old.txt"},
 	}

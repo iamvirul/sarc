@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -15,10 +16,11 @@ import (
 
 func TestSolidStreamRoundtrip(t *testing.T) {
 	members := []archive.SolidMember{
-		{Name: "main.go", Permissions: 0o644, Data: []byte("package main\n")},
-		{Name: "empty.txt", Permissions: 0o600, Data: nil},
-		{Name: "run.sh", Permissions: 0o755, Data: bytes.Repeat([]byte{0x00, 0xFF}, 5000)},
-		{Name: strings.Repeat("n", 0xFFFF), Permissions: 0o644, Data: []byte("max name")},
+		{Name: "main.go", Attributes: archive.Attributes{Mode: 0o644, ModTime: 1_790_000_000_000_000_001}, Data: []byte("package main\n")},
+		{Name: "empty.txt", Attributes: archive.Attributes{Mode: 0o600}, Data: nil},
+		{Name: "run.sh", Attributes: archive.Attributes{Mode: 0o4755, Owner: &archive.Owner{UID: 1000, GID: 50},
+			Xattrs: []archive.Xattr{{Name: "user.note", Value: []byte("v")}}}, Data: bytes.Repeat([]byte{0x00, 0xFF}, 5000)},
+		{Name: strings.Repeat("n", 0xFFFF), Attributes: archive.Attributes{Mode: 0o644}, Data: []byte("max name")},
 	}
 	var stream []byte
 	for _, m := range members {
@@ -29,7 +31,11 @@ func TestSolidStreamRoundtrip(t *testing.T) {
 	}
 	wantLen := 0
 	for _, m := range members {
-		wantLen += archive.SolidRecordSize(len(m.Name), len(m.Data))
+		attrs, err := archive.AppendAttributes(nil, m.Attributes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantLen += archive.SolidRecordSize(len(m.Name), len(attrs), len(m.Data))
 	}
 	if len(stream) != wantLen {
 		t.Fatalf("stream length %d, SolidRecordSize sum %d", len(stream), wantLen)
@@ -43,7 +49,7 @@ func TestSolidStreamRoundtrip(t *testing.T) {
 		t.Fatalf("got %d members, want %d", len(got), len(members))
 	}
 	for i, m := range members {
-		if got[i].Name != m.Name || got[i].Permissions != m.Permissions || !bytes.Equal(got[i].Data, m.Data) {
+		if got[i].Name != m.Name || !reflect.DeepEqual(got[i].Attributes, m.Attributes) || !bytes.Equal(got[i].Data, m.Data) {
 			t.Fatalf("member %d mismatch", i)
 		}
 	}
@@ -57,12 +63,21 @@ func TestAppendSolidRecordRejectsInvalidName(t *testing.T) {
 
 // rawRecord encodes a record without name validation, for malformed-stream tests.
 func rawRecord(name string, dataLen uint64, data []byte) []byte {
+	attrs, _ := archive.AppendAttributes(nil, archive.Attributes{Mode: 0o644})
 	var b []byte
 	b = binary.LittleEndian.AppendUint16(b, uint16(len(name)))
 	b = append(b, name...)
-	b = binary.LittleEndian.AppendUint32(b, 0o644)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(attrs)))
+	b = append(b, attrs...)
 	b = binary.LittleEndian.AppendUint64(b, dataLen)
 	return append(b, data...)
+}
+
+func TestAppendSolidRecordRejectsNonRegularMembers(t *testing.T) {
+	m := archive.SolidMember{Name: "link", Attributes: archive.Attributes{Kind: archive.KindSymlink, LinkTarget: "x"}}
+	if _, err := archive.AppendSolidRecord(nil, m); err == nil {
+		t.Fatal("symlink packed into a solid group")
+	}
 }
 
 func TestParseSolidStreamRejectsMalformedInput(t *testing.T) {

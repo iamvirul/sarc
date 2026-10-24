@@ -84,8 +84,9 @@ func HashTimestamp(salt [crypto.SaltSize]byte, t time.Time) [32]byte {
 	return out
 }
 
-// Wire layout: [2] filename len | [N] filename | [1] bucket | [32] ts hash | [4] perms | [1] codec
-// The trailing codec byte is Version2+; Version1 metadata ends after perms.
+// Wire layout: [2] filename len | [N] filename | [1] bucket | [32] ts hash | [4] perms |
+// [1] codec | [4] attributes len | attributes. The codec byte and attributes are
+// Version2+; Version1 metadata ends after perms, and attributes are optional.
 func marshalMetadata(pm PlaintextMetadata) ([]byte, error) {
 	fnLen := len(pm.EncryptedFilename)
 	if fnLen > 0xFFFF {
@@ -105,7 +106,15 @@ func marshalMetadata(pm PlaintextMetadata) ([]byte, error) {
 	binary.LittleEndian.PutUint32(buf[off:off+4], pm.Permissions)
 	off += 4
 	buf[off] = byte(pm.Codec)
-	return buf, nil
+	if pm.Attributes == nil {
+		return buf, nil
+	}
+	attrs, err := AppendAttributes(nil, *pm.Attributes)
+	if err != nil {
+		return nil, err
+	}
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(attrs)))
+	return append(buf, attrs...), nil
 }
 
 func unmarshalMetadata(b []byte) (PlaintextMetadata, error) {
@@ -132,6 +141,22 @@ func unmarshalMetadata(b []byte) (PlaintextMetadata, error) {
 		if !knownCodec(pm.Codec) {
 			return PlaintextMetadata{}, fmt.Errorf("archive/metadata: unknown codec %d", pm.Codec)
 		}
+		off++
+	}
+	if len(b) > off {
+		if len(b)-off < 4 {
+			return PlaintextMetadata{}, fmt.Errorf("archive/metadata: truncated attributes length")
+		}
+		n := binary.LittleEndian.Uint32(b[off:])
+		off += 4
+		if uint64(n) != uint64(len(b)-off) {
+			return PlaintextMetadata{}, fmt.Errorf("archive/metadata: attributes length mismatch")
+		}
+		attrs, err := ParseAttributes(b[off:])
+		if err != nil {
+			return PlaintextMetadata{}, err
+		}
+		pm.Attributes = &attrs
 	}
 	return pm, nil
 }

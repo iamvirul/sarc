@@ -70,10 +70,20 @@ func planSolid(files []inputFile) solidPlan {
 // size of its record: it must be a regular file of at most archive.SolidMemberMaxSize.
 func solidCandidate(in inputFile) (int, bool) {
 	info, err := os.Stat(in.path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > archive.SolidMemberMaxSize {
+	if err != nil || !in.regular() || !info.Mode().IsRegular() || info.Size() > archive.SolidMemberMaxSize {
 		return 0, false
 	}
-	return archive.SolidRecordSize(len(in.name), int(info.Size())), true
+	return archive.SolidRecordSize(len(in.name), attributesSize(in.attrs), int(info.Size())), true
+}
+
+// attributesSize returns the encoded size of attrs, or 0 if they cannot be encoded
+// (AppendSolidRecord then reports the error).
+func attributesSize(attrs archive.Attributes) int {
+	b, err := archive.AppendAttributes(nil, attrs)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }
 
 // solidMemberResult is the outcome of packing one file into a solid group.
@@ -134,14 +144,14 @@ func appendSolidMember(stream []byte, in inputFile, progress ProgressTracker) ([
 		return stream, res
 	}
 	if len(data) > archive.SolidMemberMaxSize ||
-		len(stream)+archive.SolidRecordSize(len(in.name), len(data)) > archive.MaxSolidStreamSize {
+		len(stream)+archive.SolidRecordSize(len(in.name), attributesSize(in.attrs), len(data)) > archive.MaxSolidStreamSize {
 		res.err = recoverable(ErrCodeReadFailed, "file changed size during archive", nil)
 		return stream, res
 	}
 	out, err := archive.AppendSolidRecord(stream, archive.SolidMember{
-		Name:        in.name,
-		Permissions: uint32(info.Mode().Perm()),
-		Data:        data,
+		Name:       in.name,
+		Attributes: in.attrs,
+		Data:       data,
 	})
 	if err != nil {
 		res.err = recoverable(ErrCodeReadFailed, "unsupported file name", err)
@@ -305,28 +315,21 @@ func (se *SafeExtractor) readSolidMembers(keys *archive.KeySchedule, head entryH
 	return members, int64(len(stream)), stored, nil
 }
 
-// extractSolidBody writes every member of an authenticated solid group under outputDir.
+// extractSolidBody writes every member of an authenticated solid group into tree.
 // The whole group is verified before any member is written.
-func (se *SafeExtractor) extractSolidBody(keys *archive.KeySchedule, head entryHead, decs *entryDecoders, outputDir string) ([]ExtractionResult, error) {
+func (se *SafeExtractor) extractSolidBody(keys *archive.KeySchedule, head entryHead, decs *entryDecoders, tree *outputTree) ([]ExtractionResult, error) {
 	members, _, _, err := se.readSolidMembers(keys, head, decs)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, fatal(ErrCodeWriteFailed, "create output dir", err)
-	}
 	results := make([]ExtractionResult, 0, len(members))
 	for _, m := range members {
-		outPath, err := entryOutputPath(outputDir, m.Name)
-		if err != nil {
+		if err := tree.writeFile(m.Name, m.Data, &m.Attributes); err != nil {
+			if isFatal(err) {
+				return results, err
+			}
 			se.progress.FileError(m.Name, err)
 			results = append(results, ExtractionResult{Filename: m.Name, Err: err})
-			continue
-		}
-		if err := os.WriteFile(outPath, m.Data, os.FileMode(m.Permissions).Perm()); err != nil {
-			writeErr := recoverable(ErrCodeWriteFailed, "write file", err)
-			se.progress.FileError(m.Name, writeErr)
-			results = append(results, ExtractionResult{Filename: m.Name, Err: writeErr})
 			continue
 		}
 		se.progress.FileFinished(m.Name)
@@ -344,14 +347,14 @@ func (se *SafeExtractor) listSolidBody(keys *archive.KeySchedule, head entryHead
 	results := make([]ListResult, 0, len(members))
 	for _, m := range members {
 		size := int64(len(m.Data))
-		results = append(results, ListResult{
+		results = append(results, withAttributes(ListResult{
 			Filename:      m.Name,
 			SizeBucket:    bucketName(archive.BucketizeSize(size)),
 			Codec:         head.pm.Codec.String(),
 			Solid:         true,
 			OriginalBytes: size,
 			StoredBytes:   size * stored / streamSize,
-		})
+		}, &m.Attributes, 0))
 	}
 	return results, nil
 }

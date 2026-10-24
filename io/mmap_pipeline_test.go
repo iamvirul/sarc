@@ -236,7 +236,7 @@ func TestAddFileStreamingRoundtripAboveThreshold(t *testing.T) {
 			if err := aw.WriteHeader(0); err != nil {
 				t.Fatal(err)
 			}
-			if err := addFileStreaming(aw, policy, inputFile{path: f.Name(), name: filepath.Base(f.Name())}, 4, NopProgressTracker{}); err != nil {
+			if err := addFileStreaming(aw, policy, inputFile{path: f.Name(), name: filepath.Base(f.Name()), attrs: archive.Attributes{Mode: 0o644}}, 4, NopProgressTracker{}); err != nil {
 				t.Fatalf("addFileStreaming: %v", err)
 			}
 			if err := aw.WriteFooter(); err != nil {

@@ -5,6 +5,7 @@ package io
 
 import (
 	"bufio"
+	"bytes"
 	stdhmac "crypto/hmac"
 	"crypto/sha256"
 	"errors"
@@ -81,7 +82,7 @@ func ArchiveIncremental(path string, inputs []string, opts IncrementalOptions) (
 	if cfg.compression.Solid {
 		return IncrementalResult{}, fatal(ErrCodeInvalidOption, "solid mode does not apply to incremental archives", nil)
 	}
-	files, skipped := expandInputs(inputs)
+	files, skipped := expandInputs(inputs, cfg.walkOptions())
 	for _, s := range skipped {
 		if s.unreadable && s.name == "" {
 			return IncrementalResult{}, fatal(ErrCodeReadFailed,
@@ -120,6 +121,10 @@ func createIncremental(path string, files []inputFile, cfg archiverConfig, opts 
 	ia := &incrementalArchive{keys: aw.Keys(), files: map[string]archive.FileVersion{}}
 	changed := make([]changedFile, 0, len(files))
 	for _, in := range files {
+		if !in.regular() {
+			changed = append(changed, changedFile{in: in})
+			continue
+		}
 		if info, err := os.Stat(in.path); err == nil {
 			changed = append(changed, changedFile{in: in, info: info})
 		} else {
@@ -154,7 +159,8 @@ func createIncremental(path string, files []inputFile, cfg archiverConfig, opts 
 	return res, nil
 }
 
-// changedFile is an input to record in a session, or the error that prevents it.
+// changedFile is an input to record in a session, or the error that prevents it. info
+// is set for regular files.
 type changedFile struct {
 	in   inputFile
 	info fs.FileInfo
@@ -255,23 +261,31 @@ func finishUnchanged(f *os.File, ia *incrementalArchive, res IncrementalResult, 
 	return res, nil
 }
 
-// diffInputs compares files with the archive's newest state. A file is changed when it
-// is new or its size, modification time, or mode differ. A previous file is deleted
-// when it was not found, unless it lies in a directory that could not be read.
+// diffInputs compares files with the archive's newest state. An entry is changed when
+// it is new, or its kind, size, modification time, mode, link target, owner, or
+// extended attributes differ. A previous entry is deleted when it was not found,
+// unless it lies in a directory that could not be read.
 func diffInputs(ia *incrementalArchive, files []inputFile, skipped []skippedInput) ([]changedFile, []string, int) {
 	seen := make(map[string]bool, len(files))
 	var changed []changedFile
 	unchanged := 0
 	for _, in := range files {
 		seen[in.name] = true
+		prev, known := ia.files[in.name]
+		if !in.regular() {
+			if known && sameAttributes(prev.Attributes, in.attrs) {
+				unchanged++
+			} else {
+				changed = append(changed, changedFile{in: in})
+			}
+			continue
+		}
 		info, err := os.Stat(in.path)
 		if err != nil {
 			changed = append(changed, changedFile{in: in, err: recoverable(ErrCodeReadFailed, "stat file", err)})
 			continue
 		}
-		prev, ok := ia.files[in.name]
-		if ok && prev.Size == uint64(info.Size()) && prev.ModTime == info.ModTime().UnixNano() &&
-			prev.Mode == uint32(info.Mode().Perm()) {
+		if known && prev.Size == uint64(info.Size()) && sameAttributes(prev.Attributes, in.attrs) {
 			unchanged++
 			continue
 		}
@@ -290,6 +304,20 @@ func diffInputs(ia *incrementalArchive, files []inputFile, skipped []skippedInpu
 		}
 	}
 	return changed, deleted, unchanged
+}
+
+// sameAttributes reports whether a and b describe the same entry state.
+func sameAttributes(a, b archive.Attributes) bool {
+	if a.Kind != b.Kind || a.Mode != b.Mode || a.ModTime != b.ModTime || a.LinkTarget != b.LinkTarget ||
+		(a.Owner == nil) != (b.Owner == nil) || (a.Owner != nil && *a.Owner != *b.Owner) || len(a.Xattrs) != len(b.Xattrs) {
+		return false
+	}
+	for i := range a.Xattrs {
+		if a.Xattrs[i].Name != b.Xattrs[i].Name || !bytes.Equal(a.Xattrs[i].Value, b.Xattrs[i].Value) {
+			return false
+		}
+	}
+	return true
 }
 
 // underAny reports whether name is one of prefixes or inside a directory named by one.
@@ -424,6 +452,11 @@ func writeSession(aw *archive.ArchiveWriter, ia *incrementalArchive, changed []c
 			res.Failed++
 			continue
 		}
+		if !c.in.regular() {
+			sw.index.Files = append(sw.index.Files, archive.FileVersion{Name: c.in.name, Attributes: c.in.attrs, Chunks: []uint64{}})
+			res.Changed++
+			continue
+		}
 		version, err := sw.addFile(c.in, c.info)
 		if err != nil {
 			if isFatal(err) {
@@ -516,9 +549,7 @@ func (sw *sessionWriter) addFile(in inputFile, info fs.FileInfo) (archive.FileVe
 	codec := sw.policy.codecFor(in.name, probe)
 
 	chunker := archive.NewChunker(f, &sw.gear)
-	version := archive.FileVersion{
-		Name: in.name, Mode: uint32(info.Mode().Perm()), ModTime: info.ModTime().UnixNano(), Chunks: []uint64{},
-	}
+	version := archive.FileVersion{Name: in.name, Attributes: in.attrs, Chunks: []uint64{}}
 	for {
 		chunk, err := chunker.Next()
 		if errors.Is(err, io.EOF) {

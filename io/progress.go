@@ -69,6 +69,28 @@ func (pb *ConsoleProgressBar) Done(totalFiles int, totalBytes int64, elapsed tim
 		totalFiles, FormatBytes(totalBytes), elapsed.Seconds(), throughput)
 }
 
+// Warner receives notices that do not fail a file, such as metadata that could not be
+// stored or restored. A ProgressTracker may implement it.
+type Warner interface {
+	Warn(name, message string)
+}
+
+// Warn prints a warning for name, or a general one when name is empty.
+func (pb *ConsoleProgressBar) Warn(name, message string) {
+	if name == "" {
+		fmt.Fprintf(pb.w, "  WARNING %s\n", message)
+		return
+	}
+	fmt.Fprintf(pb.w, "  WARNING %s: %s\n", name, message)
+}
+
+// warn passes a warning to progress when it implements Warner.
+func warn(progress ProgressTracker, name, message string) {
+	if w, ok := progress.(Warner); ok {
+		w.Warn(name, message)
+	}
+}
+
 // NopProgressTracker discards all progress events.
 type NopProgressTracker struct{}
 

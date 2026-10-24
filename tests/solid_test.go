@@ -300,9 +300,11 @@ func craftSolidArchive(t *testing.T, stream []byte) []byte {
 // rawSolidRecord encodes a solid record without name validation.
 func rawSolidRecord(name string, data []byte) []byte {
 	var b []byte
+	attrs, _ := archive.AppendAttributes(nil, archive.Attributes{Mode: 0o644})
 	b = binary.LittleEndian.AppendUint16(b, uint16(len(name)))
 	b = append(b, name...)
-	b = binary.LittleEndian.AppendUint32(b, 0o644)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(attrs)))
+	b = append(b, attrs...)
 	b = binary.LittleEndian.AppendUint64(b, uint64(len(data)))
 	return append(b, data...)
 }

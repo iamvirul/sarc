@@ -40,11 +40,11 @@ func TestExpandInputsStoresPathsRelativeToTheArgument(t *testing.T) {
 	writeTree(t, root, map[string]string{
 		"data/b.txt": "b", "data/a.txt": "a", "data/sub/deep/c.txt": "c", "data/.hidden": "h", "loose.txt": "l",
 	})
-	files, skipped := expandInputs([]string{filepath.Join(root, "data") + string(filepath.Separator), filepath.Join(root, "loose.txt")})
+	files, skipped := expandInputs([]string{filepath.Join(root, "data") + string(filepath.Separator), filepath.Join(root, "loose.txt")}, walkOptions{})
 	if len(skipped) != 0 {
 		t.Fatalf("unexpected skips: %+v", skipped)
 	}
-	want := []string{"data/.hidden", "data/a.txt", "data/b.txt", "data/sub/deep/c.txt", "loose.txt"}
+	want := []string{"data", "data/.hidden", "data/a.txt", "data/b.txt", "data/sub", "data/sub/deep", "data/sub/deep/c.txt", "loose.txt"}
 	if got := storedNames(files); !equalStrings(got, want) {
 		t.Fatalf("stored names %q, want %q", got, want)
 	}
@@ -54,54 +54,73 @@ func TestExpandInputsDotDirectoryHasNoPrefix(t *testing.T) {
 	root := t.TempDir()
 	writeTree(t, root, map[string]string{"a.txt": "a", "sub/b.txt": "b"})
 	t.Chdir(root)
-	files, _ := expandInputs([]string{"."})
-	if got, want := storedNames(files), []string{"a.txt", "sub/b.txt"}; !equalStrings(got, want) {
+	files, _ := expandInputs([]string{"."}, walkOptions{})
+	if got, want := storedNames(files), []string{"a.txt", "sub", "sub/b.txt"}; !equalStrings(got, want) {
 		t.Fatalf("stored names %q, want %q", got, want)
 	}
 }
 
-func TestExpandInputsSkipsSymlinksInsideDirectories(t *testing.T) {
+func TestExpandInputsRecordsKindsAndLinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("symlinks need privileges on Windows")
+		t.Skip("symlinks and hard links need privileges on Windows")
 	}
 	root := t.TempDir()
-	writeTree(t, root, map[string]string{"data/real.txt": "r"})
-	if err := os.Symlink("real.txt", filepath.Join(root, "data", "link.txt")); err != nil {
+	writeTree(t, root, map[string]string{"data/real.txt": "r", "data/sub/x.txt": "x"})
+	data := filepath.Join(root, "data")
+	if err := os.Symlink("real.txt", filepath.Join(data, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
-	files, skipped := expandInputs([]string{filepath.Join(root, "data")})
-	if got := storedNames(files); !equalStrings(got, []string{"data/real.txt"}) {
-		t.Fatalf("stored names %q", got)
+	if err := os.Link(filepath.Join(data, "real.txt"), filepath.Join(data, "zhard.txt")); err != nil {
+		t.Fatal(err)
 	}
-	if len(skipped) != 1 || filepath.Base(skipped[0].path) != "link.txt" {
-		t.Fatalf("want the symlink skipped, got %+v", skipped)
+	if err := os.Chmod(filepath.Join(data, "sub"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	files, skipped := expandInputs([]string{data}, walkOptions{owner: true})
+	if len(skipped) != 0 {
+		t.Fatalf("unexpected skips: %+v", skipped)
+	}
+	kinds := map[string]archive.Attributes{}
+	for _, f := range files {
+		kinds[f.name] = f.attrs
+	}
+	want := map[string]archive.FileKind{
+		"data": archive.KindDirectory, "data/link.txt": archive.KindSymlink, "data/real.txt": archive.KindRegular,
+		"data/sub": archive.KindDirectory, "data/sub/x.txt": archive.KindRegular, "data/zhard.txt": archive.KindHardlink,
+	}
+	if len(kinds) != len(want) {
+		t.Fatalf("entries %v", storedNames(files))
+	}
+	for name, kind := range want {
+		if kinds[name].Kind != kind {
+			t.Fatalf("%s: kind %v, want %v", name, kinds[name].Kind, kind)
+		}
+	}
+	if kinds["data/link.txt"].LinkTarget != "real.txt" || kinds["data/zhard.txt"].LinkTarget != "data/real.txt" {
+		t.Fatalf("link targets %q %q", kinds["data/link.txt"].LinkTarget, kinds["data/zhard.txt"].LinkTarget)
+	}
+	if kinds["data/sub"].Mode != 0o750 || kinds["data/real.txt"].ModTime == 0 || kinds["data/real.txt"].Owner == nil {
+		t.Fatalf("attributes not recorded: %+v %+v", kinds["data/sub"], kinds["data/real.txt"])
 	}
 }
 
 func TestExpandInputsReportsMissingArguments(t *testing.T) {
-	files, skipped := expandInputs([]string{filepath.Join(t.TempDir(), "missing")})
+	files, skipped := expandInputs([]string{filepath.Join(t.TempDir(), "missing")}, walkOptions{})
 	var ae *ArchiveError
 	if len(files) != 0 || len(skipped) != 1 || !errors.As(skipped[0].err, &ae) || ae.IsFatal() {
 		t.Fatalf("want one recoverable skip, got files %v skipped %+v", files, skipped)
 	}
 }
 
-func TestEntryOutputPathRefusesEscapes(t *testing.T) {
-	out := t.TempDir()
+func TestLocalNameRefusesEscapes(t *testing.T) {
 	for _, name := range []string{"../escape.txt", "/etc/passwd", "a/../../b", `..\b`, "", "dir/"} {
-		if _, err := entryOutputPath(out, name); err == nil {
+		if _, err := localName(name); err == nil {
 			t.Fatalf("%q accepted", name)
 		}
 	}
-	got, err := entryOutputPath(out, "docs/2026/report.pdf")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := filepath.Join(out, "docs", "2026", "report.pdf"); got != want {
-		t.Fatalf("path %s, want %s", got, want)
-	}
-	if info, err := os.Stat(filepath.Dir(got)); err != nil || !info.IsDir() {
-		t.Fatalf("parent directory not created: %v", err)
+	got, err := localName("docs/2026/report.pdf")
+	if err != nil || got != filepath.Join("docs", "2026", "report.pdf") {
+		t.Fatalf("localName: %q %v", got, err)
 	}
 }
 
@@ -123,7 +142,7 @@ func TestExtractRefusesTraversalNames(t *testing.T) {
 	}
 	policy := mustPolicy(t, CompressionNever)
 	for _, name := range []string{"../escape.txt", "safe/ok.txt", "/abs.txt"} {
-		entry, _, err := encryptFile(inputFile{path: src, name: name}, aw, policy, NopProgressTracker{})
+		entry, _, err := encryptFile(inputFile{path: src, name: name, attrs: archive.Attributes{Mode: 0o644}}, aw, policy, NopProgressTracker{})
 		if err != nil {
 			t.Fatal(err)
 		}

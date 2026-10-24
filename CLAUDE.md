@@ -59,6 +59,8 @@ Directory arguments are archived recursively under slash-separated relative name
 
 `--incremental` (`io/incremental*.go`, format in `archive/incremental.go`, chunker in `archive/chunker.go`) builds an append-only archive of sessions: FastCDC chunks over a CEK-keyed gear table, named by keyed HMAC and deduplicated, are packed into encrypted pack entries, and each session ends with a sealed index of new chunks, changed files, and deletions. A checkpoint before the footer locates the newest index and carries the checksum state for the next append; the header's sealed count is the session count, rewritten last, so rollbacks are detected (`archive.ArchiveChecksum` masks it in the footer checksum). Restoring needs random access (`WithRandomAccess`).
 
+File attributes (`archive/attributes.go`: kind, mode with setuid/setgid/sticky, mtime, link target, optional uid/gid, xattrs) live in v2 metadata, solid records, and incremental index entries. Directories, symlinks, and hard links are data-free entries written after all files. Extraction goes through `io/output_tree.go`, an `os.Root` on the output directory, so nothing escapes it; owners and special mode bits are restored only with `WithRestoreOwner` (`--preserve-owner`). Platform code: `io/xattr_{unix,linux,darwin,other}.go`, `io/fileinfo_{unix,other}.go`.
+
 `--split SIZE` (`io/volume.go`, format in `archive/volume.go`) cuts the archive stream into volume files `<output>.001`, `.002`, ... each framed by a header (random archive ID, index, last flag, payload length) and a SHA-256 checksum. Joining the payloads gives back the single-file archive, so readers are unchanged; the CLI detects volumes from any volume name, the base name, or stdin, and `io.VolumeError` names a missing or damaged volume.
 
 Optional signatures (`archive --sign`, `sarc sign`, `verify --signer`) are OpenSSH SSHSIG signatures (`crypto/signature.go`, namespace `sarc-archive`) over the footer checksum, stored in a block after the footer (`archive/signature.go`, `io/signature.go`); readers stop at the end marker, so extraction ignores it. Incremental updates re-sign or drop the stale signature.
@@ -67,7 +69,7 @@ Data is split into variable-length blocks (~64 KB ± 8 KB), each with a unique 1
 
 ### Anti-deduplication
 
-The core security property: the same file archived twice must produce completely different ciphertext. This is enforced by five independent layers — unique 32-byte salt per file entry, random header/trailer padding from `crypto/rand`, variable chunk sizes, unique nonce per block, and encrypted metadata (filename, size bucket, day-truncated timestamp hash). None of these layers can be disabled or skipped.
+The core security property: the same file archived twice must produce completely different ciphertext. This is enforced by five independent layers: unique 32-byte salt per file entry, random header/trailer padding from `crypto/rand`, variable chunk sizes, unique nonce per block, and encrypted metadata (filename, size bucket, and the file attributes). None of these layers can be disabled or skipped.
 
 ### Concurrency model
 

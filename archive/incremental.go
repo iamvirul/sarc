@@ -68,14 +68,14 @@ type ChunkRecord struct {
 	Codec     Codec
 }
 
-// FileVersion is the state of one file as of a session. Chunks lists global chunk
-// numbers (in the order chunks were added across all sessions) in file order.
+// FileVersion is the state of one entry as of a session. Chunks lists global chunk
+// numbers (in the order chunks were added across all sessions) in file order; only
+// regular files have chunks.
 type FileVersion struct {
-	Name    string
-	Mode    uint32
-	ModTime int64 // Unix nanoseconds
-	Size    uint64
-	Chunks  []uint64
+	Name       string
+	Attributes Attributes
+	Size       uint64
+	Chunks     []uint64
 }
 
 // SessionIndex is the plaintext of an index entry: what one session added and changed.
@@ -117,9 +117,16 @@ func (si *SessionIndex) Marshal() ([]byte, error) {
 		if !ValidEntryName(f.Name) {
 			return nil, fmt.Errorf("archive/incremental: invalid file name")
 		}
+		if f.Attributes.Kind != KindRegular && (f.Size != 0 || len(f.Chunks) != 0) {
+			return nil, fmt.Errorf("archive/incremental: %s entry with data", f.Attributes.Kind)
+		}
 		b = appendString(b, f.Name)
-		b = binary.AppendUvarint(b, uint64(f.Mode))
-		b = binary.AppendVarint(b, f.ModTime)
+		attrs, err := AppendAttributes(nil, f.Attributes)
+		if err != nil {
+			return nil, err
+		}
+		b = binary.AppendUvarint(b, uint64(len(attrs)))
+		b = append(b, attrs...)
 		b = binary.AppendUvarint(b, f.Size)
 		b = binary.AppendUvarint(b, uint64(len(f.Chunks)))
 		// Chunk numbers are delta-encoded: consecutive new chunks cost one byte each.
@@ -290,12 +297,17 @@ func (d *indexDecoder) chunk(packs int) ChunkRecord {
 
 func (d *indexDecoder) file(chunkLimit uint64) FileVersion {
 	f := FileVersion{Name: d.name()}
-	mode := d.uvarint()
-	if mode > 0xFFFFFFFF {
-		d.fail("mode out of range")
+	attrsLen := d.uvarint()
+	if attrsLen > MaxAttributesSize {
+		d.fail("attributes too large")
 	}
-	f.Mode = uint32(mode)
-	f.ModTime = d.varint()
+	if raw := d.bytes(int(attrsLen)); d.err == nil {
+		attrs, err := ParseAttributes(raw)
+		if err != nil {
+			d.fail("bad attributes")
+		}
+		f.Attributes = attrs
+	}
 	f.Size = d.uvarint()
 	f.Chunks = make([]uint64, d.count(1))
 	var prev uint64
@@ -305,6 +317,9 @@ func (d *indexDecoder) file(chunkLimit uint64) FileVersion {
 			d.fail("file references an unknown chunk")
 		}
 		f.Chunks[i], prev = n, n
+	}
+	if d.err == nil && f.Attributes.Kind != KindRegular && (f.Size != 0 || len(f.Chunks) != 0) {
+		d.fail("directory or link with data")
 	}
 	return f
 }
