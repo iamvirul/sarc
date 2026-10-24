@@ -28,7 +28,8 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
   frame_header(32)      random bytes, no semantic content
   metadata_nonce(12)
   metadata_size(4)
-  metadata_ciphertext   AES-256-GCM sealed: encrypted_filename | size_bucket | ts_hash | perms | codec (v2+)
+  metadata_ciphertext   AES-256-GCM sealed: encrypted_filename | size_bucket | ts_hash | perms | codec (v2+) |
+                        attributes_len(4) | attributes (v2+, see File attributes)
   interblock_pad_size(4)
   interblock_pad        random(256-1024 bytes)
   [DATA BLOCKS]  (repeated)
@@ -181,7 +182,7 @@ entry with one salt, one key, one padding set, and one trailer, which amortises 
 
 ```
 stream := record*
-record := name_len(2) | name | permissions(4) | data_len(8) | data
+record := name_len(2) | name | attributes_len(4) | attributes | data_len(8) | data
 ```
 
 - Grouping: candidates are ordered by extension (similar content shares the compression
@@ -204,13 +205,48 @@ record := name_len(2) | name | permissions(4) | data_len(8) | data
 Archive arguments that are directories are walked in lexical order. A file is stored
 under its path relative to the argument's parent, slash-separated (`data/` stores
 `data/sub/a.txt`; `.` stores paths relative to itself); a file argument keeps its base
-name. Symlinks and special files inside directories are skipped and reported.
+name. Directories are entries too, so empty ones are kept. Inside directories,
+symlinks are stored as links (a symlinked directory argument is followed), and a
+second path to a file already listed (same device and inode) is stored as a hard link
+to it. Devices, sockets, and pipes are skipped and reported.
 
 Stored names must be relative paths whose elements are non-empty and not `.` or `..`,
 with no NUL or backslash (`archive.ValidEntryName`). The extractor also requires
 `filepath.IsLocal` on the OS form of the name, creates parent directories, and refuses
 any other name for that entry only, so no archive can write outside the output
 directory.
+
+## File attributes
+
+Version 2 metadata, solid records, and incremental index entries carry the same
+attribute encoding (`archive.Attributes`):
+
+```
+attributes := kind(1) | mode(4) | mtime_ns(8) | flags(1) | [uid(4) gid(4)] |
+              target_len(2) | target | xattr_count(2) | (name_len(1) | name | value_len(4) | value)*
+```
+
+- `kind` is regular, directory, symlink, or hard link. Directories and links are file
+  entries with no data blocks, written after every file, so a hard link's target is
+  always extracted first. A symlink's target is stored as is; a hard link's target is
+  the stored name of the entry it links to and must be a safe name.
+- `mode` holds the permission bits and setuid (0o4000), setgid (0o2000), and sticky
+  (0o1000). `mtime_ns` is the exact modification time; it is encrypted like the name.
+- `uid`/`gid` are present only with `--preserve-owner`. Extended attributes include
+  macOS resource forks (`com.apple.ResourceFork`) and Linux POSIX ACLs
+  (`system.posix_acl_*`); a file's set is bounded at 1 MiB and larger sets are not
+  stored, with a warning. macOS ACLs, which are not extended attributes, are not kept.
+
+Extraction (`io/output_tree.go`) opens an `os.Root` on the output directory and
+performs every write, rename, symlink, hard link, chmod, chown, and chtimes through it,
+so nothing resolves outside the directory, whatever links the archive or the directory
+already contains. For each file it sets extended attributes, then the owner (only with
+`--preserve-owner`), then the mode (setuid, setgid, and sticky only with
+`--preserve-owner`, since chown clears them and they are only safe with the original
+owner), renames it into place, and sets its time. Directory attributes are applied
+deepest first after every entry, so read-only directories and directory times survive
+their contents being written. Failures that lose no data (an attribute a filesystem
+refuses, owners without root) are warnings, each general one printed once.
 
 ## Incremental archives
 
@@ -233,9 +269,10 @@ header | (pack* index)+ | checkpoint | end marker | footer
   file-entry framing with random block sizes and padding, so chunk boundaries are
   invisible; its trailer HMAC covers the pack plaintext.
 - Session index: one sealed index entry per session lists its packs (archive offsets), its
-  new chunks (ID, pack, offset, stored and raw sizes, codec), the new or changed files
-  (name, mode, modification time, size, chunk numbers), and the names deleted since the
-  previous session, plus the offset of the previous index. Chunks are numbered globally
+  new chunks (ID, pack, offset, stored and raw sizes, codec), the new or changed entries
+  (name, attributes, size, chunk numbers), and the names deleted since the previous
+  session, plus the offset of the previous index. An entry changes when its kind, size,
+  mode, time, link target, owner, or extended attributes do. Chunks are numbered globally
   in the order sessions add them.
 - Checkpoint: the newest index offset and the marshaled SHA-256 state of every byte
   before the checkpoint, so an update extends the footer checksum without rereading the
@@ -333,7 +370,7 @@ framing, so it is fatal and extraction stops.
 | Padding | Random header (1-4 KB) and trailer (512-2048 B) from crypto/rand |
 | Chunks | Base 64 KB +/- random(0-8 KB) per block |
 | Nonce | 12-byte crypto/rand nonce per block |
-| Metadata | Filename encrypted, size bucketed, timestamp day-truncated and hashed |
+| Metadata | Filename, permissions, times, links, owner, and extended attributes encrypted; size bucketed |
 
 ## Concurrency model
 

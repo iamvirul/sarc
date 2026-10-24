@@ -14,9 +14,17 @@ Or download a signed release binary from the [Releases](https://github.com/iamvi
 
 ```bash
 # Create an archive. Directories are archived recursively and restored with their
-# structure: "folder/" is stored as folder/..., "." as paths relative to it. Symlinks and
-# special files inside directories are skipped.
+# structure: "folder/" is stored as folder/..., "." as paths relative to it. Permissions
+# (including the executable bit), modification times, symlinks, hard links, empty
+# directories, and extended attributes (macOS resource forks, Linux POSIX ACLs) are
+# kept. Devices, sockets, and pipes are skipped.
 sarc archive --password "StrongPass123" --output backup.sarc file1.txt file2.bin folder/
+
+# Owners (numeric uid/gid) are recorded only with --preserve-owner and restored only
+# with --preserve-owner on extract, usually as root; otherwise they are skipped with a
+# warning, as are setuid, setgid, and sticky bits.
+sudo sarc archive --password "StrongPass123" --preserve-owner --output system.sarc /etc
+sudo sarc extract --password "StrongPass123" --preserve-owner --archive system.sarc --output /restore
 
 # Parallel archive (defaults to NumCPU workers)
 sarc archive --password "StrongPass123" --output backup.sarc --parallel 4 file1.txt
@@ -107,7 +115,8 @@ sarc archive --password "StrongPass123" --output - files/* | aws s3 cp - s3://bu
 curl -s https://example.com/backup.sarc | sarc extract --password "StrongPass123" --archive - --output ./out
 sarc archive --password "StrongPass123" --output - files/* | ssh user@host "sarc extract --password 'StrongPass123' --archive - --output /backup/"
 
-# List contents with codec and compression ratio (a credential is required to decrypt filenames)
+# List contents with type and permissions (ls -l style), codec, and compression ratio
+# (a credential is required to decrypt filenames)
 sarc list --password "StrongPass123" --archive backup.sarc
 ```
 
@@ -134,7 +143,8 @@ Per-file mode stays larger than zip on small-file trees because every entry carr
 | Recipients | Content key wrapped once per password (PBKDF2-SHA256, 100k+ iterations, AES-256-GCM), once per key file (HKDF-SHA256, AES-256-GCM), once per key file + password pair (both combined in one HKDF), and once for all public-key recipients (age X25519, SSH, plugins); recipient public keys are not stored |
 | Integrity | GCM auth tag per block + HMAC-SHA256 over full plaintext |
 | Deduplication resistance | Random padding (1-4 KB header, 512-2048 B trailer), variable chunk sizes (64 KB +/- 8 KB), unique nonce per block |
-| Metadata protection | Filename AES-encrypted, size bucketed (not exact), timestamps day-truncated and hashed |
+| Metadata protection | Filename, permissions, modification time, link targets, owner, and extended attributes are inside the encrypted metadata; the visible size is bucketed (not exact) |
+| Safe extraction | Every write, link, and attribute change goes through an `os.Root` on the output directory, so no entry name, symlink in the archive, or symlink already in the output directory can make extraction write outside it |
 | Compression | Optional zstd before encryption, per file; the codec is recorded inside the encrypted metadata |
 | Solid groups (`--solid`) | Small files share one entry: one key, one padding set, one HMAC per group of up to 8 MiB |
 | Incremental archives (`--incremental`) | Files are split into content-defined chunks (about 1 MiB) whose boundaries depend on a secret derived from the archive key; chunks are named by keyed HMAC, deduplicated within the archive, and packed into encrypted, padded pack entries, so chunk boundaries and identities never appear outside the encryption. The header seals the session count, so cutting off the newest sessions is detected |
