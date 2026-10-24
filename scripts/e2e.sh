@@ -305,7 +305,7 @@ example_incremental_backup() {
   echo "temporary" >data/sub/tmp.txt
   local out size1
   out="$("$SARC" archive -p "$PASS" --incremental -o backup.sarc data | tail -n 1)"
-  echo "$out" | grep -q "created incremental archive: session 1, 3 file(s)" || { echo "create: $out"; return 1; }
+  echo "$out" | grep -q "created incremental archive: session 1, 5 file(s)" || { echo "create: $out"; return 1; }
   size1="$(wc -c <backup.sarc | tr -d ' ')"
   local before after
   before="$(sha backup.sarc)"
@@ -317,7 +317,7 @@ example_incremental_backup() {
   touch data/disk.img
   rm data/sub/tmp.txt
   out="$("$SARC" archive -p "$PASS" --incremental -o backup.sarc data | tail -n 1)"
-  echo "$out" | grep -q "session 2: 1 file(s) changed" || { echo "update: $out"; return 1; }
+  echo "$out" | grep -q "session 2: 2 file(s) changed" || { echo "update: $out"; return 1; }
   echo "$out" | grep -q "1 deleted" || { echo "deletion not recorded: $out"; return 1; }
   local grown=$(( $(wc -c <backup.sarc) - size1 ))
   [ "$grown" -lt $((10 * 1048576)) ] || { echo "one changed byte appended $grown bytes"; return 1; }
@@ -410,6 +410,56 @@ example_split_archive() {
   echo "64 MB in 20 MB volumes: 4 files; extract from volume 2 or cat; missing volume 3 and corrupted volume 2 named"
 }
 
+mtime_of() {
+  if [ "$(uname)" = "Darwin" ]; then stat -f '%m' "$1"; else stat -c '%Y' "$1"; fi
+}
+
+# set_xattr FILE NAME VALUE / get_xattr FILE NAME: user extended attributes with
+# whichever tool this OS has; both fail when there is none.
+set_xattr() {
+  if command -v setfattr >/dev/null; then setfattr -n "$2" -v "$3" "$1"
+  elif command -v xattr >/dev/null; then xattr -w "$2" "$3" "$1"
+  else return 1; fi
+}
+
+get_xattr() {
+  if command -v getfattr >/dev/null; then getfattr --only-values -n "$2" "$1" 2>/dev/null
+  else xattr -p "$2" "$1" 2>/dev/null; fi
+}
+
+example_preserve_metadata() {
+  mkdir -p tree/bin tree/empty tree/readonly
+  printf '#!/bin/sh\necho hi\n' >tree/bin/tool && chmod 755 tree/bin/tool
+  echo "private" >tree/secret.txt && chmod 600 tree/secret.txt
+  ln -s ../secret.txt tree/bin/link
+  ln tree/secret.txt tree/hard.txt
+  echo "inside" >tree/readonly/file.txt && chmod 555 tree/readonly
+  touch -t 202001020304.05 tree/secret.txt tree/empty
+  local xattrs=no
+  if set_xattr tree/secret.txt user.sarc.note "kept" 2>/dev/null; then xattrs=yes; fi
+
+  "$SARC" archive -p "$PASS" -o meta.sarc tree >/dev/null
+  "$SARC" extract -p "$PASS" -a meta.sarc -o out-meta >/dev/null 2>&1
+  chmod 755 tree/readonly
+  local r=out-meta/tree
+  [ "$(perm_bits "$r/bin/tool")" = 755 ] || { echo "executable bit lost: $(perm_bits "$r/bin/tool")"; return 1; }
+  [ "$(perm_bits "$r/secret.txt")" = 600 ] || { echo "mode 600 became $(perm_bits "$r/secret.txt")"; return 1; }
+  [ "$(perm_bits "$r/readonly")" = 555 ] || { echo "read-only directory became $(perm_bits "$r/readonly")"; return 1; }
+  [ "$(readlink "$r/bin/link")" = "../secret.txt" ] || { echo "symlink not restored"; return 1; }
+  [ "$(cat "$r/bin/link")" = "private" ] || { echo "symlink does not resolve"; return 1; }
+  [ "$(ls -i "$r/secret.txt" | awk '{print $1}')" = "$(ls -i "$r/hard.txt" | awk '{print $1}')" ] || { echo "hard link restored as a copy"; return 1; }
+  [ -d "$r/empty" ] || { echo "empty directory not restored"; return 1; }
+  [ "$(mtime_of "$r/secret.txt")" = "$(mtime_of tree/secret.txt)" ] || { echo "file modification time not restored"; return 1; }
+  [ "$(mtime_of "$r/empty")" = "$(mtime_of tree/empty)" ] || { echo "directory modification time not restored"; return 1; }
+  if [ "$xattrs" = yes ]; then
+    [ "$(get_xattr "$r/secret.txt" user.sarc.note)" = "kept" ] || { echo "extended attribute not restored"; return 1; }
+  fi
+  "$SARC" list -p "$PASS" -a meta.sarc | grep -q "^lrwx.*tree/bin/link -> ../secret.txt" || { echo "list does not show the symlink"; return 1; }
+  "$SARC" list -p "$PASS" -a meta.sarc | grep -q "^dr-xr-xr-x  tree/readonly" || { echo "list does not show the directory mode"; return 1; }
+  chmod 755 "$r/readonly"
+  echo "modes (755, 600, read-only dir), symlink, hard link, empty dir, mtimes, xattrs (${xattrs}) restored; list shows types"
+}
+
 example_constant_memory() {
   head -c "$((BIG_MB * 1048576))" /dev/urandom >big.bin
   local want rss
@@ -448,6 +498,7 @@ run_example "Directory tree" example_directory_tree
 run_example "Incremental backup" example_incremental_backup
 run_example "Signed archive" example_signed_archive
 run_example "Split archive" example_split_archive
+run_example "Preserve metadata" example_preserve_metadata
 run_example "Constant memory streaming extract" example_constant_memory
 run_example "Refuse terminal output" example_refuses_terminal
 
