@@ -410,6 +410,10 @@ example_split_archive() {
   echo "64 MB in 20 MB volumes: 4 files; extract from volume 2 or cat; missing volume 3 and corrupted volume 2 named"
 }
 
+inode_of() {
+  if [ "$(uname)" = "Darwin" ]; then stat -f '%i' "$1"; else stat -c '%i' "$1"; fi
+}
+
 mtime_of() {
   if [ "$(uname)" = "Darwin" ]; then stat -f '%m' "$1"; else stat -c '%Y' "$1"; fi
 }
@@ -447,7 +451,7 @@ example_preserve_metadata() {
   [ "$(perm_bits "$r/readonly")" = 555 ] || { echo "read-only directory became $(perm_bits "$r/readonly")"; return 1; }
   [ "$(readlink "$r/bin/link")" = "../secret.txt" ] || { echo "symlink not restored"; return 1; }
   [ "$(cat "$r/bin/link")" = "private" ] || { echo "symlink does not resolve"; return 1; }
-  [ "$(ls -i "$r/secret.txt" | awk '{print $1}')" = "$(ls -i "$r/hard.txt" | awk '{print $1}')" ] || { echo "hard link restored as a copy"; return 1; }
+  [ "$(inode_of "$r/secret.txt")" = "$(inode_of "$r/hard.txt")" ] || { echo "hard link restored as a copy"; return 1; }
   [ -d "$r/empty" ] || { echo "empty directory not restored"; return 1; }
   [ "$(mtime_of "$r/secret.txt")" = "$(mtime_of tree/secret.txt)" ] || { echo "file modification time not restored"; return 1; }
   [ "$(mtime_of "$r/empty")" = "$(mtime_of tree/empty)" ] || { echo "directory modification time not restored"; return 1; }
