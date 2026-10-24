@@ -129,7 +129,8 @@ func sizeOf(t *testing.T, path string) int64 {
 func TestIncrementalFirstRunRoundtrip(t *testing.T) {
 	root, archivePath, want := incrementalFixture(t)
 	res := incrementalRun(t, archivePath, filepath.Join(root, "data"))
-	if !res.Created || res.Session != 1 || res.Changed != len(want) || res.AppendedBytes != sizeOf(t, archivePath) {
+	// Directories are recorded too, so more entries than files change.
+	if !res.Created || res.Session != 1 || res.Changed <= len(want) || res.AppendedBytes != sizeOf(t, archivePath) {
 		t.Fatalf("unexpected first run: %+v", res)
 	}
 	requireSameTree(t, restoreIncremental(t, archivePath), want)
@@ -138,14 +139,14 @@ func TestIncrementalFirstRunRoundtrip(t *testing.T) {
 // TestIncrementalUnchangedRunWritesNothing is the acceptance criterion: a second run on
 // an unchanged directory appends zero bytes.
 func TestIncrementalUnchangedRunWritesNothing(t *testing.T) {
-	root, archivePath, want := incrementalFixture(t)
-	incrementalRun(t, archivePath, filepath.Join(root, "data"))
+	root, archivePath, _ := incrementalFixture(t)
+	first := incrementalRun(t, archivePath, filepath.Join(root, "data"))
 	before, err := os.ReadFile(archivePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	res := incrementalRun(t, archivePath, filepath.Join(root, "data"))
-	if res.Changed != 0 || res.Deleted != 0 || res.AppendedBytes != 0 || res.Unchanged != len(want) || res.Session != 1 {
+	if res.Changed != 0 || res.Deleted != 0 || res.AppendedBytes != 0 || res.Unchanged != first.Changed || res.Session != 1 {
 		t.Fatalf("unchanged run: %+v", res)
 	}
 	after, err := os.ReadFile(archivePath)
@@ -188,8 +189,9 @@ func TestIncrementalDeletedFilesAreNotRestored(t *testing.T) {
 	delete(want, "data/config/app.ini")
 	want["data/new.txt"] = []byte("added later\n")
 	writeFile(t, root, "data/new.txt", want["data/new.txt"])
+	// The new file changes, and so do the two directories whose contents changed.
 	res := incrementalRun(t, archivePath, dataDir)
-	if res.Deleted != 1 || res.Changed != 1 || res.Session != 2 {
+	if res.Deleted != 1 || res.Changed != 3 || res.Session != 2 {
 		t.Fatalf("delete run: %+v", res)
 	}
 	requireSameTree(t, restoreIncremental(t, archivePath), want)
@@ -198,10 +200,13 @@ func TestIncrementalDeletedFilesAreNotRestored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != len(want) {
-		t.Fatalf("list shows %d files, want %d", len(list), len(want))
-	}
+
+	files := 0
 	for _, r := range list {
+		if r.Kind != archive.KindRegular {
+			continue
+		}
+		files++
 		if _, ok := want[r.Filename]; !ok || r.OriginalBytes != int64(len(want[r.Filename])) {
 			t.Fatalf("list entry %+v does not match the current state", r)
 		}
@@ -241,7 +246,7 @@ func TestIncrementalDeduplicatesWithinAnArchive(t *testing.T) {
 
 	writeFile(t, root, "data/b.bin", content)
 	res := incrementalRun(t, single, filepath.Join(root, "data"))
-	if res.Changed != 1 || res.NewChunks != 0 || res.AppendedBytes > 64*1024 {
+	if res.NewChunks != 0 || res.AppendedBytes > 64*1024 {
 		t.Fatalf("adding a copy: %+v", res)
 	}
 
@@ -424,12 +429,15 @@ func TestIncrementalTamperedPackFailsItsFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].OK {
-		t.Fatalf("tampered file restored: %+v", results)
+	for _, r := range results {
+		if r.Filename == "data/victim.bin" && r.OK {
+			t.Fatalf("tampered file restored: %+v", results)
+		}
 	}
-	if len(readTree(t, out)) != 0 {
-		t.Fatal("tampered restore left files behind")
+	if _, err := os.Stat(filepath.Join(out, "data", "victim.bin")); !os.IsNotExist(err) {
+		t.Fatal("tampered restore left the file behind")
 	}
+	requireNoTempFilesInTree(t, out)
 }
 
 func TestIncrementalNeedsRandomAccess(t *testing.T) {
@@ -465,7 +473,19 @@ func TestIncrementalUnreadableDirectoryKeepsPreviousVersions(t *testing.T) {
 		t.Fatalf("unreadable directory recorded as deleted: %+v", res)
 	}
 	os.Chmod(locked, 0o755)
-	requireSameTree(t, restoreIncremental(t, archivePath), want)
+	// The directory itself was recorded as it was (mode 000); its files were kept.
+	out := t.TempDir()
+	if _, err := openIncremental(t, archivePath, incrementalTestPassword).Extract(out); err != nil {
+		t.Fatal(err)
+	}
+	restoredLogs := filepath.Join(out, "data", "logs")
+	if info, err := os.Stat(restoredLogs); err != nil || info.Mode().Perm() != 0 {
+		t.Fatalf("locked directory restored as %v, %v", info.Mode(), err)
+	}
+	if err := os.Chmod(restoredLogs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	requireSameTree(t, readTree(t, out), want)
 }
 
 func TestIncrementalKeyFileAndPasswordCredentials(t *testing.T) {

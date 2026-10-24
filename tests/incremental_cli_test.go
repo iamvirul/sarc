@@ -43,7 +43,8 @@ func TestIncrementalCLI(t *testing.T) {
 		return out
 	}
 
-	if out := archive(); !strings.Contains(out, "created incremental archive: session 1, 3 file(s)") {
+	// Three files and the two directories holding them.
+	if out := archive(); !strings.Contains(out, "created incremental archive: session 1, 5 file(s)") {
 		t.Fatalf("create output:\n%s", out)
 	}
 	if out := archive(); !strings.Contains(out, "no changes since session 1; archive not modified") {
@@ -54,12 +55,13 @@ func TestIncrementalCLI(t *testing.T) {
 	if err := os.Remove(filepath.Join(dataDir, "gone.txt")); err != nil {
 		t.Fatal(err)
 	}
-	if out := archive(); !strings.Contains(out, "session 2: 1 file(s) changed") || !strings.Contains(out, "1 unchanged, 1 deleted") {
+	// edit.bin, and data whose listing lost gone.txt; data/sub and keep.txt are unchanged.
+	if out := archive(); !strings.Contains(out, "session 2: 2 file(s) changed") || !strings.Contains(out, "2 unchanged, 1 deleted") {
 		t.Fatalf("update output:\n%s", out)
 	}
 
 	list, err := runSarc(t, nil, "list", "-p", incrementalTestPassword, "-a", archivePath)
-	if err != nil || strings.Contains(list, "gone.txt") || !strings.Contains(list, "data/sub/edit.bin") || !strings.Contains(list, "2 file(s)") {
+	if err != nil || strings.Contains(list, "gone.txt") || !strings.Contains(list, "data/sub/edit.bin") || !strings.Contains(list, "4 entries") {
 		t.Fatalf("list: %v\n%s", err, list)
 	}
 	if out, err := runSarc(t, nil, "verify", "-a", archivePath); err != nil || !strings.Contains(out, "PASSED") {
