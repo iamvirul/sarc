@@ -65,9 +65,12 @@ jobs:
       - name: Build test age plugin
         run: go build -o "$RUNNER_TEMP/age/age-plugin-sarctest" ./tests/testdata/age-plugin-sarctest
 
-      - name: Ensure GNU time (Linux)
+      - name: Ensure GNU time and xattr tools (Linux)
         if: runner.os == 'Linux'
-        run: test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
+        run: |
+          if [ ! -x /usr/bin/time ] || ! command -v setfattr >/dev/null; then
+            sudo apt-get update -q && sudo apt-get install -y -q time attr
+          fi
 
       - name: Lint example script
         if: runner.os == 'Linux'
