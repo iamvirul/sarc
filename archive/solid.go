@@ -13,7 +13,7 @@ import (
 // metadata, padding, data blocks, trailer) but its plaintext is a record stream:
 //
 //	stream := record*
-//	record := [2] name length | name | [4] permissions | [8] data length | data
+//	record := [2] name length | name | [4] attributes length | attributes | [8] data length | data
 //
 // The stream is compressed as one unit per the entry's Codec, the result is split into
 // data blocks, and the trailer HMAC and size cover the uncompressed stream.
@@ -24,24 +24,25 @@ const (
 	// MaxSolidStreamSize bounds a solid group's uncompressed record stream. Writers close
 	// a group before exceeding it and readers refuse to decode past it.
 	MaxSolidStreamSize = 8 << 20
-	// solidRecordHeaderSize is the fixed part of a record (name, permissions, data lengths).
+	// solidRecordHeaderSize is the fixed part of a record (name, attributes, and data lengths).
 	solidRecordHeaderSize = 2 + 4 + 8
 )
 
 // ErrMalformedSolidStream is returned when a solid record stream cannot be parsed.
 var ErrMalformedSolidStream = errors.New("archive: malformed solid stream")
 
-// SolidMember is one file inside a solid group. Data returned by ParseSolidStream
-// aliases the stream it was parsed from.
+// SolidMember is one regular file inside a solid group. Data returned by
+// ParseSolidStream aliases the stream it was parsed from.
 type SolidMember struct {
-	Name        string
-	Permissions uint32
-	Data        []byte
+	Name       string
+	Attributes Attributes
+	Data       []byte
 }
 
-// SolidRecordSize returns the encoded size of a record with the given name and data lengths.
-func SolidRecordSize(nameLen, dataLen int) int {
-	return solidRecordHeaderSize + nameLen + dataLen
+// SolidRecordSize returns the encoded size of a record with the given name, encoded
+// attributes, and data lengths.
+func SolidRecordSize(nameLen, attrsLen, dataLen int) int {
+	return solidRecordHeaderSize + nameLen + attrsLen + dataLen
 }
 
 // AppendSolidRecord appends the encoded record for m to dst.
@@ -49,14 +50,18 @@ func AppendSolidRecord(dst []byte, m SolidMember) ([]byte, error) {
 	if !ValidEntryName(m.Name) {
 		return dst, fmt.Errorf("archive/solid: invalid member name")
 	}
-	var hdr [8]byte
-	binary.LittleEndian.PutUint16(hdr[:2], uint16(len(m.Name)))
-	dst = append(dst, hdr[:2]...)
+	if m.Attributes.Kind != KindRegular {
+		return dst, fmt.Errorf("archive/solid: only regular files join solid groups")
+	}
+	attrs, err := AppendAttributes(nil, m.Attributes)
+	if err != nil {
+		return dst, err
+	}
+	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(m.Name)))
 	dst = append(dst, m.Name...)
-	binary.LittleEndian.PutUint32(hdr[:4], m.Permissions)
-	dst = append(dst, hdr[:4]...)
-	binary.LittleEndian.PutUint64(hdr[:8], uint64(len(m.Data)))
-	dst = append(dst, hdr[:8]...)
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(attrs)))
+	dst = append(dst, attrs...)
+	dst = binary.LittleEndian.AppendUint64(dst, uint64(len(m.Data)))
 	return append(dst, m.Data...), nil
 }
 
@@ -78,15 +83,23 @@ func ParseSolidStream(stream []byte) ([]SolidMember, error) {
 		if !ValidEntryName(name) {
 			return nil, fmt.Errorf("%w: invalid member name", ErrMalformedSolidStream)
 		}
-		perms := binary.LittleEndian.Uint32(stream[off:])
+		attrsLen := int(binary.LittleEndian.Uint32(stream[off:]))
 		off += 4
+		if attrsLen > MaxAttributesSize || attrsLen > len(stream)-off-8 {
+			return nil, fmt.Errorf("%w: attributes run past stream", ErrMalformedSolidStream)
+		}
+		attrs, err := ParseAttributes(stream[off : off+attrsLen])
+		if err != nil || attrs.Kind != KindRegular {
+			return nil, fmt.Errorf("%w: bad member attributes", ErrMalformedSolidStream)
+		}
+		off += attrsLen
 		dataLen := binary.LittleEndian.Uint64(stream[off:])
 		off += 8
 		if dataLen > uint64(len(stream)-off) {
 			return nil, fmt.Errorf("%w: member data runs past stream", ErrMalformedSolidStream)
 		}
 		end := off + int(dataLen)
-		members = append(members, SolidMember{Name: name, Permissions: perms, Data: stream[off:end:end]})
+		members = append(members, SolidMember{Name: name, Attributes: attrs, Data: stream[off:end:end]})
 		off = end
 	}
 	if len(members) == 0 {

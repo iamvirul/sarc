@@ -301,13 +301,14 @@ func (se *SafeExtractor) listIncremental(keys *archive.KeySchedule) ([]ListResul
 		for _, n := range f.Chunks {
 			stored += int64(ia.chunks[n].stored)
 		}
-		results = append(results, ListResult{
+		attrs := f.Attributes
+		results = append(results, withAttributes(ListResult{
 			Filename:      f.Name,
 			SizeBucket:    bucketName(archive.BucketizeSize(int64(f.Size))),
 			Codec:         "chunked",
 			OriginalBytes: int64(f.Size),
 			StoredBytes:   stored,
-		})
+		}, &attrs, 0))
 	}
 	return results, nil
 }

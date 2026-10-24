@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -40,6 +39,10 @@ type ListResult struct {
 	Solid         bool
 	OriginalBytes int64
 	StoredBytes   int64
+	Kind          archive.FileKind
+	Mode          uint32 // permission and special bits, as in chmod
+	LinkTarget    string // a symlink's target, or the entry a hard link points to
+	ModTime       int64  // Unix nanoseconds; 0 when not recorded
 	Err           error
 }
 
@@ -49,7 +52,7 @@ const maxBlockCiphertext = archive.MaxPayloadSize + crypto.GCMTagSize
 
 // maxMetadataCiphertext bounds a sealed metadata block: a 64 KiB filename blob plus the
 // fixed fields (see archive.marshalMetadata) and the GCM tag.
-const maxMetadataCiphertext = 2 + 0xFFFF + 1 + 32 + 4 + 1 + crypto.GCMTagSize
+const maxMetadataCiphertext = archive.MaxMetadataSize + crypto.GCMTagSize
 
 // isFatal reports whether err is a fatal ArchiveError, after which the entry stream
 // cannot be parsed further.
@@ -128,6 +131,8 @@ type SafeExtractor struct {
 	identities []age.Identity
 	progress   ProgressTracker
 	header     headerInfo
+	// restoreOwner restores recorded owners and setuid, setgid, and sticky bits.
+	restoreOwner bool
 	// random, when set, gives the random access incremental archives need; r reads the
 	// same archive sequentially from its start.
 	random     io.ReaderAt
@@ -168,13 +173,18 @@ func NewSafeExtractor(r io.Reader, password string, progress ProgressTracker, op
 // Each entry is authenticated before any bytes are written to disk.
 // Returns one ExtractionResult per file, including each member of a solid group, or
 // one failed result for an entry that could not be opened.
+//
+// Every write goes through an os.Root on outputDir, so no entry, symlink, or hard link
+// reaches outside it. Directory attributes are applied once all entries are written.
 func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
 	}
+	tree := newOutputTree(outputDir, se.restoreOwner, se.progress)
+	defer tree.close()
 	if se.header.incremental() {
-		return se.extractIncremental(keys, outputDir)
+		return se.extractIncremental(keys, tree)
 	}
 	block, err := archive.NewBlockDecompressor()
 	if err != nil {
@@ -192,7 +202,7 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 		if !more {
 			return results, nil
 		}
-		entryResults, err := se.extractEntry(keys, entryType, decs, outputDir)
+		entryResults, err := se.extractEntry(keys, entryType, decs, tree)
 		if err != nil {
 			if isFatal(err) {
 				return results, err
@@ -375,15 +385,15 @@ func (se *SafeExtractor) readEntryHead(keys *archive.KeySchedule) (entryHead, er
 }
 
 // extractEntry extracts the entry whose type byte was just read.
-func (se *SafeExtractor) extractEntry(keys *archive.KeySchedule, entryType byte, decs *entryDecoders, outputDir string) ([]ExtractionResult, error) {
+func (se *SafeExtractor) extractEntry(keys *archive.KeySchedule, entryType byte, decs *entryDecoders, tree *outputTree) ([]ExtractionResult, error) {
 	head, err := se.readEntryHead(keys)
 	if err != nil {
 		return nil, err
 	}
 	if entryType == archive.EntryTypeSolid {
-		return se.extractSolidBody(keys, head, decs, outputDir)
+		return se.extractSolidBody(keys, head, decs, tree)
 	}
-	result, err := se.extractFileBody(keys, head, decs.block, outputDir)
+	result, err := se.extractFileBody(keys, head, decs.block, tree)
 	if err != nil {
 		return nil, err
 	}
@@ -391,25 +401,24 @@ func (se *SafeExtractor) extractEntry(keys *archive.KeySchedule, entryType byte,
 }
 
 // extractFileBody extracts the rest of a file entry after its head, streaming the
-// plaintext into a hidden temporary file in outputDir while its HMAC and size are
+// plaintext into a hidden temporary file beside its destination while its HMAC and size are
 // computed. Only after the trailer verifies is the file renamed to its final name, so
 // unverified data never appears under it and memory stays constant for any file size.
-func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHead, dec *archive.BlockDecompressor, outputDir string) (ExtractionResult, error) {
+func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHead, dec *archive.BlockDecompressor, tree *outputTree) (ExtractionResult, error) {
 	fileKey, pm := head.fileKey, head.pm
 	filename, err := decryptFilename(pm.EncryptedFilename, fileKey)
 	if err != nil {
 		return ExtractionResult{}, se.skipEntryBody(recoverable(ErrCodeAuthFailed, "decrypt filename", err))
 	}
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return ExtractionResult{}, fatal(ErrCodeWriteFailed, "create output dir", err)
+	if pm.Attributes != nil && pm.Attributes.Kind != archive.KindRegular {
+		return se.extractSpecial(tree, filename, pm.Attributes)
 	}
-	outPath, err := entryOutputPath(outputDir, filename)
+	out, err := newVerifiedFile(tree, filename, fileKey)
 	if err != nil {
+		if isFatal(err) {
+			return ExtractionResult{}, err
+		}
 		return ExtractionResult{}, se.skipEntryBody(err)
-	}
-	out, err := newVerifiedFile(filepath.Dir(outPath), fileKey)
-	if err != nil {
-		return ExtractionResult{}, se.skipEntryBody(recoverable(ErrCodeWriteFailed, "create file", err))
 	}
 	defer out.discard()
 
@@ -432,7 +441,7 @@ func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHe
 	if err := out.verify(trailer); err != nil {
 		return ExtractionResult{}, err
 	}
-	if err := out.publish(outPath, os.FileMode(pm.Permissions).Perm()); err != nil {
+	if err := out.publish(pm.Attributes, os.FileMode(pm.Permissions).Perm()); err != nil {
 		return ExtractionResult{}, recoverable(ErrCodeWriteFailed, "write file", err)
 	}
 
@@ -440,20 +449,21 @@ func (se *SafeExtractor) extractFileBody(keys *archive.KeySchedule, head entryHe
 	return ExtractionResult{Filename: filename, Size: out.size, OK: true}, nil
 }
 
-// entryOutputPath returns where the entry named name is extracted under outputDir and
-// creates its parent directories. A name that is not a safe relative path (absolute,
-// containing "..", or reserved on this OS) is refused, so no entry can be written
-// outside outputDir.
-func entryOutputPath(outputDir, name string) (string, error) {
-	local := filepath.FromSlash(name)
-	if !archive.ValidEntryName(name) || !filepath.IsLocal(local) {
-		return "", recoverable(ErrCodeIntegrityFail, "unsafe file name", nil)
+// extractSpecial restores a directory, symlink, or hard link entry, whose body carries
+// no data and is skipped.
+func (se *SafeExtractor) extractSpecial(tree *outputTree, name string, attrs *archive.Attributes) (ExtractionResult, error) {
+	if err := se.skipEntryBody(nil); err != nil {
+		return ExtractionResult{}, err
 	}
-	outPath := filepath.Join(outputDir, local)
-	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
-		return "", recoverable(ErrCodeWriteFailed, "create directory", err)
+	if err := tree.special(name, attrs); err != nil {
+		if isFatal(err) {
+			return ExtractionResult{}, err
+		}
+		se.progress.FileError(name, err)
+		return ExtractionResult{Filename: name, Err: err}, nil
 	}
-	return outPath, nil
+	se.progress.FileFinished(name)
+	return ExtractionResult{Filename: name, OK: true}, nil
 }
 
 func (se *SafeExtractor) readMetadataBlock() (archive.MetadataBlock, error) {
@@ -780,13 +790,25 @@ func (se *SafeExtractor) listFileBody(keys *archive.KeySchedule, head entryHead)
 		original = int64(trailer.plaintextSize)
 	}
 
-	return ListResult{
+	return withAttributes(ListResult{
 		Filename:      filename,
 		SizeBucket:    bucketName(pm.SizeBucket),
 		Codec:         pm.Codec.String(),
 		OriginalBytes: original,
 		StoredBytes:   stored,
-	}, nil
+	}, pm.Attributes, pm.Permissions), nil
+}
+
+// withAttributes fills a listing's kind, mode, and link target from attrs, or from the
+// legacy permissions when an entry has no attributes.
+func withAttributes(r ListResult, attrs *archive.Attributes, permissions uint32) ListResult {
+	if attrs == nil {
+		r.Mode = permissions & 0o777
+		return r
+	}
+	r.Kind, r.Mode, r.LinkTarget = attrs.Kind, attrs.Mode, attrs.LinkTarget
+	r.ModTime = attrs.ModTime
+	return r
 }
 
 func bucketName(b archive.SizeBucket) string {

@@ -11,35 +11,43 @@ import (
 	"hash"
 	"os"
 
+	"github.com/iamvirul/sarc/archive"
 	"github.com/iamvirul/sarc/crypto"
 )
 
 // verifiedFileBufferSize batches plaintext writes to the temporary file.
 const verifiedFileBufferSize = 1 << 20
 
-// tempFilePattern names in-progress extractions: hidden, and recognisable if a crash
+// tempFilePrefix names in-progress extractions: hidden, and recognisable if a crash
 // leaves one behind.
-const tempFilePattern = ".sarc-extract-*"
+const tempFilePrefix = ".sarc-extract-"
+
+// tempFilePattern matches tempFilePrefix names.
+const tempFilePattern = tempFilePrefix + "*"
 
 // verifiedFile accumulates one entry's plaintext in a temporary file beside its final
 // destination while computing the plaintext HMAC. It becomes visible under its real
 // name only through publish, after verify succeeds.
 type verifiedFile struct {
+	tree      *outputTree
 	f         *os.File
+	tmp       string
+	local     string
 	w         *bufio.Writer
 	mac       hash.Hash
 	size      int64
 	published bool
 }
 
-// newVerifiedFile creates the temporary file in dir (mode 0600) keyed for HMAC by fileKey.
-func newVerifiedFile(dir string, fileKey [crypto.KeySize]byte) (*verifiedFile, error) {
-	f, err := os.CreateTemp(dir, tempFilePattern)
+// newVerifiedFile creates the temporary file for name in tree (mode 0600), keyed for
+// HMAC by fileKey.
+func newVerifiedFile(tree *outputTree, name string, fileKey [crypto.KeySize]byte) (*verifiedFile, error) {
+	f, tmp, local, err := tree.createTemp(name)
 	if err != nil {
 		return nil, err
 	}
 	return &verifiedFile{
-		f:   f,
+		tree: tree, f: f, tmp: tmp, local: local,
 		w:   bufio.NewWriterSize(f, verifiedFileBufferSize),
 		mac: stdhmac.New(sha256.New, fileKey[:]),
 	}, nil
@@ -64,20 +72,14 @@ func (v *verifiedFile) verify(trailer trailerInfo) error {
 	return nil
 }
 
-// publish flushes, applies perm, and atomically renames the file to path, replacing any
-// existing file there.
-func (v *verifiedFile) publish(path string, perm os.FileMode) error {
+// publish flushes, applies attrs (or fallbackPerm when there are none), and atomically
+// renames the file to its final name, replacing any file or symlink there.
+func (v *verifiedFile) publish(attrs *archive.Attributes, fallbackPerm os.FileMode) error {
 	if err := v.w.Flush(); err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
-	if err := v.f.Chmod(perm); err != nil {
-		return fmt.Errorf("chmod: %w", err)
-	}
-	if err := v.f.Close(); err != nil {
-		return fmt.Errorf("close: %w", err)
-	}
-	if err := os.Rename(v.f.Name(), path); err != nil {
-		return fmt.Errorf("rename: %w", err)
+	if err := v.tree.publish(v.f, v.tmp, v.local, attrs, fallbackPerm); err != nil {
+		return err
 	}
 	v.published = true
 	return nil
@@ -90,6 +92,6 @@ func (v *verifiedFile) discard() {
 	if v.published {
 		return
 	}
-	_ = v.f.Close()
-	_ = os.Remove(v.f.Name())
+	v.published = true
+	v.tree.discard(v.f, v.tmp)
 }

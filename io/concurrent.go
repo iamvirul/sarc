@@ -56,6 +56,7 @@ type ConcurrentArchiver struct {
 	w           *archive.ArchiveWriter
 	out         io.Writer
 	signer      ssh.Signer
+	walk        walkOptions
 	compression *compressionPolicy
 	workers     int
 	progress    ProgressTracker
@@ -70,7 +71,7 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	aw, compression, signer, err := openArchiveWriter(w, password, opts)
+	aw, compression, cfg, err := openArchiveWriter(w, password, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +79,8 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 		progress = NopProgressTracker{}
 	}
 	return &ConcurrentArchiver{
-		w: aw, out: w, signer: signer, compression: compression, workers: workers, progress: progress, start: time.Now(),
+		w: aw, out: w, signer: cfg.signer, walk: cfg.walkOptions(), compression: compression,
+		workers: workers, progress: progress, start: time.Now(),
 	}, nil
 }
 
@@ -91,18 +93,20 @@ func NewConcurrentArchiver(w io.Writer, password string, workers int, progress P
 // which parallelises the block-level AES-256-GCM encryption of that one file across
 // ca.workers goroutines so it still saturates all available cores.
 func (ca *ConcurrentArchiver) Archive(paths []string) error {
-	files, skipped := expandInputs(paths)
+	entries, skipped := expandInputs(paths, ca.walk)
 	reportSkipped(skipped, ca.progress)
+	files, special := splitSpecial(entries)
 	if len(files) == 1 {
-		return ca.archiveJobs([]fileJob{{index: 0, in: files[0], inline: true}}, 1)
+		return ca.archiveJobs([]fileJob{{index: 0, in: files[0], inline: true}}, special, len(entries))
 	}
-	return ca.archiveJobs(ca.planJobs(files), len(files))
+	return ca.archiveJobs(ca.planJobs(files), special, len(entries))
 }
 
 // archiveJobs runs jobs through the worker pool and writes their entries in job order
-// as they complete. At most workers+resultLookahead results are held at once, so memory
-// is bounded by the window, not by the archive size. It stops at the first fatal error.
-func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, totalFiles int) error {
+// as they complete, then the special entries (directories and links). At most
+// workers+resultLookahead results are held at once, so memory is bounded by the
+// window, not by the archive size. It stops at the first fatal error.
+func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, special []inputFile, totalFiles int) error {
 	results := make([]chan fileResult, len(jobs))
 	for i := range results {
 		results[i] = make(chan fileResult, 1)
@@ -155,6 +159,9 @@ func (ca *ConcurrentArchiver) archiveJobs(jobs []fileJob, totalFiles int) error 
 			return err
 		}
 		totalBytes += size
+	}
+	if err := writeSpecialEntries(ca.w, special, ca.progress); err != nil {
+		return err
 	}
 	if err := finishArchive(ca.w, ca.out, ca.signer); err != nil {
 		return err
@@ -302,6 +309,7 @@ func encryptFile(in inputFile, aw *archive.ArchiveWriter, compression *compressi
 		TimestampHash:     archive.HashTimestamp(salt, info.ModTime()),
 		Permissions:       uint32(info.Mode().Perm()),
 		Codec:             codec,
+		Attributes:        &in.attrs,
 	}
 	metaBlock, err := mm.Seal(pm)
 	if err != nil {

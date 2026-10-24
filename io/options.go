@@ -20,6 +20,12 @@ type archiverConfig struct {
 	ageRecipients []age.Recipient
 	keyFiles      []archive.KeyFile
 	signer        ssh.Signer
+	preserveOwner bool
+}
+
+// walkOptions returns the attributes the archivers record for cfg.
+func (cfg archiverConfig) walkOptions() walkOptions {
+	return walkOptions{owner: cfg.preserveOwner}
 }
 
 // WithCompression overrides the default compression options (CompressionAuto, level 3).
@@ -47,6 +53,12 @@ func WithSigner(signer ssh.Signer) ArchiverOption {
 	return func(c *archiverConfig) { c.signer = signer }
 }
 
+// WithPreserveOwner records each entry's numeric owner and group, which extraction
+// restores only when asked to (see WithRestoreOwner).
+func WithPreserveOwner(preserve bool) ArchiverOption {
+	return func(c *archiverConfig) { c.preserveOwner = preserve }
+}
+
 // newArchiverConfig applies opts over the defaults.
 func newArchiverConfig(opts []ArchiverOption) archiverConfig {
 	cfg := archiverConfig{compression: DefaultCompressionOptions()}
@@ -58,21 +70,21 @@ func newArchiverConfig(opts []ArchiverOption) archiverConfig {
 
 // openArchiveWriter applies opts, builds the compression policy, and writes the archive
 // header for password (empty for none) plus any key file and age recipients. At least
-// one credential is required. It also returns the signer from opts, if any.
-func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, ssh.Signer, error) {
+// one credential is required. It also returns the applied configuration.
+func openArchiveWriter(w io.Writer, password string, opts []ArchiverOption) (*archive.ArchiveWriter, *compressionPolicy, archiverConfig, error) {
 	cfg := newArchiverConfig(opts)
 	policy, err := newCompressionPolicy(cfg.compression)
 	if err != nil {
-		return nil, nil, nil, fatal(ErrCodeInvalidOption, "invalid compression options", err)
+		return nil, nil, cfg, fatal(ErrCodeInvalidOption, "invalid compression options", err)
 	}
 	aw, err := newCredentialedWriter(w, password, cfg)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, cfg, err
 	}
 	if err := aw.WriteHeader(0); err != nil {
-		return nil, nil, nil, fatal(ErrCodeWriteFailed, "write header", err)
+		return nil, nil, cfg, fatal(ErrCodeWriteFailed, "write header", err)
 	}
-	return aw, policy, cfg.signer, nil
+	return aw, policy, cfg, nil
 }
 
 // newCredentialedWriter returns an ArchiveWriter openable with password (empty for none)
@@ -100,6 +112,12 @@ type ExtractorOption func(*SafeExtractor)
 // try against a Version2 archive's age recipients.
 func WithIdentities(identities ...age.Identity) ExtractorOption {
 	return func(se *SafeExtractor) { se.identities = append(se.identities, identities...) }
+}
+
+// WithRestoreOwner restores recorded owners and the setuid, setgid, and sticky bits,
+// which normally needs root. Without it, recorded owners are skipped with a warning.
+func WithRestoreOwner(restore bool) ExtractorOption {
+	return func(se *SafeExtractor) { se.restoreOwner = restore }
 }
 
 // WithRandomAccess gives the extractor random access to the archive it reads, as
