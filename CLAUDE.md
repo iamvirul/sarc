@@ -101,5 +101,7 @@ Pushing a `v*` tag (or running the Release workflow manually) triggers:
 1. `release.yml` — creates the GitHub release with auto-generated notes grouped by PR label, then opens a PR to prepend the notes to `CHANGELOG.md`.
 2. `build.yml` — fires on `workflow_run` after release completes, runs the quality gate (tests + gofmt + go vet + license headers), then GoReleaser builds multi-platform binaries (`linux/darwin/windows`, `amd64/arm64`) and uploads them to the existing release in append mode.
 3. Docker image published to `ghcr.io/iamvirul/sarc` with semver tags + `latest`.
+4. GoReleaser also builds `.deb`/`.rpm` packages (nfpm, shell completions from `scripts/completions.sh`) and pushes a Homebrew cask to `iamvirul/homebrew-sarc` (needs `HOMEBREW_TAP_DEPLOY_KEY`, an SSH deploy key with write access to the tap).
+5. `packages.yml` fires after `build.yml`, downloads the packages of the newest 3 releases, builds signed apt and dnf repositories with `scripts/build-package-repo.sh` (needs `PACKAGE_SIGNING_KEY`), and deploys them to GitHub Pages. Setup is in `RELEASING.md`.
 
 `.goreleaser.yml` is set to `release.mode: append` — it never creates the release itself, only uploads artifacts to the one `release.yml` already created.

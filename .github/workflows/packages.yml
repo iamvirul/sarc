@@ -1,0 +1,94 @@
+name: Package repositories
+
+# Publishes signed apt and dnf repositories to GitHub Pages
+# (https://iamvirul.github.io/sarc) after each release's binaries are built, from the
+# .deb and .rpm assets of the newest releases. The site is rebuilt from release assets
+# every time, so package files never accumulate in git history.
+#
+# Needs the PACKAGE_SIGNING_KEY secret (an armored GPG private key without a passphrase)
+# and Pages set to deploy from GitHub Actions.
+#
+# Manual: Actions -> "Package repositories" -> Run workflow (e.g. after rotating the key).
+
+on:
+  workflow_run:
+    workflows: ["Build Release Binaries"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # How many releases the repositories offer, newest first. GitHub Pages sites are
+  # limited to 1 GB.
+  KEEP_RELEASES: 3
+  BASE_URL: https://iamvirul.github.io/sarc
+
+jobs:
+  build:
+    name: Build repositories
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install repository tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils createrepo-c
+
+      - name: Import signing key
+        env:
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+        run: |
+          if [ -z "$PACKAGE_SIGNING_KEY" ]; then
+            echo "::error::PACKAGE_SIGNING_KEY secret is not set; see RELEASING.md"
+            exit 1
+          fi
+          printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --import
+
+      - name: Download packages from the newest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p packages
+          found=0
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName'); do
+            before=$(ls packages | wc -l)
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir packages --pattern '*.deb' --pattern '*.rpm' || true
+            if [ "$(ls packages | wc -l)" -gt "$before" ]; then
+              echo "packages from $tag"
+              found=$((found + 1))
+            fi
+            [ "$found" -ge "$KEEP_RELEASES" ] && break
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no release has .deb and .rpm packages yet"
+            exit 1
+          fi
+
+      - name: Build signed repositories
+        run: ./scripts/build-package-repo.sh packages site "$BASE_URL"
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

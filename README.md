@@ -4,6 +4,36 @@ Secure Anti-Deduplication Archive. Encrypts files with AES-256-GCM and defeats d
 
 ## Install
 
+macOS and Linux with [Homebrew](https://brew.sh):
+
+```bash
+brew install iamvirul/sarc/sarc
+```
+
+Debian and Ubuntu (amd64, arm64), from the signed apt repository:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://iamvirul.github.io/sarc/sarc.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/sarc.gpg
+echo "deb [signed-by=/etc/apt/keyrings/sarc.gpg] https://iamvirul.github.io/sarc/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/sarc.list
+sudo apt update && sudo apt install sarc
+```
+
+Fedora, RHEL, and other dnf systems (x86_64, aarch64):
+
+```bash
+sudo curl -fsSL -o /etc/yum.repos.d/sarc.repo https://iamvirul.github.io/sarc/rpm/sarc.repo
+sudo dnf install sarc
+```
+
+The repositories are signed with the key
+`C288 2C4E 61C3 846A 5302  3BD8 8455 419A 7567 D512` (`sarc packages`); check it with
+`gpg --show-keys` on the downloaded `sarc.gpg`. Packages install shell completions for bash, zsh, and fish. Each release also attaches the
+`.deb` and `.rpm` files (`sudo apt install ./sarc_*.deb`, `sudo dnf install ./sarc-*.rpm`).
+
+With Go:
+
 ```bash
 go install github.com/iamvirul/sarc/cmd/sarc@latest
 ```

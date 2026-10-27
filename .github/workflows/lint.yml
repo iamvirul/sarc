@@ -54,3 +54,28 @@ jobs:
             exit 1
           fi
           echo "All Go files have copyright headers."
+
+  release-config:
+    name: Release Config Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check GoReleaser configuration
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: check
+
+      # Builds every artifact (binaries, archives, .deb, .rpm, cask) without publishing,
+      # which also evaluates the templates that check does not.
+      - name: Snapshot release build
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --snapshot --clean --skip=publish
+
+      - name: Check packaging scripts
+        run: shellcheck scripts/completions.sh scripts/build-package-repo.sh

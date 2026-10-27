@@ -2,6 +2,10 @@ version: 2
 
 project_name: sarc
 
+before:
+  hooks:
+    - ./scripts/completions.sh
+
 builds:
   - main: ./cmd/sarc
     binary: sarc
@@ -30,10 +34,103 @@ archives:
   - formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - completions/*
     format_overrides:
       - goos: windows
         formats:
           - zip
+
+# .deb and .rpm packages, attached to the release and served from the apt and dnf
+# repositories that packages.yml publishes to GitHub Pages.
+nfpms:
+  - id: packages
+    package_name: sarc
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: iamvirul
+    homepage: https://github.com/iamvirul/sarc
+    maintainer: iamvirul <89099391+iamvirul@users.noreply.github.com>
+    description: |-
+      Secure anti-deduplication archiver.
+      sarc encrypts files with AES-256-GCM into archives whose ciphertext never repeats,
+      defeating deduplication attacks with per-file salts, variable chunk sizes, and
+      random padding. It supports multiple recipients, compression, incremental backups,
+      signatures, and archiving straight to S3, GCS, and Azure Blob Storage.
+    license: MIT
+    section: utils
+    priority: optional
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: ./completions/sarc.bash
+        dst: /usr/share/bash-completion/completions/sarc
+        file_info:
+          mode: 0644
+      - src: ./completions/sarc.zsh
+        dst: /usr/share/zsh/vendor-completions/_sarc
+        packager: deb
+        file_info:
+          mode: 0644
+      - src: ./completions/sarc.zsh
+        dst: /usr/share/zsh/site-functions/_sarc
+        packager: rpm
+        file_info:
+          mode: 0644
+      - src: ./completions/sarc.fish
+        dst: /usr/share/fish/vendor_completions.d/sarc.fish
+        file_info:
+          mode: 0644
+      - src: ./LICENSE
+        dst: /usr/share/doc/sarc/copyright
+        packager: deb
+        file_info:
+          mode: 0644
+      - src: ./LICENSE
+        dst: /usr/share/licenses/sarc/LICENSE
+        packager: rpm
+        file_info:
+          mode: 0644
+
+# Homebrew tap: brew install iamvirul/sarc/sarc (macOS and Linux). Pushed over SSH with
+# HOMEBREW_TAP_DEPLOY_KEY, a deploy key with write access to iamvirul/homebrew-sarc only.
+homebrew_casks:
+  - name: sarc
+    repository:
+      owner: iamvirul
+      name: homebrew-sarc
+      branch: main
+      git:
+        url: git@github.com:iamvirul/homebrew-sarc.git
+        # Empty without the secret (local snapshots), which skips the push; build.yml
+        # requires the secret for real releases.
+        private_key: '{{ index .Env "HOMEBREW_TAP_DEPLOY_KEY" }}'
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "sarc {{ .Tag }}"
+    homepage: https://github.com/iamvirul/sarc
+    description: Secure anti-deduplication archiver with AES-256-GCM encryption
+    license: MIT
+    binaries:
+      - sarc
+    # Shipped in the archive rather than generated at install time, which runs the
+    # binary inside Homebrew's sandbox.
+    completions:
+      bash: completions/sarc.bash
+      zsh: completions/sarc.zsh
+      fish: completions/sarc.fish
+    hooks:
+      post:
+        # The release binaries are not notarized; without this, Gatekeeper refuses to run
+        # them.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/sarc"]
+          end
 
 checksum:
   name_template: "checksums.txt"
