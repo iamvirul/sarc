@@ -95,14 +95,17 @@ nfpms:
         file_info:
           mode: 0644
 
-# Homebrew tap: brew install iamvirul/sarc/sarc (macOS and Linux). Needs the
-# HOMEBREW_TAP_GITHUB_TOKEN secret, a token that can push to iamvirul/homebrew-sarc.
+# Homebrew tap: brew install iamvirul/sarc/sarc (macOS and Linux). Pushed over SSH with
+# HOMEBREW_TAP_DEPLOY_KEY, a deploy key with write access to iamvirul/homebrew-sarc only.
 homebrew_casks:
   - name: sarc
     repository:
       owner: iamvirul
       name: homebrew-sarc
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+      branch: main
+      git:
+        url: git@github.com:iamvirul/homebrew-sarc.git
+        private_key: "{{ .Env.HOMEBREW_TAP_DEPLOY_KEY }}"
     commit_author:
       name: github-actions[bot]
       email: 41898282+github-actions[bot]@users.noreply.github.com
