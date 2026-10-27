@@ -86,7 +86,7 @@ jobs:
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
           if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
-            echo "::error::HOMEBREW_TAP_DEPLOY_KEY secret is not set; see RELEASING.md"
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY secret is not set; see "Release secrets" in CLAUDE.md"
             exit 1
           fi
 
