@@ -4,6 +4,7 @@
 package io
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -195,7 +196,7 @@ func (se *SafeExtractor) Extract(outputDir string) ([]ExtractionResult, error) {
 
 	var results []ExtractionResult
 	for {
-		entryType, more, err := se.nextEntryType(keys.Version())
+		entryType, more, err := se.nextEntryType(keys)
 		if err != nil {
 			return results, err
 		}
@@ -326,31 +327,38 @@ func openFileCount(keys *archive.KeySchedule, sealed [archive.FileCountSealedSiz
 }
 
 // nextEntryType reads the next entry type byte and reports whether an entry follows.
-// Version2+ archives hold file and solid entries and end with EntryTypeEnd; EOF or any
-// other byte is fatal. Version1 archives hold only file entries and have no end marker,
-// so EOF or any byte other than EntryTypeFile ends them.
-func (se *SafeExtractor) nextEntryType(version uint16) (byte, bool, error) {
-	var b [1]byte
-	_, err := io.ReadFull(se.r, b[:])
-	if version == archive.Version1 {
-		if err == io.EOF {
-			return 0, false, nil
+// Version2+ archives hold file and solid entries, possibly a directory and its locator,
+// which are skipped, and end with EntryTypeEnd; EOF or any other byte is fatal.
+// Version1 archives hold only file entries and have no end marker, so EOF or any byte
+// other than EntryTypeFile ends them.
+func (se *SafeExtractor) nextEntryType(keys *archive.KeySchedule) (byte, bool, error) {
+	for {
+		var b [1]byte
+		_, err := io.ReadFull(se.r, b[:])
+		if keys.Version() == archive.Version1 {
+			if err == io.EOF {
+				return 0, false, nil
+			}
+			if err != nil {
+				return 0, false, fatal(ErrCodeTruncated, "read entry type", err)
+			}
+			return b[0], b[0] == archive.EntryTypeFile, nil
 		}
 		if err != nil {
 			return 0, false, fatal(ErrCodeTruncated, "read entry type", err)
 		}
-		return b[0], b[0] == archive.EntryTypeFile, nil
-	}
-	if err != nil {
-		return 0, false, fatal(ErrCodeTruncated, "read entry type", err)
-	}
-	switch b[0] {
-	case archive.EntryTypeFile, archive.EntryTypeSolid:
-		return b[0], true, nil
-	case archive.EntryTypeEnd:
-		return b[0], false, nil
-	default:
-		return 0, false, fatal(ErrCodeIntegrityFail, fmt.Sprintf("unexpected entry type 0x%02x", b[0]), nil)
+		switch b[0] {
+		case archive.EntryTypeFile, archive.EntryTypeSolid:
+			return b[0], true, nil
+		case archive.EntryTypeEnd:
+			return b[0], false, nil
+		case archive.EntryTypeDirectory, archive.EntryTypeDirectoryLocator:
+			if err := se.skipDirectory(keys, b[0]); err != nil {
+				return 0, false, err
+			}
+		default:
+			return 0, false, fatal(ErrCodeIntegrityFail, fmt.Sprintf("unexpected entry type 0x%02x", b[0]), nil)
+		}
 	}
 }
 
@@ -714,7 +722,14 @@ func verifyPlaintext(fileKey [crypto.KeySize]byte, plaintext []byte, trailer tra
 // List decrypts metadata for every entry and returns a ListResult per file, including
 // each member of a solid group. Data blocks of file entries are never decrypted; solid
 // groups are decrypted in memory to read their member records. Nothing is written to disk.
+//
+// With random access (WithRandomAccess), the header and any directory are read through
+// it, so listing an archive with a directory reads no data block; the sequential reader
+// is used only to scan an archive without one.
 func (se *SafeExtractor) List() ([]ListResult, error) {
+	if se.random != nil {
+		return se.listRandom()
+	}
 	keys, err := se.readHeader()
 	if err != nil {
 		return nil, err
@@ -722,13 +737,47 @@ func (se *SafeExtractor) List() ([]ListResult, error) {
 	if se.header.incremental() {
 		return se.listIncremental(keys)
 	}
+	return se.scanList(keys)
+}
 
+// listRandom lists through random access: an incremental archive through its session
+// indexes, a one-pass archive through its directory, and one without a directory by
+// scanning the sequential reader after skipping the header read through random access.
+func (se *SafeExtractor) listRandom() ([]ListResult, error) {
+	stream := se.r
+	counter := &byteCounter{r: bufio.NewReaderSize(io.NewSectionReader(se.random, 0, se.randomSize), entryReadBufferSize)}
+	se.r = counter
+	keys, err := se.readHeader()
+	se.r = stream
+	if err != nil {
+		return nil, err
+	}
+	if se.header.incremental() {
+		return se.listIncremental(keys)
+	}
+	if keys.Version() != archive.Version1 {
+		records, ok, err := readDirectory(se.random, se.randomSize, keys, se.header)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return directoryListing(records), nil
+		}
+	}
+	if _, err := io.CopyN(io.Discard, se.r, counter.n); err != nil {
+		return nil, fatal(ErrCodeTruncated, "read header", err)
+	}
+	return se.scanList(keys)
+}
+
+// scanList lists every entry after the header by reading the archive sequentially.
+func (se *SafeExtractor) scanList(keys *archive.KeySchedule) ([]ListResult, error) {
 	decs := &entryDecoders{}
 	defer decs.close()
 
 	var results []ListResult
 	for {
-		entryType, more, err := se.nextEntryType(keys.Version())
+		entryType, more, err := se.nextEntryType(keys)
 		if err != nil {
 			return results, err
 		}

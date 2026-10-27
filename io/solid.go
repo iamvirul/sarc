@@ -88,10 +88,13 @@ func attributesSize(attrs archive.Attributes) int {
 
 // solidMemberResult is the outcome of packing one file into a solid group.
 type solidMemberResult struct {
-	path string
-	name string
-	size int64
-	err  error
+	path   string
+	name   string
+	size   int64
+	err    error
+	attrs  archive.Attributes
+	codec  archive.Codec
+	stored int64 // share of the group's stored payload, as list reports it
 }
 
 // buildSolidEntry packs paths into one record stream, compresses it per policy, and
@@ -112,17 +115,32 @@ func buildSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, membe
 	if packed == 0 {
 		return nil, results, nil
 	}
-	entry, err := sealSolidEntry(aw, policy, stream)
+	entry, codec, err := sealSolidEntry(aw, policy, stream)
 	if err != nil {
 		return nil, results, err
 	}
+	stored := storedSize(entry)
+	for i := range results {
+		results[i].codec = codec
+		results[i].stored = results[i].size * stored / int64(len(stream))
+	}
 	return &entry, results, nil
+}
+
+// storedSize returns the encoded payload size of an in-memory entry: its data block
+// ciphertext without GCM tags.
+func storedSize(entry archive.FileEntry) int64 {
+	var n int64
+	for _, db := range entry.DataBlocks {
+		n += int64(len(db.Ciphertext)) - crypto.GCMTagSize
+	}
+	return n
 }
 
 // appendSolidMember reads in and appends its record to stream. On failure stream is
 // returned unchanged and the result carries a recoverable error.
 func appendSolidMember(stream []byte, in inputFile, progress ProgressTracker) ([]byte, solidMemberResult) {
-	res := solidMemberResult{path: in.path, name: in.name}
+	res := solidMemberResult{path: in.path, name: in.name, attrs: in.attrs}
 	f, err := os.Open(in.path)
 	if err != nil {
 		res.err = recoverable(ErrCodeReadFailed, "open file", err)
@@ -162,14 +180,16 @@ func appendSolidMember(stream []byte, in inputFile, progress ProgressTracker) ([
 }
 
 // sealSolidEntry compresses stream per policy and seals it as a solid group entry under
-// a fresh entry salt. The HMAC and recorded size cover the uncompressed stream.
-func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream []byte) (archive.FileEntry, error) {
+// a fresh entry salt, and returns the entry and its codec. The HMAC and recorded size
+// cover the uncompressed stream.
+func sealSolidEntry(aw *archive.ArchiveWriter, policy *compressionPolicy, stream []byte) (archive.FileEntry, archive.Codec, error) {
 	codec := policy.solidCodecFor(stream)
 	payload := stream
 	if codec == archive.CodecZstd {
 		payload = policy.solidCompressor.Compress(nil, stream)
 	}
-	return sealPayloadEntry(aw, archive.EntryTypeSolid, codec, payload, stream)
+	entry, err := sealPayloadEntry(aw, archive.EntryTypeSolid, codec, payload, stream)
+	return entry, codec, err
 }
 
 // sealPayloadEntry seals an in-memory entry of entryType under a fresh entry salt: its

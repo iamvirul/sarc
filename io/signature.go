@@ -121,8 +121,12 @@ func signatureBlock(checksum []byte, signer ssh.Signer) ([]byte, error) {
 	return block, nil
 }
 
-// finishArchive writes the footer and, when signer is set, a signature block after it.
-func finishArchive(aw *archive.ArchiveWriter, w io.Writer, signer ssh.Signer) error {
+// finishArchive writes the directory, the footer, and, when signer is set, a signature
+// block after it.
+func finishArchive(aw *archive.ArchiveWriter, w io.Writer, dir *directoryBuilder, signer ssh.Signer) error {
+	if err := dir.write(aw); err != nil {
+		return err
+	}
 	if err := aw.WriteFooter(); err != nil {
 		return fatal(ErrCodeWriteFailed, "write footer", err)
 	}
