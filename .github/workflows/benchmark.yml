@@ -205,7 +205,10 @@ jobs:
           MESH_FILE_MB:         ${{ env.MESH_FILE_MB }}
         run: python3 scripts/gen-benchmark-chart.py
 
+      # Dependabot PRs only bump dependencies; committing the chart there
+      # conflicts with every other open Dependabot PR.
       - name: Commit chart to PR branch
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -265,7 +268,9 @@ jobs:
               `| Extract time | ${toSec(mse_ms)} s (${toMBs(mse_ms, meshMb)} MB/s) | ${toSec(mze_ms)} s (${toMBs(mze_ms, meshMb)} MB/s) | ${mse_ms <= mze_ms ? "**sarc**" : "zip"} |`,
               `| Data integrity | ${process.env.MESH_SARC_INTEGRITY} | n/a | - |`,
               ``,
-              `Chart committed to \`benchmarks/benchmark_results.png\`.`,
+              context.payload.pull_request.user.login === "dependabot[bot]"
+                ? `Chart not committed for Dependabot PRs.`
+                : `Chart committed to \`benchmarks/benchmark_results.png\`.`,
             ].join("\n");
 
             await github.rest.issues.createComment({
