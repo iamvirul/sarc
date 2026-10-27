@@ -102,6 +102,12 @@ Pushing a `v*` tag (or running the Release workflow manually) triggers:
 2. `build.yml` — fires on `workflow_run` after release completes, runs the quality gate (tests + gofmt + go vet + license headers), then GoReleaser builds multi-platform binaries (`linux/darwin/windows`, `amd64/arm64`) and uploads them to the existing release in append mode.
 3. Docker image published to `ghcr.io/iamvirul/sarc` with semver tags + `latest`.
 4. GoReleaser also builds `.deb`/`.rpm` packages (nfpm, shell completions from `scripts/completions.sh`) and pushes a Homebrew cask to `iamvirul/homebrew-sarc` (needs `HOMEBREW_TAP_DEPLOY_KEY`, an SSH deploy key with write access to the tap).
-5. `packages.yml` fires after `build.yml`, downloads the packages of the newest 3 releases, builds signed apt and dnf repositories with `scripts/build-package-repo.sh` (needs `PACKAGE_SIGNING_KEY`), and deploys them to GitHub Pages. Setup is in `RELEASING.md`.
+5. `packages.yml` fires after `build.yml`, downloads the packages of the newest 3 releases, builds signed apt and dnf repositories with `scripts/build-package-repo.sh` (needs `PACKAGE_SIGNING_KEY`), and deploys them to GitHub Pages.
 
 `.goreleaser.yml` is set to `release.mode: append` — it never creates the release itself, only uploads artifacts to the one `release.yml` already created.
+
+### Release secrets
+
+- `HOMEBREW_TAP_DEPLOY_KEY`: SSH deploy key with write access to `iamvirul/homebrew-sarc` only. Replace it by generating an ed25519 key, adding the public half with `gh repo deploy-key add KEY.pub --repo iamvirul/homebrew-sarc --allow-write`, storing the private half with `gh secret set HOMEBREW_TAP_DEPLOY_KEY --repo iamvirul/sarc < KEY`, and deleting the old deploy key. No backup needed.
+- `PACKAGE_SIGNING_KEY`: passphrase-less ed25519 GPG key `sarc packages` signing the apt and dnf repositories, fingerprint `C288 2C4E 61C3 846A 5302  3BD8 8455 419A 7567 D512` (published in `README.md` and `docs/security.md`). The owner keeps an offline backup. Rotating it means generating a new key in a throwaway `GNUPGHOME`, updating the secret and both published fingerprints, and rerunning `packages.yml`; every user must then import the new key.
+- GitHub Pages deploys from GitHub Actions. `packages.yml` rebuilds the site from release assets on every run, so running it by hand republishes the repositories.

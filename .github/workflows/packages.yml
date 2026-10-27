@@ -47,7 +47,7 @@ jobs:
           PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
         run: |
           if [ -z "$PACKAGE_SIGNING_KEY" ]; then
-            echo "::error::PACKAGE_SIGNING_KEY secret is not set; see RELEASING.md"
+            echo "::error::PACKAGE_SIGNING_KEY secret is not set; see "Release secrets" in CLAUDE.md"
             exit 1
           fi
           printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --import
