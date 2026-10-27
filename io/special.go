@@ -9,9 +9,10 @@ import (
 )
 
 // writeSpecialEntries writes a data-free entry for each directory, symlink, and hard
-// link. They follow every file, so a hard link's target always precedes it and a
-// directory's attributes can be applied after its contents are extracted.
-func writeSpecialEntries(aw *archive.ArchiveWriter, special []inputFile, progress ProgressTracker) error {
+// link, and records each in dir. They follow every file, so a hard link's target always
+// precedes it and a directory's attributes can be applied after its contents are
+// extracted.
+func writeSpecialEntries(aw *archive.ArchiveWriter, dir *directoryBuilder, special []inputFile, progress ProgressTracker) error {
 	for _, in := range special {
 		entry, err := sealSpecialEntry(aw, in)
 		if err != nil {
@@ -19,6 +20,9 @@ func writeSpecialEntries(aw *archive.ArchiveWriter, special []inputFile, progres
 		}
 		if err := aw.WriteFileEntry(entry); err != nil {
 			return fatal(ErrCodeWriteFailed, "write entry", err)
+		}
+		if err := dir.addEntry(aw, in, specialSummary); err != nil {
+			return err
 		}
 		progress.FileFinished(in.name)
 	}

@@ -31,6 +31,9 @@ type ArchiveWriter struct {
 	recipients []byte
 	// checksum is the footer checksum, set by WriteFooter.
 	checksum []byte
+	// entryOffset and entryStored describe the entry written last (see LastEntry).
+	entryOffset int64
+	entryStored int64
 }
 
 // NewArchiveWriter returns an ArchiveWriter that writes a Version archive to w, openable
@@ -84,6 +87,12 @@ func (c *offsetCounter) Write(p []byte) (int, error) {
 
 // Offset returns the archive offset of the next byte to be written.
 func (aw *ArchiveWriter) Offset() int64 { return aw.offset.n }
+
+// LastEntry returns the archive offset of the type byte of the entry written last and
+// its stored payload size: the data block ciphertext without GCM tags.
+func (aw *ArchiveWriter) LastEntry() (offset, stored int64) {
+	return aw.entryOffset, aw.entryStored
+}
 
 // Keys returns the writer's key schedule.
 func (aw *ArchiveWriter) Keys() *KeySchedule { return aw.keys }
@@ -161,6 +170,7 @@ func (aw *ArchiveWriter) WriteCheckpointFooter(lastIndex int64) error {
 
 // WriteFileEntry serialises a complete FileEntry to the stream.
 func (aw *ArchiveWriter) WriteFileEntry(entry FileEntry) error {
+	aw.startEntry()
 	if err := writeByte(aw.tee, entry.EntryType); err != nil {
 		return fmt.Errorf("archive/writer: entry type: %w", err)
 	}
@@ -191,6 +201,7 @@ func (aw *ArchiveWriter) WriteFileEntry(entry FileEntry) error {
 // BeginFileEntry writes all fields of a file entry up to (but not including) data blocks.
 // Follow with one AppendDataBlock call per encrypted chunk, then EndFileEntry.
 func (aw *ArchiveWriter) BeginFileEntry(entryType byte, salt [crypto.SaltSize]byte, frameHdr FrameHeader, meta MetadataBlock, interPad []byte) error {
+	aw.startEntry()
 	if err := writeByte(aw.tee, entryType); err != nil {
 		return fmt.Errorf("archive/writer: entry type: %w", err)
 	}
@@ -218,6 +229,15 @@ func (aw *ArchiveWriter) EndFileEntry(trailer FileTrailer) error {
 		return fmt.Errorf("archive/writer: data block sentinel: %w", err)
 	}
 	return aw.writeTrailer(trailer)
+}
+
+// WriteDirectoryLocator writes the locator of the directory entry at offset. It must
+// directly precede WriteFooter.
+func (aw *ArchiveWriter) WriteDirectoryLocator(offset int64) error {
+	if _, err := aw.tee.Write(AppendDirectoryLocator(nil, uint64(offset))); err != nil {
+		return fmt.Errorf("archive/writer: directory locator: %w", err)
+	}
+	return nil
 }
 
 // WriteFooter writes the EntryTypeEnd marker, computes the archive HMAC over everything
@@ -292,7 +312,13 @@ func (aw *ArchiveWriter) writePadding(pad []byte) error {
 	return err
 }
 
+// startEntry records the offset of an entry about to be written.
+func (aw *ArchiveWriter) startEntry() {
+	aw.entryOffset, aw.entryStored = aw.offset.n, 0
+}
+
 func (aw *ArchiveWriter) writeDataBlock(db DataBlock) error {
+	aw.entryStored += int64(len(db.Ciphertext)) - crypto.GCMTagSize
 	if _, err := aw.tee.Write(db.Nonce[:]); err != nil {
 		return fmt.Errorf("archive/writer: block nonce: %w", err)
 	}

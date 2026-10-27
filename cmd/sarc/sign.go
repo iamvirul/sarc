@@ -33,8 +33,8 @@ func init() {
 }
 
 func runSign(cmd *cobra.Command, args []string) error {
-	if flagArchive == stdioPath {
-		return errors.New("sign needs an archive file, not stdin; or sign while archiving with archive --sign")
+	if flagArchive == stdioPath || isRemote(flagArchive) {
+		return errors.New("sign rewrites the end of a local archive file, not stdin or a storage URL; or sign while archiving with archive --sign")
 	}
 	signer, err := loadSigner(flagSigningKey)
 	if err != nil {

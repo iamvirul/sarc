@@ -31,6 +31,7 @@ type StreamingArchiver struct {
 	signer      ssh.Signer
 	walk        walkOptions
 	special     []inputFile // directories and links, written after every file
+	dir         *directoryBuilder
 	compression *compressionPolicy
 	progress    ProgressTracker
 	start       time.Time
@@ -50,7 +51,8 @@ func NewStreamingArchiver(w io.Writer, password string, progress ProgressTracker
 		progress = NopProgressTracker{}
 	}
 	return &StreamingArchiver{
-		w: aw, out: w, signer: cfg.signer, walk: cfg.walkOptions(), compression: compression, progress: progress, start: time.Now(),
+		w: aw, out: w, signer: cfg.signer, walk: cfg.walkOptions(), dir: newDirectoryBuilder(),
+		compression: compression, progress: progress, start: time.Now(),
 	}, nil
 }
 
@@ -105,7 +107,16 @@ func (sa *StreamingArchiver) addInput(in inputFile) error {
 			return nil
 		}
 	}
-	return addFileStreaming(sa.w, sa.compression, in, runtime.GOMAXPROCS(0), sa.progress)
+	return sa.addStreamed(in)
+}
+
+// addStreamed streams in as one file entry and records it in the directory.
+func (sa *StreamingArchiver) addStreamed(in inputFile) error {
+	sum, err := addFileStreaming(sa.w, sa.compression, in, runtime.GOMAXPROCS(0), sa.progress)
+	if err != nil {
+		return err
+	}
+	return sa.dir.addEntry(sa.w, in, sum)
 }
 
 // flushSolid writes the queued solid members: as one solid group, or as an individual
@@ -117,7 +128,7 @@ func (sa *StreamingArchiver) flushSolid() error {
 	case 0:
 		return nil
 	case 1:
-		err := addFileStreaming(sa.w, sa.compression, pending[0], runtime.GOMAXPROCS(0), sa.progress)
+		err := sa.addStreamed(pending[0])
 		if err != nil && !isFatal(err) {
 			sa.progress.FileError(pending[0].path, err)
 			return nil
@@ -132,61 +143,65 @@ func (sa *StreamingArchiver) flushSolid() error {
 		if err := sa.w.WriteFileEntry(*entry); err != nil {
 			return fatal(ErrCodeWriteFailed, "write solid entry", err)
 		}
+		if err := sa.dir.addSolid(sa.w, members); err != nil {
+			return err
+		}
 	}
 	reportSolidMembers(members, sa.progress)
 	return nil
 }
 
 // addFileStreaming streams in into aw as one file entry, encrypting chunks across
-// `workers` goroutines when the file is large enough to benefit (see minParallelFileSize).
-// Shared by StreamingArchiver and ConcurrentArchiver's single-file fast path.
-func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy, in inputFile, workers int, progress ProgressTracker) error {
+// `workers` goroutines when the file is large enough to benefit (see minParallelFileSize),
+// and returns its summary. Shared by StreamingArchiver and ConcurrentArchiver's
+// single-file fast path.
+func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy, in inputFile, workers int, progress ProgressTracker) (entrySummary, error) {
 	f, err := os.Open(in.path)
 	if err != nil {
-		return recoverable(ErrCodeReadFailed, "open file", err)
+		return entrySummary{}, recoverable(ErrCodeReadFailed, "open file", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return recoverable(ErrCodeReadFailed, "stat file", err)
+		return entrySummary{}, recoverable(ErrCodeReadFailed, "stat file", err)
 	}
 
 	progress.FileStarted(in.name, info.Size())
 
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "generate file salt", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "generate file salt", err)
 	}
 	fileKey, err := aw.DeriveFileKey(salt)
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "derive file key", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "derive file key", err)
 	}
 
 	probe, err := readProbe(f, info.Size(), compression.mode)
 	if err != nil {
-		return recoverable(ErrCodeReadFailed, "read compression probe", err)
+		return entrySummary{}, recoverable(ErrCodeReadFailed, "read compression probe", err)
 	}
 	codec := compression.codecFor(in.name, probe)
 
 	fb, err := compression.newFrameBuilder(fileKey, codec)
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "init frame builder", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "init frame builder", err)
 	}
 
 	frameHdr, err := fb.FrameHeader()
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "frame header", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "frame header", err)
 	}
 
 	mm, err := archive.NewMetadataManager(fileKey)
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "init metadata manager", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "init metadata manager", err)
 	}
 
 	encFilename, err := encryptFilename(in.name, fileKey)
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "encrypt filename", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "encrypt filename", err)
 	}
 
 	pm := archive.PlaintextMetadata{
@@ -199,16 +214,16 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 	}
 	metaBlock, err := mm.Seal(pm)
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "seal metadata", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "seal metadata", err)
 	}
 
 	interPad, err := fb.InterBlockPadding()
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "inter-block padding", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "inter-block padding", err)
 	}
 
 	if err := aw.BeginFileEntry(archive.EntryTypeFile, salt, frameHdr, metaBlock, interPad); err != nil {
-		return fatal(ErrCodeWriteFailed, "begin file entry", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "begin file entry", err)
 	}
 
 	if workers < 1 {
@@ -245,20 +260,20 @@ func addFileStreaming(aw *archive.ArchiveWriter, compression *compressionPolicy,
 		plaintextSize = tracked.total
 	}
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "encrypt stream", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "encrypt stream", err)
 	}
 
 	trailer, err := fb.BuildTrailer(plaintextHMAC, uint64(plaintextSize))
 	if err != nil {
-		return fatal(ErrCodeWriteFailed, "build trailer", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "build trailer", err)
 	}
 
 	if err := aw.EndFileEntry(trailer); err != nil {
-		return fatal(ErrCodeWriteFailed, "end file entry", err)
+		return entrySummary{}, fatal(ErrCodeWriteFailed, "end file entry", err)
 	}
 
 	progress.FileFinished(in.name)
-	return nil
+	return entrySummary{bucket: pm.SizeBucket, codec: codec, original: plaintextSize}, nil
 }
 
 // Finalize writes any queued solid group and the archive footer. Must be called after
@@ -267,10 +282,10 @@ func (sa *StreamingArchiver) Finalize(totalFiles int, totalBytes int64) error {
 	if err := sa.flushSolid(); err != nil {
 		return err
 	}
-	if err := writeSpecialEntries(sa.w, sa.special, sa.progress); err != nil {
+	if err := writeSpecialEntries(sa.w, sa.dir, sa.special, sa.progress); err != nil {
 		return err
 	}
-	if err := finishArchive(sa.w, sa.out, sa.signer); err != nil {
+	if err := finishArchive(sa.w, sa.out, sa.dir, sa.signer); err != nil {
 		return err
 	}
 	sa.progress.Done(totalFiles, totalBytes, time.Since(sa.start))

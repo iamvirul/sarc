@@ -184,30 +184,9 @@ func readIndexAt(ra io.ReaderAt, size int64, keys *archive.KeySchedule, offset i
 // readIndexBody reads the rest of an index entry after its type byte, verifies its
 // HMAC, and parses it. Any failure is fatal: the archive's state depends on every index.
 func (se *SafeExtractor) readIndexBody(keys *archive.KeySchedule) (*archive.SessionIndex, error) {
-	head, err := se.readEntryHead(keys)
+	plaintext, err := se.readPayloadBody(keys, archive.MaxIndexSize, "session index")
 	if err != nil {
-		return nil, fatal(ErrCodeIntegrityFail, "open session index", err)
-	}
-	if err := se.skipPadding(); err != nil {
-		return nil, fatal(ErrCodeTruncated, "skip index padding", err)
-	}
-	var plaintext []byte
-	err = se.streamDataBlocks(head.fileKey, archive.BucketHuge, archive.CodecNone, nil, func(pt []byte) error {
-		if len(plaintext)+len(pt) > archive.MaxIndexSize {
-			return errIndexTooLarge
-		}
-		plaintext = append(plaintext, pt...)
-		return nil
-	})
-	if err != nil {
-		return nil, fatal(ErrCodeIntegrityFail, "decrypt session index", err)
-	}
-	trailer, err := se.readTrailer(head.fileKey, keys.Version())
-	if err != nil {
-		return nil, fatal(ErrCodeIntegrityFail, "read session index trailer", err)
-	}
-	if err := verifyPlaintext(head.fileKey, plaintext, trailer); err != nil {
-		return nil, fatal(ErrCodeIntegrityFail, "session index failed verification", err)
+		return nil, err
 	}
 	si, err := archive.ParseSessionIndex(plaintext)
 	if err != nil {
@@ -216,8 +195,40 @@ func (se *SafeExtractor) readIndexBody(keys *archive.KeySchedule) (*archive.Sess
 	return si, nil
 }
 
-// errIndexTooLarge stops reading an index that exceeds archive.MaxIndexSize.
-var errIndexTooLarge = errors.New("session index exceeds maximum size")
+// readPayloadBody reads the rest of an uncompressed in-memory entry (see
+// sealPayloadEntry) after its type byte, verifies its HMAC, and returns its plaintext of
+// at most limit bytes. what names the entry in errors; every failure is fatal.
+func (se *SafeExtractor) readPayloadBody(keys *archive.KeySchedule, limit int, what string) ([]byte, error) {
+	head, err := se.readEntryHead(keys)
+	if err != nil {
+		return nil, fatal(ErrCodeIntegrityFail, "open "+what, err)
+	}
+	if err := se.skipPadding(); err != nil {
+		return nil, fatal(ErrCodeTruncated, "skip "+what+" padding", err)
+	}
+	var plaintext []byte
+	err = se.streamDataBlocks(head.fileKey, archive.BucketHuge, archive.CodecNone, nil, func(pt []byte) error {
+		if len(plaintext)+len(pt) > limit {
+			return errPayloadTooLarge
+		}
+		plaintext = append(plaintext, pt...)
+		return nil
+	})
+	if err != nil {
+		return nil, fatal(ErrCodeIntegrityFail, "decrypt "+what, err)
+	}
+	trailer, err := se.readTrailer(head.fileKey, keys.Version())
+	if err != nil {
+		return nil, fatal(ErrCodeIntegrityFail, "read "+what+" trailer", err)
+	}
+	if err := verifyPlaintext(head.fileKey, plaintext, trailer); err != nil {
+		return nil, fatal(ErrCodeIntegrityFail, what+" failed verification", err)
+	}
+	return plaintext, nil
+}
+
+// errPayloadTooLarge stops reading an entry that exceeds its size limit.
+var errPayloadTooLarge = errors.New("entry exceeds maximum size")
 
 // scanForLastIndex walks the entries after the header and returns the offset of the
 // last index entry that reads and verifies completely, and the offset just past it.

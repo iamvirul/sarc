@@ -4,6 +4,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -30,7 +32,7 @@ func init() {
 		"public key allowed to open the archive: age (age1...), SSH (ssh-ed25519, ssh-rsa), or plugin such as age1yubikey1..., or a file of them (repeatable)")
 	archiveCmd.Flags().StringArrayVarP(&flagIdentities, "identity", "i", nil,
 		"identity file (age, SSH, or plugin) whose holder can open the archive (repeatable); only its public key is used")
-	archiveCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output archive path, or - for stdout (required)")
+	archiveCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output archive path, - for stdout, or a storage URL: "+remoteSchemesHelp+" (required)")
 	archiveCmd.Flags().IntVar(&flagParallel, "parallel", 0, "worker count (default: NumCPU)")
 	archiveCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")
 	archiveCmd.Flags().BoolVar(&flagCompress, "compress", false, "zstd-compress every file (default: auto, skips incompressible files)")
@@ -75,6 +77,15 @@ func runArchive(cmd *cobra.Command, args []string) error {
 		credentialOpts = append(credentialOpts, sarcio.WithPreserveOwner(true))
 	}
 	log.Debug("compression", "mode", compression.Mode.String(), "level", compression.Level, "solid", compression.Solid)
+	ctx := commandContext(cmd)
+	if isRemote(flagOutput) {
+		if flagIncremental {
+			return errors.New("--incremental updates the archive in place, so --output must be a local file, not a storage URL")
+		}
+		var stop context.CancelFunc
+		ctx, stop = interruptContext(ctx)
+		defer stop()
+	}
 	if flagIncremental {
 		return runIncremental(cmd, args, password, append(credentialOpts, sarcio.WithCompression(compression)))
 	}
@@ -85,11 +96,11 @@ func runArchive(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
-	out, err := createArchiveOutput(flagOutput, split)
+	out, err := createArchiveOutput(ctx, flagOutput, split)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer out.closeOnError()
 
 	totalFiles, totalInputBytes := sarcio.InputTotals(args)
 	if out.file != nil {

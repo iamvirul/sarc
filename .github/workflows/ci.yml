@@ -27,3 +27,49 @@ jobs:
 
       - name: Benchmark (smoke)
         run: go test -run='^$' -bench=. -benchtime=1x ./benchmarks/...
+
+  cloud-storage:
+    name: Cloud storage backends
+    runs-on: ubuntu-latest
+    env:
+      # S3 on SeaweedFS (MinIO no longer publishes public images).
+      SARC_TEST_S3_BUCKET: sarc-test
+      SARC_TEST_S3_PATH_STYLE: "1"
+      SARC_S3_PATH_STYLE: "true"
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:8333
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: sarctest
+      AWS_SECRET_ACCESS_KEY: sarctest-secret
+      SARC_TEST_GCS_BUCKET: sarc-test
+      STORAGE_EMULATOR_HOST: localhost:4443
+      SARC_TEST_AZURE_CONTAINER: sarc-test
+      # Azurite's fixed, publicly documented development account key.
+      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start storage emulators
+        run: |
+          docker run -d --name s3 -p 8333:8333 chrislusf/seaweedfs:4.50 server -s3 -dir=/data -ip.bind=0.0.0.0
+          docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server:1.52.2 -scheme http -port 4443 -external-url http://localhost:4443
+          docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.35.0 azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+          for url in http://127.0.0.1:8333 http://127.0.0.1:4443/storage/v1/b http://127.0.0.1:10000; do
+            timeout 120 sh -c "until curl -s -o /dev/null $url; do sleep 2; done"
+          done
+
+      # Creates the buckets the CLI tests use.
+      - name: Backend contract tests
+        run: go test -race -count=1 -v ./storage/...
+
+      - name: CLI against storage URLs
+        run: go test -race -count=1 -v -run 'RemoteCLI' ./tests/
+
+      - name: Emulator logs
+        if: failure()
+        run: for c in s3 gcs azurite; do echo "== $c"; docker logs --tail 100 $c; done

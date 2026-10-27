@@ -20,7 +20,7 @@ var listCmd = &cobra.Command{
 
 func init() {
 	addReaderCredentialFlags(listCmd)
-	listCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
+	listCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, - for stdin, or a storage URL: "+remoteSchemesHelp+" (required)")
 	_ = listCmd.MarkFlagRequired("archive")
 }
 
@@ -29,7 +29,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	f, err := openArchiveInput(flagArchive)
+	f, err := openArchiveInput(commandContext(cmd), flagArchive)
 	if err != nil {
 		return err
 	}
