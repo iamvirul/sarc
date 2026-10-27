@@ -29,7 +29,7 @@ var verifyCmd = &cobra.Command{
 }
 
 func init() {
-	verifyCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
+	verifyCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, - for stdin, or a storage URL: "+remoteSchemesHelp+" (required)")
 	verifyCmd.Flags().StringArrayVar(&flagSigners, "signer", nil,
 		"trusted signer: an SSH public key (ssh-ed25519 AAAA...), or a .pub, authorized_keys, allowed_signers, or PEM public key file (repeatable); require a valid signature by one of them")
 	_ = verifyCmd.MarkFlagRequired("archive")
@@ -45,7 +45,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	in, err := openArchiveInput(flagArchive)
+	in, err := openArchiveInput(commandContext(cmd), flagArchive)
 	if err != nil {
 		return err
 	}

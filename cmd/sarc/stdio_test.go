@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +22,7 @@ func TestIsTerminalFalseForRegularFile(t *testing.T) {
 }
 
 func TestCreateArchiveOutputFileSendsProgressToStdout(t *testing.T) {
-	out, err := createArchiveOutput(filepath.Join(t.TempDir(), "a.sarc"), 0)
+	out, err := createArchiveOutput(context.Background(), filepath.Join(t.TempDir(), "a.sarc"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +33,7 @@ func TestCreateArchiveOutputFileSendsProgressToStdout(t *testing.T) {
 }
 
 func TestOpenArchiveInputMissingFile(t *testing.T) {
-	if _, err := openArchiveInput(filepath.Join(t.TempDir(), "missing.sarc")); err == nil {
+	if _, err := openArchiveInput(context.Background(), filepath.Join(t.TempDir(), "missing.sarc")); err == nil {
 		t.Fatal("opened a missing archive")
 	}
 }

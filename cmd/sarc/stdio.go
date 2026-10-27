@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/iamvirul/sarc/archive"
 	sarcio "github.com/iamvirul/sarc/io"
+	"github.com/iamvirul/sarc/storage"
 )
 
 // stdioPath as --archive or archive --output means stdin or stdout, for pipelines.
@@ -36,12 +38,28 @@ type archiveInput struct {
 	io.Reader
 	file    *os.File             // nil for stdin, which is left open, and for split archives
 	volumes *sarcio.VolumeReader // set for a split archive
+	remote  *remoteInput         // set for a storage URL
+}
+
+// remoteInput is an archive object in a storage backend.
+type remoteInput struct {
+	ctx    context.Context
+	object storage.Object
+	stream io.ReadCloser
 }
 
 // openArchiveInput opens path for reading, or stdin for "-", behind a large buffer. A
 // split archive, named by any of its volumes or its base name, or arriving on stdin as
-// concatenated volumes, is read as the joined archive.
-func openArchiveInput(path string) (*archiveInput, error) {
+// concatenated volumes, is read as the joined archive. A storage URL is read as one
+// streaming request, opened on the first read.
+func openArchiveInput(ctx context.Context, path string) (*archiveInput, error) {
+	loc, remote, err := remoteLocation(path)
+	if err != nil {
+		return nil, err
+	}
+	if remote {
+		return openRemoteInput(ctx, loc)
+	}
 	if path == stdioPath {
 		if isTerminal(os.Stdin) {
 			return nil, errTerminalInput
@@ -66,13 +84,31 @@ func openArchiveInput(path string) (*archiveInput, error) {
 	return &archiveInput{Reader: bufio.NewReaderSize(f, archiveReadBufferSize), file: f}, nil
 }
 
+func openRemoteInput(ctx context.Context, loc storage.Location) (*archiveInput, error) {
+	backend, err := openBackend(ctx, loc)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := backend.Open(ctx, loc.Key)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open archive: %w", err)
+	}
+	stream := storage.NewReader(ctx, obj)
+	return &archiveInput{
+		Reader: bufio.NewReaderSize(stream, archiveReadBufferSize),
+		remote: &remoteInput{ctx: ctx, object: obj, stream: stream},
+	}, nil
+}
+
 func volumeInput(vr *sarcio.VolumeReader) *archiveInput {
 	return &archiveInput{Reader: bufio.NewReaderSize(vr, archiveReadBufferSize), volumes: vr}
 }
 
-// Close closes the underlying file; stdin is left open.
+// Close closes the underlying file or request; stdin is left open.
 func (in *archiveInput) Close() error {
 	switch {
+	case in.remote != nil:
+		return in.remote.stream.Close()
 	case in.volumes != nil:
 		return in.volumes.Close()
 	case in.file != nil:
@@ -86,14 +122,34 @@ type archiveOutput struct {
 	io.Writer
 	file     *os.File             // the output file, nil for stdout and split archives
 	volumes  *sarcio.VolumeWriter // set when splitting into volumes
+	remote   storage.Writer       // set for a storage URL
 	progress io.Writer
 	closed   bool
 }
 
 // createArchiveOutput creates path, or uses stdout for "-". When the archive goes to
 // stdout, progress is written to stderr so it cannot corrupt the stream. With a split
-// size, it writes volumes path.001, path.002, and so on of at most that size.
-func createArchiveOutput(path string, split int64) (*archiveOutput, error) {
+// size, it writes volumes path.001, path.002, and so on of at most that size. A storage
+// URL is uploaded as it is written and appears only when the output is closed.
+func createArchiveOutput(ctx context.Context, path string, split int64) (*archiveOutput, error) {
+	loc, remote, err := remoteLocation(path)
+	if err != nil {
+		return nil, err
+	}
+	if remote {
+		if split > 0 {
+			return nil, errors.New("--split writes local volume files, so it cannot be used with a storage URL")
+		}
+		backend, err := openBackend(ctx, loc)
+		if err != nil {
+			return nil, err
+		}
+		w, err := backend.Create(ctx, loc.Key)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create output: %w", err)
+		}
+		return &archiveOutput{Writer: w, remote: w, progress: os.Stdout}, nil
+	}
 	if split > 0 {
 		if path == stdioPath {
 			return nil, errors.New("--split writes volume files, so it needs an --output path, not stdout")
@@ -117,14 +173,16 @@ func createArchiveOutput(path string, split int64) (*archiveOutput, error) {
 	return &archiveOutput{Writer: f, file: f, progress: os.Stdout}, nil
 }
 
-// Close closes the output file or finishes the last volume; stdout is left open. Only
-// the first call does anything.
+// Close closes the output file, finishes the last volume, or commits the upload;
+// stdout is left open. Only the first call to Close or closeOnError does anything.
 func (out *archiveOutput) Close() error {
 	if out.closed {
 		return nil
 	}
 	out.closed = true
 	switch {
+	case out.remote != nil:
+		return out.remote.Close()
 	case out.volumes != nil:
 		return out.volumes.Close()
 	case out.file != nil:
@@ -133,10 +191,29 @@ func (out *archiveOutput) Close() error {
 	return nil
 }
 
+// closeOnError closes the output after a failure: an upload is discarded, while a local
+// file or volume set is closed as far as it was written.
+func (out *archiveOutput) closeOnError() {
+	if out.remote != nil && !out.closed {
+		out.closed = true
+		if err := out.remote.Abort(); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: discarding the incomplete upload failed:", err)
+		}
+		return
+	}
+	if err := out.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: closing the incomplete output failed:", err)
+	}
+}
+
 // randomAccess returns the extractor option giving random access to a regular archive
-// file, including stdin redirected from one, which incremental archives need. It
-// returns none for a pipe.
+// file, including stdin redirected from one, or to a storage object, which incremental
+// archives and fast listing need. It returns none for a pipe.
 func (in *archiveInput) randomAccess() []sarcio.ExtractorOption {
+	if in.remote != nil {
+		obj := in.remote.object
+		return []sarcio.ExtractorOption{sarcio.WithRandomAccess(storage.NewReaderAt(in.remote.ctx, obj), obj.Size())}
+	}
 	if in.volumes != nil {
 		return nil
 	}

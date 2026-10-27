@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -20,7 +21,7 @@ var extractCmd = &cobra.Command{
 
 func init() {
 	addReaderCredentialFlags(extractCmd)
-	extractCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, or - for stdin (required)")
+	extractCmd.Flags().StringVarP(&flagArchive, "archive", "a", "", "archive path, - for stdin, or a storage URL: "+remoteSchemesHelp+" (required)")
 	extractCmd.Flags().StringVarP(&flagOutput, "output", "o", ".", "output directory")
 	extractCmd.Flags().BoolVar(&flagDebug, "debug", false, "enable debug logging")
 	extractCmd.Flags().BoolVar(&flagPreserveOwner, "preserve-owner", false,
@@ -31,11 +32,14 @@ func init() {
 func runExtract(cmd *cobra.Command, args []string) error {
 	log := initLogger()
 
+	if isRemote(flagOutput) {
+		return errors.New("extract writes files to a local --output directory, not a storage URL")
+	}
 	opts, err := readerOptions()
 	if err != nil {
 		return err
 	}
-	f, err := openArchiveInput(flagArchive)
+	f, err := openArchiveInput(commandContext(cmd), flagArchive)
 	if err != nil {
 		return err
 	}
