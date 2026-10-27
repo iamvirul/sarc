@@ -8,12 +8,16 @@ sarc/
   crypto/          Pure crypto primitives — no I/O, no archive concepts
   archive/         Wire format types, metadata sealing, frame builder, archive writer
   io/              File I/O orchestration — streaming archiver, concurrent archiver, extractor
+  storage/         Archive objects in local and cloud stores: Backend interface, scheme
+                   registry, resumable readers; backends in storage/{local,s3,gcs,azblob}
   tests/           Integration and security tests
   benchmarks/      Performance benchmarks
   scripts/         Developer tooling
 ```
 
 Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports above itself.
+`storage` imports none of them and only `cmd` imports it: the archive code sees an
+`io.Writer`, `io.Reader`, or `io.ReaderAt`, wherever the bytes live.
 
 ## On-disk format
 
@@ -52,6 +56,8 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
 [PACK ENTRY]            entry_type=0x03, incremental archives only (see Incremental archives)
 [INDEX ENTRY]           entry_type=0x04, incremental archives only
 [CHECKPOINT]            entry_type=0x05, incremental archives only, unencrypted
+[DIRECTORY ENTRY]       entry_type=0x06, one-pass version 2 archives (see Entry directory)
+[DIRECTORY LOCATOR]     entry_type=0x07, unencrypted: magic "SARCDLC1"(8) directory_offset(8)
 
 [END MARKER]            entry_type=0x00(1), version 2+ only
 
@@ -66,7 +72,8 @@ Dependency direction: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports a
 ```
 
 The reader loops on `entry_type`: `0x01` starts a file entry and, in version 2, `0x02`
-starts a solid group and `0x00` ends the entry list. Any other byte, or EOF before the end marker, is a fatal error.
+starts a solid group, `0x06` and `0x07` (the directory and its locator) are skipped, and
+`0x00` ends the entry list. Any other byte, or EOF before the end marker, is a fatal error.
 Version 1 archives have no end marker, so the reader treats EOF or any byte other than
 `0x01` as the end. That heuristic misreads roughly 1 in 256 version 1 archives, whose
 footer HMAC happens to start with `0x01`, as having one extra (failing) entry.
@@ -385,6 +392,48 @@ writer:     walks jobs in order; writes each result as soon as it is ready, or s
 
 Entries are written in submission order regardless of which worker finishes first, and
 memory is bounded by the window, not by the number or size of files.
+
+## Entry directory
+
+A version 2 archive written in one pass (not incremental) ends its entries with a
+directory, then a locator, just before the end marker:
+
+```
+header | entries | directory entry | locator | end marker | footer | [signature]
+```
+
+The directory entry uses the file-entry framing (own salt, key, padding, data blocks, and
+trailer HMAC), so it is encrypted and padded like any file and leaks nothing new. Its
+plaintext is `"SARCDIR1"` followed by one record per listed file: entry offset, name,
+flags (solid), size bucket, codec, attributes, plaintext size, and stored size (a solid
+member's proportional share), the same fields a scanning `list` reports. Both sit before
+the footer, so the footer checksum and any signature cover them.
+
+The locator sits at a fixed distance from the end of the archive proper, so a reader with
+random access (a regular file, or a storage object through ranged reads) lists the
+archive by reading the header, the locator, and the directory, without reading any data
+block. A listed entry offset must lie between the header and the directory. The writer
+builds the directory as it writes entries and stops at 16 MiB of plaintext (roughly
+150,000 files) to keep memory bounded; such an archive has no directory, and `list` falls
+back to scanning, as it does for pipes. A damaged directory or locator fails `list` with
+`INTEGRITY_FAIL` rather than silently falling back.
+
+## Cloud storage
+
+`cmd` maps archive URLs to backends through a `storage.Registry` (`file`, `s3`, `gs`,
+`azblob`); adding a store means implementing `storage.Backend` and registering a scheme.
+
+- Writing: `Backend.Create` returns a writer whose object appears only on `Close`. S3 uses
+  a multipart upload (parts of 16 MiB doubling every 1000 parts to 256 MiB, four in
+  flight); Azure uploads 16 MiB blocks and commits the block list on close; GCS uses a
+  resumable upload; `file://` writes a hidden temporary file and renames it. Any failure,
+  and the first Ctrl-C or SIGTERM, aborts the upload, so no partial archive is left.
+- Reading: `Backend.Open` pins the object's version (ETag or generation). `extract` and
+  `verify` stream it as one request that is reopened at the current offset if the
+  connection breaks; `list` and incremental restores use ranged reads. A read of an object
+  replaced after it was opened fails instead of mixing versions.
+- `--split`, `--incremental`, and `sarc sign` rewrite local files in place, so they reject
+  storage URLs.
 
 ## Streaming
 

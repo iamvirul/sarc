@@ -115,10 +115,30 @@ sarc archive --password "StrongPass123" --output - files/* | aws s3 cp - s3://bu
 curl -s https://example.com/backup.sarc | sarc extract --password "StrongPass123" --archive - --output ./out
 sarc archive --password "StrongPass123" --output - files/* | ssh user@host "sarc extract --password 'StrongPass123' --archive - --output /backup/"
 
+# Cloud storage: archive straight to S3 (or MinIO, R2, B2, Wasabi), Google Cloud
+# Storage, or Azure Blob Storage, with no local temporary file, and extract or list
+# straight from there. Uploads appear only once complete; a failed or interrupted
+# (Ctrl-C) upload is discarded. list reads only the header and the archive's encrypted
+# directory, not the data. Credentials come from each SDK's usual sources (AWS_PROFILE,
+# AWS_ACCESS_KEY_ID, instance roles; GOOGLE_APPLICATION_CREDENTIALS; az login or
+# AZURE_STORAGE_ACCOUNT with AZURE_STORAGE_KEY or AZURE_STORAGE_CONNECTION_STRING).
+sarc archive --password "pass" --output s3://my-bucket/backups/2026-07-20.sarc ./data/
+sarc list --password "pass" --archive s3://my-bucket/backups/2026-07-20.sarc
+sarc extract --password "pass" --archive gs://my-bucket/backup.sarc --output ./restored/
+sarc verify --archive azblob://my-container/backup.sarc
+AWS_ENDPOINT_URL_S3=http://minio:9000 SARC_S3_PATH_STYLE=true \
+  sarc archive --password "pass" --output s3://bucket/backup.sarc ./data/
+
 # List contents with type and permissions (ls -l style), codec, and compression ratio
 # (a credential is required to decrypt filenames)
 sarc list --password "StrongPass123" --archive backup.sarc
 ```
+
+Storage URLs work with `archive --output` and with `extract`, `list`, and `verify`
+`--archive`; `file:///path` names a local file the same way. `--split`, `--incremental`,
+and `sarc sign` modify local files in place, so they need a local path. Uploads hold a few
+parts in memory: S3 parts start at 16 MiB and grow, allowing archives of about 1.7 TiB;
+Azure blocks are 16 MiB, allowing about 780 GiB; GCS uploads in 16 MiB chunks.
 
 `--compress-level` takes zstd's 1-22 scale; the pure-Go encoder maps it onto four speed
 tiers (fastest, default, better, best), so neighbouring levels can produce identical output.

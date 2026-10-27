@@ -33,13 +33,14 @@ go vet ./...
 
 ## Architecture
 
-Strict unidirectional dependency: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports above itself.
+Strict unidirectional dependency: `cmd` -> `io` -> `archive` -> `crypto`. No layer imports above itself. `storage` is imported only by `cmd` and imports none of them.
 
 ```
 cmd/sarc/     CLI (cobra). Thin — parses flags, calls io layer, handles progress display.
 io/           Orchestration. StreamingArchiver, ConcurrentArchiver, SafeExtractor.
 archive/      Wire format. ArchiveWriter, FrameBuilder, MetadataManager. No I/O.
 crypto/       Pure primitives. EncryptionManager, KeyDeriver, padding, HMAC. No I/O.
+storage/      Archive objects in local and cloud stores: Backend, Registry, resumable readers; local, s3, gcs, azblob backends.
 tests/        Integration and security tests (CLI roundtrip, dedup resistance, tamper detection).
 benchmarks/   Go benchmarks comparing sarc vs stdlib operations.
 examples/     Standalone Go programs showing archive/extract API usage.
@@ -62,6 +63,10 @@ Directory arguments are archived recursively under slash-separated relative name
 File attributes (`archive/attributes.go`: kind, mode with setuid/setgid/sticky, mtime, link target, optional uid/gid, xattrs) live in v2 metadata, solid records, and incremental index entries. Directories, symlinks, and hard links are data-free entries written after all files. Extraction goes through `io/output_tree.go`, an `os.Root` on the output directory, so nothing escapes it; owners and special mode bits are restored only with `WithRestoreOwner` (`--preserve-owner`). Platform code: `io/xattr_{unix,linux,darwin,other}.go`, `io/fileinfo_{unix,other}.go`.
 
 `--split SIZE` (`io/volume.go`, format in `archive/volume.go`) cuts the archive stream into volume files `<output>.001`, `.002`, ... each framed by a header (random archive ID, index, last flag, payload length) and a SHA-256 checksum. Joining the payloads gives back the single-file archive, so readers are unchanged; the CLI detects volumes from any volume name, the base name, or stdin, and `io.VolumeError` names a missing or damaged volume.
+
+One-pass v2 archives end their entries with an encrypted entry directory (`EntryTypeDirectory`, `archive/directory.go`, built and read in `io/directory.go`) and a fixed locator before the end marker, so `list` with random access reads only the header and the directory. Sequential readers skip both; a directory over 16 MiB is not written and `list` scans instead.
+
+`archive --output`, and `extract`/`list`/`verify --archive`, accept storage URLs (`s3://`, `gs://`, `azblob://`, `file:///`), wired in `cmd/sarc/remote.go` and `stdio.go`. Uploads commit only on close and abort on failure or Ctrl-C; reads pin the object version and resume broken streams. `storage/storagetest` is the contract every backend runs; cloud backend tests run against SeaweedFS, fake-gcs-server, and Azurite in CI (`SARC_TEST_*` env vars) and skip otherwise.
 
 Optional signatures (`archive --sign`, `sarc sign`, `verify --signer`) are OpenSSH SSHSIG signatures (`crypto/signature.go`, namespace `sarc-archive`) over the footer checksum, stored in a block after the footer (`archive/signature.go`, `io/signature.go`); readers stop at the end marker, so extraction ignores it. Incremental updates re-sign or drop the stale signature.
 
