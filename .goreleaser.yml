@@ -105,7 +105,9 @@ homebrew_casks:
       branch: main
       git:
         url: git@github.com:iamvirul/homebrew-sarc.git
-        private_key: "{{ .Env.HOMEBREW_TAP_DEPLOY_KEY }}"
+        # Empty without the secret (local snapshots), which skips the push; build.yml
+        # requires the secret for real releases.
+        private_key: '{{ index .Env "HOMEBREW_TAP_DEPLOY_KEY" }}'
     commit_author:
       name: github-actions[bot]
       email: 41898282+github-actions[bot]@users.noreply.github.com
