@@ -197,16 +197,22 @@ func ParseSessionIndex(b []byte) (*SessionIndex, error) {
 	return si, nil
 }
 
-// indexDecoder reads index fields, recording the first error and returning zero values
-// after it.
+// indexDecoder reads index or directory fields, recording the first error and
+// returning zero values after it. Errors wrap malformed, or ErrMalformedIndex when it
+// is nil.
 type indexDecoder struct {
-	b   []byte
-	err error
+	b         []byte
+	err       error
+	malformed error
 }
 
 func (d *indexDecoder) fail(what string) {
 	if d.err == nil {
-		d.err = fmt.Errorf("%w: %s", ErrMalformedIndex, what)
+		kind := d.malformed
+		if kind == nil {
+			kind = ErrMalformedIndex
+		}
+		d.err = fmt.Errorf("%w: %s", kind, what)
 	}
 	d.b = nil
 }
