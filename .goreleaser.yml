@@ -95,6 +95,38 @@ nfpms:
         file_info:
           mode: 0644
 
+# Homebrew tap: brew install iamvirul/sarc/sarc (macOS and Linux). Needs the
+# HOMEBREW_TAP_GITHUB_TOKEN secret, a token that can push to iamvirul/homebrew-sarc.
+homebrew_casks:
+  - name: sarc
+    repository:
+      owner: iamvirul
+      name: homebrew-sarc
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "sarc {{ .Tag }}"
+    homepage: https://github.com/iamvirul/sarc
+    description: Secure anti-deduplication archiver with AES-256-GCM encryption
+    license: MIT
+    binaries:
+      - sarc
+    # Shipped in the archive rather than generated at install time, which runs the
+    # binary inside Homebrew's sandbox.
+    completions:
+      bash: completions/sarc.bash
+      zsh: completions/sarc.zsh
+      fish: completions/sarc.fish
+    hooks:
+      post:
+        # The release binaries are not notarized; without this, Gatekeeper refuses to run
+        # them.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/sarc"]
+          end
+
 checksum:
   name_template: "checksums.txt"
 
