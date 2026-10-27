@@ -27,7 +27,9 @@ sudo curl -fsSL -o /etc/yum.repos.d/sarc.repo https://iamvirul.github.io/sarc/rp
 sudo dnf install sarc
 ```
 
-Packages install shell completions for bash, zsh, and fish. Each release also attaches the
+The repositories are signed with the key
+`C288 2C4E 61C3 846A 5302  3BD8 8455 419A 7567 D512` (`sarc packages`); check it with
+`gpg --show-keys` on the downloaded `sarc.gpg`. Packages install shell completions for bash, zsh, and fish. Each release also attaches the
 `.deb` and `.rpm` files (`sudo apt install ./sarc_*.deb`, `sudo dnf install ./sarc-*.rpm`).
 
 With Go:
