@@ -57,6 +57,15 @@ run_example() {
   fi
 }
 
+# matches reports whether stdin has a line matching the basic regex $1. Unlike grep -q,
+# it reads all input: grep -q exits at the first match, and a sarc command still writing
+# into the pipe then dies of SIGPIPE, which pipefail reports as a failure.
+matches() {
+  local count
+  count=$(grep -c -- "$1") || true
+  [ "${count:-0}" -gt 0 ]
+}
+
 sha() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
@@ -151,7 +160,7 @@ example_multi_recipient_age() {
 example_solid_pipe() {
   "$SARC" archive -p "$PASS" --solid --compress-level 19 -o - in/* 2>/dev/null >solid.sarc
   nonempty solid.sarc
-  "$SARC" list -p "$PASS" -a - <solid.sarc | grep -q 'zstd+solid'
+  "$SARC" list -p "$PASS" -a - <solid.sarc | matches 'zstd+solid'
   "$SARC" extract -p "$PASS" -a - -o out-solid <solid.sarc >/dev/null
   same_files in out-solid
   echo "--solid through a pipe: $(wc -c <solid.sarc | tr -d ' ') bytes, files identical"
@@ -159,7 +168,7 @@ example_solid_pipe() {
 
 example_verify_stdin() {
   "$SARC" archive -p "$PASS" -o v.sarc in/* >/dev/null
-  "$SARC" verify -a - <v.sarc | grep -q PASSED
+  "$SARC" verify -a - <v.sarc | matches PASSED
   cp v.sarc corrupt.sarc
   # Flip every bit of one byte; overwriting with a fixed value is a no-op 1 time in 256.
   local byte
@@ -322,8 +331,8 @@ example_incremental_backup() {
   local grown=$(( $(wc -c <backup.sarc) - size1 ))
   [ "$grown" -lt $((10 * 1048576)) ] || { echo "one changed byte appended $grown bytes"; return 1; }
 
-  "$SARC" list -p "$PASS" -a backup.sarc | grep -q "tmp.txt" && { echo "deleted file still listed"; return 1; }
-  "$SARC" verify -a backup.sarc | grep -q PASSED
+  "$SARC" list -p "$PASS" -a backup.sarc | matches "tmp.txt" && { echo "deleted file still listed"; return 1; }
+  "$SARC" verify -a backup.sarc | matches PASSED
   "$SARC" extract -p "$PASS" -a backup.sarc -o restored >/dev/null
   diff -r data restored/data >/dev/null || { echo "restored tree differs from the latest state"; return 1; }
   if dd if=backup.sarc bs=1048576 2>/dev/null | "$SARC" extract -p "$PASS" -a - -o piped >/dev/null 2>&1; then
@@ -337,7 +346,7 @@ example_signed_archive() {
   ssh-keygen -q -t ed25519 -N "" -C ops@example -f ops_key
   "$SARC" archive -p "$PASS" --sign release.key -o - in/* 2>/dev/null >signed.sarc
   nonempty signed.sarc
-  "$SARC" verify -a - --signer release.key.pub <signed.sarc | grep -q "signature VALID"
+  "$SARC" verify -a - --signer release.key.pub <signed.sarc | matches "signature VALID"
   if "$SARC" verify -a signed.sarc --signer ops_key.pub >/dev/null 2>&1; then
     echo "verify accepted a signature by an untrusted key"; return 1
   fi
@@ -348,7 +357,7 @@ example_signed_archive() {
     echo "verify --signer accepted an unsigned archive"; return 1
   fi
   "$SARC" sign -s ops_key -a plain.sarc >/dev/null
-  "$SARC" verify -a plain.sarc --signer ops_key.pub | grep -q "signature VALID"
+  "$SARC" verify -a plain.sarc --signer ops_key.pub | matches "signature VALID"
 
   cp signed.sarc tampered.sarc
   local byte
@@ -392,7 +401,7 @@ example_split_archive() {
   diff -r media out-split/media >/dev/null || { echo "extract from volume 2 differs"; return 1; }
   cat vol.sarc.0* | "$SARC" extract -p "$PASS" -a - -o out-cat >/dev/null
   diff -r media out-cat/media >/dev/null || { echo "extract of concatenated volumes differs"; return 1; }
-  "$SARC" verify -a vol.sarc | grep -q "all 4 volume(s) present and intact"
+  "$SARC" verify -a vol.sarc | matches "all 4 volume(s) present and intact"
 
   local err
   mv vol.sarc.003 held.003
@@ -458,8 +467,8 @@ example_preserve_metadata() {
   if [ "$xattrs" = yes ]; then
     [ "$(get_xattr "$r/secret.txt" user.sarc.note)" = "kept" ] || { echo "extended attribute not restored"; return 1; }
   fi
-  "$SARC" list -p "$PASS" -a meta.sarc | grep -q "^lrwx.*tree/bin/link -> ../secret.txt" || { echo "list does not show the symlink"; return 1; }
-  "$SARC" list -p "$PASS" -a meta.sarc | grep -q "^dr-xr-xr-x  tree/readonly" || { echo "list does not show the directory mode"; return 1; }
+  "$SARC" list -p "$PASS" -a meta.sarc | matches "^lrwx.*tree/bin/link -> ../secret.txt" || { echo "list does not show the symlink"; return 1; }
+  "$SARC" list -p "$PASS" -a meta.sarc | matches "^dr-xr-xr-x  tree/readonly" || { echo "list does not show the directory mode"; return 1; }
   chmod 755 "$r/readonly"
   echo "modes (755, 600, read-only dir), symlink, hard link, empty dir, mtimes, xattrs (${xattrs}) restored; list shows types"
 }
