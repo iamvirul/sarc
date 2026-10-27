@@ -16,6 +16,7 @@ on:
       - "crypto/**"
       - "io/**"
       - "cmd/**"
+      - "storage/**"
       - "go.mod"
       - "go.sum"
       - "tests/testdata/age-plugin-sarctest/**"
