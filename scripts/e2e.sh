@@ -2,7 +2,7 @@
 # Copyright (c) 2026 iamvirul. All rights reserved.
 # Use of this source code is governed by the MIT license.
 #
-# Live end-to-end examples: runs the README's sarc commands for real (pipes, HTTP,
+# Live end-to-end examples: runs the documented sarc commands for real (pipes, HTTP,
 # age keys, memory bounds) against a built binary and fails on any broken example.
 #
 # Usage: scripts/e2e.sh SARC_BINARY AGE_BIN_DIR [REPORT_MD]
