@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.0.0 - 2026-10-27
+
+<!-- Release notes generated using configuration in .github/release.yml at 2.0.0 -->
+
+## What's Changed
+### New Features
+* perf: HKDF per-file keys with single PBKDF2 per archive by @iamvirul in https://github.com/iamvirul/sarc/pull/48
+* feat: zstd compression before encryption by @iamvirul in https://github.com/iamvirul/sarc/pull/50
+* feat: multi-recipient encryption with age keys by @iamvirul in https://github.com/iamvirul/sarc/pull/51
+* feat: streaming archive and extract via stdin/stdout by @iamvirul in https://github.com/iamvirul/sarc/pull/52
+* feat: key files, SSH keys, and hardware tokens by @iamvirul in https://github.com/iamvirul/sarc/pull/53
+* feat: incremental archives and directory support by @iamvirul in https://github.com/iamvirul/sarc/pull/54
+* feat: archive signing with SSH keys by @iamvirul in https://github.com/iamvirul/sarc/pull/61
+* feat: split archives into volumes by @iamvirul in https://github.com/iamvirul/sarc/pull/62
+* feat: preserve permissions, links, owners, and xattrs by @iamvirul in https://github.com/iamvirul/sarc/pull/63
+* feat: native cloud storage backends by @iamvirul in https://github.com/iamvirul/sarc/pull/71
+* build: deb/rpm packages, apt/dnf repos, and Homebrew tap by @iamvirul in https://github.com/iamvirul/sarc/pull/72
+* docs: restructure README, add guides and CODEOWNERS by @iamvirul in https://github.com/iamvirul/sarc/pull/73
+### Bug Fixes
+* ci: skip dependabot chart commit by @iamvirul in https://github.com/iamvirul/sarc/pull/70
+### CI / Build
+* ci: bump docker/build-push-action from 6 to 7 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/56
+* ci: bump goreleaser/goreleaser-action from 6 to 7 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/57
+* ci: bump actions/checkout from 4 to 7 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/58
+* ci: bump docker/setup-buildx-action from 3 to 4 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/59
+* ci: bump actions/github-script from 7 to 9 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/60
+* deps: bump golang from 1.25-alpine to 1.27-alpine in the docker-images group by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/64
+* ci: bump actions/labeler from 5 to 7 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/65
+* ci: bump docker/metadata-action from 5 to 6 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/66
+* ci: bump docker/login-action from 3 to 4 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/67
+* ci: bump actions/upload-artifact from 4 to 7 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/68
+* ci: bump actions/setup-go from 5 to 7 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/69
+### Dependencies
+* deps: bump the go-modules group with 4 updates by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/55
+
+## New Contributors
+* @dependabot[bot] made their first contribution in https://github.com/iamvirul/sarc/pull/55
+
+**Full Changelog**: https://github.com/iamvirul/sarc/compare/1.1.0...2.0.0
+
+---
+
 ## 1.1.0 - 2026-08-26
 
 <!-- Release notes generated using configuration in .github/release.yml at 1.1.0 -->
