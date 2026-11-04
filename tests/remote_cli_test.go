@@ -101,6 +101,9 @@ func TestRemoteCLIRoundtrip(t *testing.T) {
 			mustRunSarc(t, "archive", "-p", remotePassword, "-o", url, src)
 
 			listing := mustRunSarc(t, "list", "-p", remotePassword, "-a", url)
+			if strings.Contains(listing, "SDK ") {
+				t.Fatalf("storage SDK log lines leaked into the output:\n%s", listing)
+			}
 			for name := range files {
 				if !strings.Contains(listing, "data/"+name) {
 					t.Fatalf("listing lacks data/%s:\n%s", name, listing)
