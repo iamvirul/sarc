@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.0.1 - 2026-11-08
+
+<!-- Release notes generated using configuration in .github/release.yml at 2.0.1 -->
+
+## What's Changed
+### CI / Build
+* ci: bump docker/setup-qemu-action from 3 to 4 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/76
+* ci: bump actions/upload-pages-artifact from 4 to 5 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/77
+* ci: bump actions/deploy-pages from 4 to 5 by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/78
+### Dependencies
+* deps: bump the go-modules group with 5 updates by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/79
+
+
+**Full Changelog**: https://github.com/iamvirul/sarc/compare/2.0.0...2.0.1
+
+---
+
 ## 2.0.0 - 2026-10-27
 
 <!-- Release notes generated using configuration in .github/release.yml at 2.0.0 -->
