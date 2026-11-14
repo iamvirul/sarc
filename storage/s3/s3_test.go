@@ -95,3 +95,14 @@ func TestAbortDiscardsMultipartUpload(t *testing.T) {
 		t.Fatalf("%d multipart uploads left after Abort", len(out.Uploads))
 	}
 }
+
+func TestFactoryDisablesChecksumSkipLog(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
+	b, err := Factory(Options{})(context.Background(), "bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.(*Backend).client.Options().DisableLogOutputChecksumValidationSkipped {
+		t.Fatal("the SDK would log a warning to stderr on every ranged read")
+	}
+}

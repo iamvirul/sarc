@@ -78,7 +78,12 @@ func Factory(opts Options) storage.Factory {
 		if cfg.Region == "" {
 			return nil, errors.New("no AWS region configured; set AWS_REGION or a profile region")
 		}
-		client := awss3.NewFromConfig(cfg, func(o *awss3.Options) { o.UsePathStyle = opts.UsePathStyle })
+		client := awss3.NewFromConfig(cfg, func(o *awss3.Options) {
+			o.UsePathStyle = opts.UsePathStyle
+			// Ranged reads carry no response checksum, and the SDK would log that to stderr
+			// on every one; archive contents are authenticated by sarc itself.
+			o.DisableLogOutputChecksumValidationSkipped = true
+		})
 		return &Backend{
 			client:   client,
 			bucket:   bucket,
