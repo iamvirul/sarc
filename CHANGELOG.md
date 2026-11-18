@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.0.2 - 2026-11-16
+
+<!-- Release notes generated using configuration in .github/release.yml at 2.0.2 -->
+
+## What's Changed
+### Dependencies
+* deps: bump the go-modules group with 7 updates by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/81
+* deps: bump the go-modules group with 9 updates by @dependabot[bot] in https://github.com/iamvirul/sarc/pull/82
+
+
+**Full Changelog**: https://github.com/iamvirul/sarc/compare/2.0.1...2.0.2
+
+---
+
 ## 2.0.1 - 2026-11-08
 
 <!-- Release notes generated using configuration in .github/release.yml at 2.0.1 -->
